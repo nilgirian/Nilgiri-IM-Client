@@ -110,7 +110,8 @@ struct TranscriptView: View {
     }
 
     /// Sits in the scroll view's bottom safe area, so lines travel under the blur
-    /// and the bottom anchor still rests above the bar.
+    /// and the bottom anchor still rests above the bar. Half-strength frost lets
+    /// the log show through; the prompt stays the light terminal ink on dark.
     private var inputBar: some View {
         HStack {
             Text(">")
@@ -119,6 +120,7 @@ struct TranscriptView: View {
             TextField("command", text: $session.command)
                 .font(.system(.body, design: .monospaced))
                 .foregroundStyle(ink)
+                .textFieldStyle(.plain)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .focused($commandFocused)
@@ -132,7 +134,7 @@ struct TranscriptView: View {
                 Color.clear.preference(key: InputBarHeightKey.self, value: proxy.size.height)
             }
         }
-        .background(.ultraThinMaterial, ignoresSafeAreaEdges: .bottom)
+        .background(.ultraThinMaterial.opacity(0.5), ignoresSafeAreaEdges: .bottom)
         .simultaneousGesture(
             DragGesture(minimumDistance: 15)
                 .onEnded { value in
