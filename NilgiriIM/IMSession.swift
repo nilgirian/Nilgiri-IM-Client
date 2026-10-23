@@ -14,6 +14,22 @@ final class IMSession: ObservableObject {
     @Published private(set) var vitals: HMVPrompt.Vitals?
     @Published var lines: [LineDTO] = []
     @Published var status = "Parked on the IM server when this app is in the background."
+    /// Set for one login, resume, reconnect, or creation attempt. Nil hides the alert.
+    @Published var outageAlert: OutageKind?
+    /// After the first alert, since polling stays quiet until a new attempt or a success.
+    private var outageLatched = false
+    /// Retry dismisses the alert before the new attempt finishes. That dismiss must
+    /// not clear an alert the attempt just raised.
+    private var suppressOutageDismiss = false
+    /// What Retry repeats. Login and resume stay on the parked session.
+    /// Creation retries the form, the last answer, or the abort DELETE.
+    private enum OutageFollowUp {
+        case login
+        case create
+        case answer(String)
+        case delete(String)
+    }
+    private var outageFollowUp: OutageFollowUp = .login
     @Published var parked = false
     @Published var busy = false
     @Published var command = ""
@@ -76,11 +92,13 @@ final class IMSession: ObservableObject {
         static let hmvName = "im.hmvName"
     }
 
-    private enum ResumeOutcome {
+    private enum ResumeOutcome: Equatable {
         case ready
         case rejected
         case closed
         case offline
+        /// Proxy or MUD outage. The stored token and session id stay.
+        case outage(OutageKind)
         /// Since applied a restored session that is not attached yet (`closed` and `resumed`).
         /// Login follows. The transcript and the divider stay.
         case detached
@@ -134,6 +152,7 @@ final class IMSession: ObservableObject {
         busy = true
         status = "Resuming parked session…"
         defer { busy = false }
+        outageLatched = false
         switch await resumeDirect() {
         case .ready:
             break
@@ -141,6 +160,8 @@ final class IMSession: ObservableObject {
             pendingUnpark = true
             status = "Could not reach the IM server. The parked session is still saved."
             startLive()
+        case .outage(let kind):
+            holdSessionThroughOutage(kind)
         case .closed:
             await dropClosedSession()
         case .detached:
@@ -156,6 +177,8 @@ final class IMSession: ObservableObject {
         busy = true
         characterMissing = false
         defer { busy = false }
+        outageLatched = false
+        outageFollowUp = .login
         if offersResume {
             hydrateSavedSession()
             switch await resumeDirect() {
@@ -165,6 +188,9 @@ final class IMSession: ObservableObject {
                 pendingUnpark = true
                 status = "Could not reach the IM server. The parked session is still saved."
                 startLive()
+                return
+            case .outage(let kind):
+                holdSessionThroughOutage(kind)
                 return
             case .closed:
                 await dropClosedSession()
@@ -176,6 +202,40 @@ final class IMSession: ObservableObject {
             }
         }
         await passwordLogin()
+    }
+
+    /// OK on the outage alert. The token and session id stay so a later retry can resume.
+    func acknowledgeOutage() {
+        if suppressOutageDismiss {
+            suppressOutageDismiss = false
+            return
+        }
+        outageAlert = nil
+    }
+
+    /// Retry repeats the request that failed. A stored bearer resumes.
+    /// Create retries the form. A step retries the last answer. An abort retries DELETE.
+    func retryOutage() async {
+        suppressOutageDismiss = true
+        let followUp = outageFollowUp
+        outageAlert = nil
+        outageLatched = false
+        switch followUp {
+        case .login:
+            await login()
+        case .create:
+            await startCharacterCreation()
+        case .answer(let value):
+            await answerCharacterCreation(value)
+        case .delete(let cid):
+            await performDeleteCreation(cid)
+        }
+        // A dismiss of the alert Retry just closed can arrive after the new
+        // attempt has raised another one. Leave the flag set so that dismiss
+        // does not clear the new alert. If this attempt raised nothing, drop it.
+        if outageAlert == nil {
+            suppressOutageDismiss = false
+        }
     }
 
     /// Opens the name and email form. The login name is the starting point.
@@ -211,9 +271,17 @@ final class IMSession: ObservableObject {
                 abortLateCreation(http.data)
                 return
             }
+            if let kind = OutageKind.http(status: http.status, data: http.data) {
+                reportOutage(kind, retry: .create)
+                return
+            }
             await handleCreateHTTP(http, phase: .start, generation: generation)
         } catch {
             guard generation == createGeneration else { return }
+            if let kind = OutageKind.transport(error) {
+                reportOutage(kind, retry: .create)
+                return
+            }
             presentCreateFailure(failureMessage(error), phase: .start)
         }
     }
@@ -237,9 +305,17 @@ final class IMSession: ObservableObject {
                 abortLateCreation(http.data)
                 return
             }
+            if let kind = OutageKind.http(status: http.status, data: http.data) {
+                reportOutage(kind, retry: .answer(value))
+                return
+            }
             await handleCreateHTTP(http, phase: .answer, generation: generation)
         } catch {
             guard generation == createGeneration else { return }
+            if let kind = OutageKind.transport(error) {
+                reportOutage(kind, retry: .answer(value))
+                return
+            }
             presentCreateFailure(failureMessage(error), phase: .answer)
         }
     }
@@ -344,6 +420,8 @@ final class IMSession: ObservableObject {
 
     func sceneBecameActive() async {
         guard token != nil, sessionId != nil else { return }
+        // Returning to the app is one reconnect attempt, not a poll tick.
+        outageLatched = false
         await setParked(false)
         if desiredParked == false {
             if lastParkOK {
@@ -365,6 +443,8 @@ final class IMSession: ObservableObject {
         switch await fetchSince() {
         case .ready:
             didAutoLogin = false
+            outageLatched = false
+            outageAlert = nil
             if pendingUnpark && inForeground && desiredParked == false {
                 await setParked(false)
                 if lastParkOK && desiredParked == false {
@@ -373,6 +453,11 @@ final class IMSession: ObservableObject {
             }
         case .offline:
             break
+        case .outage(let kind):
+            // The repeating since poll must not raise the dialog again.
+            if outageLatched == false {
+                reportOutage(kind)
+            }
         case .closed:
             stopLive()
             await dropClosedSession()
@@ -413,6 +498,13 @@ final class IMSession: ObservableObject {
             let (respData, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse else {
                 status = "Login failed."
+                return
+            }
+            if let kind = OutageKind.http(status: http.statusCode, data: respData) {
+                // Leave the Keychain pair in place. Retry resumes it.
+                // This was not a rejected login, so the one automatic re-login stays armed.
+                didAutoLogin = false
+                reportOutage(kind)
                 return
             }
             if http.statusCode == 401 {
@@ -467,6 +559,11 @@ final class IMSession: ObservableObject {
                 : "Playing as \(login.character)"
             await settleAfterResume(announcement: announcement)
         } catch {
+            if let kind = OutageKind.transport(error) {
+                didAutoLogin = false
+                reportOutage(kind)
+                return
+            }
             status = failureMessage(error)
         }
     }
@@ -518,17 +615,43 @@ final class IMSession: ObservableObject {
             case 401, 403, 404:
                 return .rejected
             default:
+                if let kind = OutageKind.http(status: http.statusCode, data: data) {
+                    return .outage(kind)
+                }
                 return .offline
             }
         } catch {
+            if let kind = OutageKind.transport(error) {
+                return .outage(kind)
+            }
             return .offline
         }
+    }
+
+    /// Shows the outage alert once for this attempt and does not drop the bearer.
+    private func holdSessionThroughOutage(_ kind: OutageKind) {
+        reportOutage(kind)
+        pendingUnpark = true
+        startLive()
+    }
+
+    /// Login, resume, reconnect, and character creation share this.
+    /// Since polling calls it only while `outageLatched` is false.
+    /// `retry` is recorded only when this call is the one that shows the alert.
+    private func reportOutage(_ kind: OutageKind, retry: OutageFollowUp = .login) {
+        outageLatched = true
+        status = kind.message
+        guard outageAlert == nil else { return }
+        outageFollowUp = retry
+        outageAlert = kind
     }
 
     /// Login reattach and a successful token resume both clear park.
     /// In the background that has to be put back; in front, go live.
     /// The event stream does not replay the buffer, so since has already run.
     private func settleAfterResume(announcement: String) async {
+        outageLatched = false
+        outageAlert = nil
         persistAccount()
         let foreground = inForeground
         pendingUnpark = foreground == false
@@ -1219,13 +1342,29 @@ final class IMSession: ObservableObject {
         return (http.statusCode, data)
     }
 
-    /// Does not wait, and does not care if the server already dropped the creation.
+    /// Does not wait. A proxy or MUD outage still raises the shared alert.
+    /// 404 and 410 mean the creation is already gone, so those stay quiet.
     private func deleteCreation(_ cid: String) {
-        let endpoint = url("/v1/create/\(pathComponent(cid))")
-        Task {
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "DELETE"
-            _ = try? await URLSession.shared.data(for: req)
+        Task { await performDeleteCreation(cid) }
+    }
+
+    private func performDeleteCreation(_ cid: String) async {
+        do {
+            let http = try await createSend(
+                method: "DELETE",
+                path: "/v1/create/\(pathComponent(cid))",
+                json: nil
+            )
+            if http.status == 404 || http.status == 410 {
+                return
+            }
+            if let kind = OutageKind.http(status: http.status, data: http.data) {
+                reportOutage(kind, retry: .delete(cid))
+            }
+        } catch {
+            if let kind = OutageKind.transport(error) {
+                reportOutage(kind, retry: .delete(cid))
+            }
         }
     }
 
