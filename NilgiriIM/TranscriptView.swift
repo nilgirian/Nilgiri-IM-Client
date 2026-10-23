@@ -73,10 +73,9 @@ struct TranscriptView: View {
             .onChange(of: scenePhase) { _, phase in
                 Task {
                     if phase == .background {
-                        await session.park(true)
+                        await session.sceneWentBackground()
                     } else if phase == .active {
-                        await session.park(false)
-                        await session.catchUp()
+                        await session.sceneBecameActive()
                     }
                 }
             }

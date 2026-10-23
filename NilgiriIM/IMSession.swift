@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import UIKit
 
 @MainActor
 final class IMSession: ObservableObject {
@@ -14,42 +15,118 @@ final class IMSession: ObservableObject {
     @Published var parked = false
     @Published var busy = false
     @Published var command = ""
+    @Published private(set) var savedName = ""
+    @Published private(set) var savedTokenAvailable = false
 
     private var lastSeq: Int64 = 0
     private var pollTask: Task<Void, Never>?
     private var streamTask: Task<Void, Never>?
+    private var didRestore = false
+    private var didAutoLogin = false
+    private var desiredParked = false
+    private var parkApplying = false
+    private var lastParkOK = true
+    private var pendingUnpark = false
+    private var parkWaiters: [CheckedContinuation<Void, Never>] = []
+    private let defaults = UserDefaults.standard
+
+    private enum StoreKey {
+        static let serverURL = "im.serverURL"
+        static let name = "im.name"
+        static let character = "im.character"
+        static let lastSeq = "im.lastSeq"
+    }
+
+    private enum ResumeOutcome {
+        case ready
+        case rejected
+        case closed
+        case offline
+    }
+
+    private struct HTTPFailure: Error {
+        let status: Int
+        let message: String
+    }
+
+    init() {
+        if let storedURL = defaults.string(forKey: StoreKey.serverURL), storedURL.isEmpty == false {
+            serverURL = storedURL
+        }
+        if let storedName = defaults.string(forKey: StoreKey.name), storedName.isEmpty == false {
+            name = storedName
+            savedName = storedName
+        }
+        if let storedCharacter = defaults.string(forKey: StoreKey.character), storedCharacter.isEmpty == false {
+            character = storedCharacter
+        }
+        if let rawSeq = defaults.string(forKey: StoreKey.lastSeq), let seq = Int64(rawSeq) {
+            lastSeq = seq
+        }
+        if let storedPassword = SessionSecrets.get(SessionSecrets.Account.password) {
+            password = storedPassword
+        }
+        token = SessionSecrets.get(SessionSecrets.Account.token)
+        sessionId = SessionSecrets.get(SessionSecrets.Account.sessionId)
+        savedTokenAvailable = token != nil && sessionId != nil
+    }
+
+    /// True when Enter should try the saved bearer token before posting a login.
+    var offersResume: Bool {
+        guard savedTokenAvailable || (token != nil && sessionId != nil) else { return false }
+        let storedURL = defaults.string(forKey: StoreKey.serverURL) ?? ""
+        if storedURL.isEmpty == false, normalized(serverURL) != normalized(storedURL) {
+            return false
+        }
+        if savedName.isEmpty { return false }
+        if namesEqual(name, savedName) { return true }
+        if let character, namesEqual(name, character) { return true }
+        return false
+    }
+
+    func restoreOnLaunch() async {
+        guard didRestore == false else { return }
+        didRestore = true
+        guard token != nil, sessionId != nil else { return }
+        busy = true
+        status = "Resuming parked session…"
+        defer { busy = false }
+        switch await resumeDirect() {
+        case .ready:
+            break
+        case .offline:
+            pendingUnpark = true
+            status = "Could not reach the IM server. The parked session is still saved."
+            startLive()
+        case .closed:
+            await dropClosedSession()
+        case .rejected:
+            token = nil
+            await autoPasswordLogin()
+        }
+    }
 
     func login() async {
         busy = true
         defer { busy = false }
-        do {
-            let body = ["name": name, "password": password, "color": true] as [String: Any]
-            let data = try JSONSerialization.data(withJSONObject: body)
-            var req = URLRequest(url: url("/v1/login"))
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = data
-            let (respData, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse else { return }
-            if http.statusCode != 200 {
-                status = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
-                    ?? "Login failed (\(http.statusCode))"
+        if offersResume {
+            hydrateSavedSession()
+            switch await resumeDirect() {
+            case .ready:
                 return
+            case .offline:
+                pendingUnpark = true
+                status = "Could not reach the IM server. The parked session is still saved."
+                startLive()
+                return
+            case .closed:
+                await dropClosedSession()
+                return
+            case .rejected:
+                token = nil
             }
-            let login = try JSONDecoder().decode(LoginResponse.self, from: respData)
-            token = login.token
-            sessionId = login.sessionId
-            character = login.character
-            status = "Playing as \(login.character)"
-            lastSeq = 0
-            lines = []
-            append(login.lines ?? [])
-            await park(false)
-            startLive()
-            await PushRegistration.flush(session: self)
-        } catch {
-            status = error.localizedDescription
         }
+        await passwordLogin()
     }
 
     func send() async {
@@ -59,19 +136,25 @@ final class IMSession: ObservableObject {
         do {
             try await post("/input", ["text": text])
         } catch {
-            status = error.localizedDescription
+            status = failureMessage(error)
         }
     }
 
-    func park(_ value: Bool) async {
+    @discardableResult
+    func park(_ value: Bool) async -> Bool {
         parked = value
+        if token != nil, sessionId != nil {
+            persistAccount()
+        }
         do {
             try await post("/park", ["parked": value])
             status = value
                 ? "Parked. Tells, death, combat start, idle, and link loss can notify."
                 : "Live. Full transcript while the app is open."
+            return true
         } catch {
-            status = error.localizedDescription
+            status = failureMessage(error)
+            return false
         }
     }
 
@@ -79,39 +162,292 @@ final class IMSession: ObservableObject {
         do {
             try await post("/device", ["token": hex, "environment": environment])
         } catch {
-            status = error.localizedDescription
+            status = failureMessage(error)
         }
     }
 
     func logout(closeMud: Bool) async {
         stopLive()
         if closeMud {
-            try? await post("/close", [:])
+            do {
+                try await post("/close", [:])
+            } catch {
+                status = failureMessage(error)
+                return
+            }
+            lines = []
+            lastSeq = 0
+            token = nil
+            sessionId = nil
+            character = nil
+            clearSessionSecrets()
+            defaults.set("0", forKey: StoreKey.lastSeq)
+            defaults.removeObject(forKey: StoreKey.character)
+            status = "Quit. The MUD session is closed."
         } else {
-            await park(true)
+            persistAccount()
+            await setParked(true)
+            // Leave the Keychain pair in place so the next enter can resume.
+            token = nil
+            status = "Parked. Resume keeps this character where they are."
         }
-        token = nil
-        sessionId = nil
-        character = nil
-        lines = []
-        lastSeq = 0
+    }
+
+    /// Resume clears park on the server, so backgrounding has to park again.
+    func sceneWentBackground() async {
+        persistAccount()
+        stopLive()
+        guard token != nil, sessionId != nil else { return }
+        await setParked(true)
+    }
+
+    func sceneBecameActive() async {
+        guard token != nil, sessionId != nil else { return }
+        await setParked(false)
+        if desiredParked == false {
+            if lastParkOK {
+                pendingUnpark = false
+            }
+            startLive()
+        }
     }
 
     func catchUp() async {
-        guard let sessionId, token != nil else { return }
+        guard token != nil, sessionId != nil else { return }
+        switch await fetchSince() {
+        case .ready:
+            didAutoLogin = false
+            if pendingUnpark && inForeground && desiredParked == false {
+                await setParked(false)
+                if lastParkOK && desiredParked == false {
+                    pendingUnpark = false
+                }
+            }
+        case .offline:
+            break
+        case .closed:
+            stopLive()
+            await dropClosedSession()
+        case .rejected:
+            stopLive()
+            token = nil
+            await autoPasswordLogin()
+        }
+    }
+
+    private func passwordLogin() async {
+        guard name.isEmpty == false else { return }
+        guard password.isEmpty == false else {
+            token = nil
+            status = "Enter the password to reattach the parked character."
+            return
+        }
+        // Block the catch-up poller from firing another login while this one is in flight.
+        didAutoLogin = true
+        let sameCharacter = nameMatchesHeld()
+        let includeSince = sameCharacter && lines.isEmpty == false && lastSeq > 0
+        var body: [String: Any] = ["name": name, "password": password, "color": true]
+        if includeSince {
+            body["since"] = NSNumber(value: lastSeq)
+        }
         do {
-            var req = URLRequest(url: url("/v1/sessions/\(sessionId)/since/\(lastSeq)"))
-            req.setValue("Bearer \(token ?? "")", forHTTPHeaderField: "Authorization")
+            let data = try JSONSerialization.data(withJSONObject: body)
+            var req = URLRequest(url: url("/v1/login"))
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = data
+            let (respData, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else {
+                status = "Login failed."
+                return
+            }
+            if http.statusCode == 401 {
+                // Wrong password leaves the parked session alone. Do not close it.
+                status = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
+                    ?? "Login failed (401)"
+                stopLive()
+                token = nil
+                return
+            }
+            if http.statusCode != 200 {
+                status = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
+                    ?? "Login failed (\(http.statusCode))"
+                token = nil
+                return
+            }
+            let login = try JSONDecoder().decode(LoginResponse.self, from: respData)
+            token = login.token
+            sessionId = login.sessionId
+            character = login.character
+            parked = login.parked ?? false
+            savedName = name
+            if login.resumed == true && includeSince {
+                append(login.lines ?? [])
+            } else {
+                replaceTranscript(login.lines ?? [])
+                if includeSince && lines.isEmpty {
+                    lastSeq = 0
+                    persistCursor()
+                }
+            }
+            persistAccount()
+            let announcement = login.resumed == true
+                ? "Resumed \(login.character)."
+                : "Playing as \(login.character)"
+            await settleAfterResume(announcement: announcement)
+        } catch {
+            status = failureMessage(error)
+        }
+    }
+
+    /// Bearer token never expires. Prefer GET since, then unpark, before logging in again.
+    private func resumeDirect() async -> ResumeOutcome {
+        let outcome = await fetchSince()
+        guard outcome == .ready else { return outcome }
+        let announcement = character.map { "Resumed \($0)." } ?? "Resumed parked session."
+        await settleAfterResume(announcement: announcement)
+        return .ready
+    }
+
+    private func fetchSince() async -> ResumeOutcome {
+        guard let token else { return .rejected }
+        let seq = lines.isEmpty ? Int64(0) : lastSeq
+        guard let requestURL = sessionURL("/since/\(seq)") else { return .rejected }
+        var req = URLRequest(url: requestURL)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        do {
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return }
-            let since = try JSONDecoder().decode(SinceResponse.self, from: data)
-            append(since.lines)
-            if since.closed {
-                status = "MUD session closed (idle, unlink, or logout)."
+            guard let http = resp as? HTTPURLResponse else { return .offline }
+            switch http.statusCode {
+            case 200:
+                guard let since = try? JSONDecoder().decode(SinceResponse.self, from: data) else {
+                    return .offline
+                }
+                if lines.isEmpty {
+                    replaceTranscript(since.lines)
+                } else {
+                    append(since.lines)
+                }
+                if since.closed { return .closed }
+                return .ready
+            case 401, 403, 404:
+                return .rejected
+            default:
+                return .offline
             }
         } catch {
-            status = error.localizedDescription
+            return .offline
         }
+    }
+
+    /// Login reattach and a successful token resume both clear park.
+    /// In the background that has to be put back; in front, go live.
+    /// The event stream does not replay the buffer, so since has already run.
+    private func settleAfterResume(announcement: String) async {
+        persistAccount()
+        let foreground = inForeground
+        pendingUnpark = foreground == false
+        await setParked(foreground ? false : true)
+        guard desiredParked == false else { return }
+        if lastParkOK {
+            status = announcement
+            pendingUnpark = false
+        } else {
+            pendingUnpark = true
+        }
+        startLive()
+        await PushRegistration.flush(session: self)
+    }
+
+    /// One automatic re-login per failed resume. A ready since arms it again.
+    private func autoPasswordLogin() async {
+        guard didAutoLogin == false else {
+            token = nil
+            status = "Could not reattach the parked session."
+            return
+        }
+        await passwordLogin()
+    }
+
+    /// Keeps the last park request aligned with the latest foreground or background.
+    private func setParked(_ value: Bool) async {
+        desiredParked = value
+        if parkApplying {
+            await withCheckedContinuation { continuation in
+                parkWaiters.append(continuation)
+            }
+            return
+        }
+        parkApplying = true
+        while token != nil, sessionId != nil {
+            let target = desiredParked
+            lastParkOK = await park(target)
+            if desiredParked == target {
+                break
+            }
+        }
+        parkApplying = false
+        let waiters = parkWaiters
+        parkWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func dropClosedSession() async {
+        lines = []
+        lastSeq = 0
+        token = nil
+        sessionId = nil
+        character = nil
+        clearSessionSecrets()
+        defaults.set("0", forKey: StoreKey.lastSeq)
+        defaults.removeObject(forKey: StoreKey.character)
+        if password.isEmpty == false && name.isEmpty == false {
+            await autoPasswordLogin()
+        } else {
+            status = "MUD session closed (idle, unlink, or logout)."
+        }
+    }
+
+    private func hydrateSavedSession() {
+        if token == nil {
+            token = SessionSecrets.get(SessionSecrets.Account.token)
+        }
+        if sessionId == nil {
+            sessionId = SessionSecrets.get(SessionSecrets.Account.sessionId)
+        }
+    }
+
+    private func persistAccount() {
+        if let token, token.isEmpty == false {
+            SessionSecrets.set(token, account: SessionSecrets.Account.token)
+        }
+        if let sessionId, sessionId.isEmpty == false {
+            SessionSecrets.set(sessionId, account: SessionSecrets.Account.sessionId)
+        }
+        if password.isEmpty == false {
+            SessionSecrets.set(password, account: SessionSecrets.Account.password)
+        }
+        defaults.set(serverURL, forKey: StoreKey.serverURL)
+        if name.isEmpty == false {
+            defaults.set(name, forKey: StoreKey.name)
+            savedName = name
+        }
+        if let character, character.isEmpty == false {
+            defaults.set(character, forKey: StoreKey.character)
+        }
+        persistCursor()
+        savedTokenAvailable = SessionSecrets.get(SessionSecrets.Account.token) != nil
+            && SessionSecrets.get(SessionSecrets.Account.sessionId) != nil
+    }
+
+    private func persistCursor() {
+        defaults.set(String(lastSeq), forKey: StoreKey.lastSeq)
+    }
+
+    private func clearSessionSecrets() {
+        SessionSecrets.set(nil, account: SessionSecrets.Account.token)
+        SessionSecrets.set(nil, account: SessionSecrets.Account.sessionId)
+        savedTokenAvailable = false
     }
 
     private func startLive() {
@@ -133,8 +469,8 @@ final class IMSession: ObservableObject {
     }
 
     private func stream() async {
-        guard let sessionId, let token else { return }
-        var req = URLRequest(url: url("/v1/sessions/\(sessionId)/stream"))
+        guard let token, let requestURL = sessionURL("/stream") else { return }
+        var req = URLRequest(url: requestURL)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         do {
             let (bytes, _) = try await URLSession.shared.bytes(for: req)
@@ -155,33 +491,94 @@ final class IMSession: ObservableObject {
         }
     }
 
+    private func replaceTranscript(_ incoming: [LineDTO]) {
+        var shown: [LineDTO] = []
+        var maxSeq: Int64 = 0
+        for line in incoming {
+            if line.seq > maxSeq {
+                maxSeq = line.seq
+            }
+            guard shouldShow(line) else { continue }
+            shown.append(line)
+        }
+        if shown.count > 4000 {
+            shown.removeFirst(shown.count - 4000)
+        }
+        lines = shown
+        lastSeq = maxSeq
+        persistCursor()
+    }
+
     private func append(_ incoming: [LineDTO]) {
         for line in incoming where line.seq > lastSeq {
             lastSeq = line.seq
-            if line.text.contains("Do you want text color") {
-                continue
-            }
+            guard shouldShow(line) else { continue }
             lines.append(line)
         }
         if lines.count > 4000 {
             lines.removeFirst(lines.count - 4000)
         }
+        persistCursor()
+    }
+
+    private func shouldShow(_ line: LineDTO) -> Bool {
+        line.text.contains("Do you want text color") == false
     }
 
     private func post(_ action: String, _ body: [String: Any]) async throws {
-        guard let sessionId else { return }
-        var req = URLRequest(url: url("/v1/sessions/\(sessionId)\(action)"))
+        guard let requestURL = sessionURL(action) else {
+            throw HTTPFailure(status: 0, message: "No session to update.")
+        }
+        var req = URLRequest(url: requestURL)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(token ?? "")", forHTTPHeaderField: "Authorization")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (_, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-            throw URLError(.badServerResponse)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw HTTPFailure(status: 0, message: "No response from the IM server.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let message = (try? JSONDecoder().decode(ErrorResponse.self, from: data))?.error
+                ?? "Request failed (\(http.statusCode))"
+            throw HTTPFailure(status: http.statusCode, message: message)
         }
     }
 
+    private func sessionURL(_ suffix: String) -> URL? {
+        guard let sessionId, sessionId.isEmpty == false else { return nil }
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        let escaped = sessionId.addingPercentEncoding(withAllowedCharacters: allowed) ?? sessionId
+        return url("/v1/sessions/\(escaped)\(suffix)")
+    }
+
     private func url(_ path: String) -> URL {
-        URL(string: serverURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + path)!
+        URL(string: normalized(serverURL) + path)!
+    }
+
+    private func normalized(_ raw: String) -> String {
+        raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    private func nameMatchesHeld() -> Bool {
+        if savedName.isEmpty == false && namesEqual(name, savedName) { return true }
+        if let character, namesEqual(name, character) { return true }
+        return false
+    }
+
+    private func namesEqual(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.compare(rhs, options: .caseInsensitive) == .orderedSame
+    }
+
+    private var inForeground: Bool {
+        UIApplication.shared.applicationState != .background
+    }
+
+    private func failureMessage(_ error: Error) -> String {
+        if let http = error as? HTTPFailure {
+            return http.message
+        }
+        return error.localizedDescription
     }
 }

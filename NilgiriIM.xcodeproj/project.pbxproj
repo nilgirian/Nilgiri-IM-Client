@@ -14,6 +14,7 @@
 		A10000000000000000000005 /* TranscriptView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000015 /* TranscriptView.swift */; };
 		A10000000000000000000006 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* PushRegistration.swift */; };
 		A10000000000000000000008 /* Ansi.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001A /* Ansi.swift */; };
+		A10000000000000000000009 /* SessionSecrets.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001B /* SessionSecrets.swift */; };
 		A10000000000000000000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -26,6 +27,7 @@
 		A10000000000000000000015 /* TranscriptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptView.swift; sourceTree = "<group>"; };
 		A10000000000000000000016 /* PushRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushRegistration.swift; sourceTree = "<group>"; };
 		A1000000000000000000001A /* Ansi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ansi.swift; sourceTree = "<group>"; };
+		A1000000000000000000001B /* SessionSecrets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSecrets.swift; sourceTree = "<group>"; };
 		A10000000000000000000017 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A10000000000000000000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A10000000000000000000019 /* NilgiriIM.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = NilgiriIM.entitlements; sourceTree = "<group>"; };
@@ -60,6 +62,7 @@
 				A10000000000000000000015 /* TranscriptView.swift */,
 				A10000000000000000000016 /* PushRegistration.swift */,
 				A1000000000000000000001A /* Ansi.swift */,
+				A1000000000000000000001B /* SessionSecrets.swift */,
 				A10000000000000000000017 /* Assets.xcassets */,
 				A10000000000000000000018 /* Info.plist */,
 				A10000000000000000000019 /* NilgiriIM.entitlements */,
@@ -146,6 +149,7 @@
 				A10000000000000000000005 /* TranscriptView.swift in Sources */,
 				A10000000000000000000006 /* PushRegistration.swift in Sources */,
 				A10000000000000000000008 /* Ansi.swift in Sources */,
+				A10000000000000000000009 /* SessionSecrets.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

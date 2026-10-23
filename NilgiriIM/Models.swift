@@ -5,6 +5,10 @@ struct LoginResponse: Decodable {
     let sessionId: String
     let character: String
     let lines: [LineDTO]?
+    /// True when this login reattached a session that was already open.
+    let resumed: Bool?
+    /// False after a successful reattach; the server clears park on resume.
+    let parked: Bool?
 }
 
 struct LineDTO: Decodable, Identifiable {
