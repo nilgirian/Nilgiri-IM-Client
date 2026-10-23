@@ -138,6 +138,59 @@ struct ErrorResponse: Decodable {
     let error: String
 }
 
+/// Why the IM host could not serve this attempt.
+/// `proxy` is the machine in front (unreachable, or Apache 502/503).
+/// `server` is the MUD itself (`503` and `{"error":"mud_unavailable"}`).
+enum OutageKind: Equatable {
+    case proxy
+    case server
+
+    var message: String {
+        switch self {
+        case .proxy:
+            return "Nilgiri proxy is currently unavailable."
+        case .server:
+            return "Nilgiri server is currently unavailable."
+        }
+    }
+
+    /// `503` with `mud_unavailable` is the MUD. Any other `502` or `503` is Apache
+    /// with the IM server down. A `502` that already carries `mud_unavailable`
+    /// is not relabeled as the proxy.
+    static func http(status: Int, data: Data) -> OutageKind? {
+        let error = (try? JSONDecoder().decode(ErrorResponse.self, from: data))?.error
+        if error == "mud_unavailable" {
+            return status == 503 ? .server : nil
+        }
+        if status == 502 || status == 503 {
+            return .proxy
+        }
+        return nil
+    }
+
+    /// DNS, connection refused, timeout, and TLS failures. Other URL errors,
+    /// including no network and cancellation, are not this dialog.
+    static func transport(_ error: Error) -> OutageKind? {
+        guard let code = (error as? URLError)?.code else { return nil }
+        switch code {
+        case .cannotFindHost,
+             .dnsLookupFailed,
+             .cannotConnectToHost,
+             .timedOut,
+             .secureConnectionFailed,
+             .serverCertificateUntrusted,
+             .serverCertificateHasBadDate,
+             .serverCertificateHasUnknownRoot,
+             .serverCertificateNotYetValid,
+             .clientCertificateRejected,
+             .clientCertificateRequired:
+            return .proxy
+        default:
+            return nil
+        }
+    }
+}
+
 /// The MUD status prompt, for example `<30h 100m 97v>` or `<30h 100m 97v fighting>`.
 /// Real sessions put that token on its own line or fused with the text around it,
 /// including after a carriage-return redraw. ANSI around the token is ignored.

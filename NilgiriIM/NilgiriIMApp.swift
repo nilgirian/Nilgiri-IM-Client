@@ -50,12 +50,32 @@ struct RootView: View {
     @EnvironmentObject private var session: IMSession
 
     var body: some View {
-        if session.token != nil {
-            TranscriptView()
-        } else if session.creating {
-            CharacterCreateView()
-        } else {
-            LoginView()
+        Group {
+            if session.token != nil {
+                TranscriptView()
+            } else if session.creating {
+                CharacterCreateView()
+            } else {
+                LoginView()
+            }
+        }
+        .alert(
+            session.outageAlert?.message ?? "",
+            isPresented: Binding(
+                get: { session.outageAlert != nil },
+                set: { shown in
+                    if shown == false {
+                        session.acknowledgeOutage()
+                    }
+                }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                session.acknowledgeOutage()
+            }
+            Button("Retry") {
+                Task { await session.retryOutage() }
+            }
         }
     }
 }
