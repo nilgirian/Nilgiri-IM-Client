@@ -75,17 +75,12 @@ struct TranscriptView: View {
             .navigationTitle(session.character ?? "IM")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Park") {
-                        Task { await session.logout(closeMud: false) }
-                    }
-                    .foregroundStyle(ink)
-                }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Quit") {
+                    Button("Unlink") {
                         Task { await session.logout(closeMud: true) }
                     }
                     .foregroundStyle(ink)
+                    .accessibilityLabel("Unlink")
                 }
             }
             .onChange(of: scenePhase) { _, phase in

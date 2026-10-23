@@ -183,7 +183,7 @@ final class IMSession: ObservableObject {
             clearSessionSecrets()
             defaults.set("0", forKey: StoreKey.lastSeq)
             defaults.removeObject(forKey: StoreKey.character)
-            status = "Quit. The MUD session is closed."
+            status = "Unlinked. The MUD session is closed."
         } else {
             persistAccount()
             await setParked(true)
