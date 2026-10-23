@@ -1,9 +1,6 @@
 import Foundation
 import Combine
-import os
 import UIKit
-
-private let scrollLog = Logger(subsystem: "net.nilgiri.imclient", category: "scroll")
 
 @MainActor
 final class IMSession: ObservableObject {
@@ -600,25 +597,19 @@ final class IMSession: ObservableObject {
            separatorID != resumeSeparatorID {
             resumeSeparatorID = separatorID
             pendingResumeReveal = true
-            scrollLog.debug("armed resume reveal separator=\(separatorID, privacy: .public) lines=\(next.count)")
         }
         lines = next
     }
 
     /// The transcript calls this after the ease to the bottom has finished.
     func finishResumeReveal(separatorID: String) {
-        guard resumeSeparatorID == separatorID else {
-            scrollLog.debug("finish resume reveal ignored; separator changed")
-            return
-        }
+        guard resumeSeparatorID == separatorID else { return }
         pendingResumeReveal = false
-        scrollLog.debug("resume reveal finished")
     }
 
     private func cancelResumeReveal() {
         guard pendingResumeReveal else { return }
         pendingResumeReveal = false
-        scrollLog.debug("resume reveal cancelled")
     }
 
     /// Separator that splits lines the user had seen from lines added in this update.
