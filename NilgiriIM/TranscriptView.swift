@@ -20,9 +20,8 @@ struct TranscriptView: View {
                             VStack(spacing: 0) {
                                 LazyVStack(alignment: .leading, spacing: 0) {
                                     ForEach(session.lines) { line in
-                                        Ansi.text(line.text, fontSize: fontSize, columns: terminalColumns)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .id(line.seq)
+                                        transcriptLine(line, fontSize: fontSize)
+                                            .id(line.id)
                                     }
                                 }
                                 .padding(.horizontal, 8)
@@ -104,12 +103,26 @@ struct TranscriptView: View {
     }
 
     // Login fills `lines` before this view exists, so the first backlog is not an
-    // onChange. Resume catchUp appends later and does change the array. Wait until
-    // after layout; the bottom anchor is not ready on the triggering frame.
+    // onChange. Resume replace, catch-up append, and a disconnect separator all
+    // change the array. Wait until after layout; the bottom anchor is not ready
+    // on the triggering frame.
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
         let scroll = { proxy.scrollTo(transcriptBottomID, anchor: .bottom) }
         DispatchQueue.main.async(execute: scroll)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: scroll)
+    }
+
+    @ViewBuilder
+    private func transcriptLine(_ line: LineDTO, fontSize: CGFloat) -> some View {
+        if line.kind == "separator" {
+            Text(line.text)
+                .font(.system(size: fontSize, design: .monospaced))
+                .foregroundStyle(ink)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Ansi.text(line.text, fontSize: fontSize, columns: terminalColumns)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
 }
