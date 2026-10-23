@@ -316,3 +316,158 @@ enum HMVPrompt {
         return lower..<upper
     }
 }
+
+/// One screen in `POST /v1/create`. `info` is either a string of lines or an
+/// array of lines. `options` are strings or `{value, label}` objects.
+/// A confirm step with no options is answered with yes/no.
+struct CreateStep: Decodable {
+    let kind: String
+    let label: String
+    let info: [String]
+    let options: [CreateOption]
+    var error: String?
+    let email: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, label, info, options, error, email
+    }
+
+    var normalizedKind: String {
+        kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    var isPassword: Bool { normalizedKind == "password" }
+    var isText: Bool { normalizedKind == "text" }
+    var isConfirm: Bool { normalizedKind == "confirm" }
+
+    /// Radios for this step. Confirm synthesizes yes/no when the server sends none.
+    var choices: [CreateOption] {
+        if options.isEmpty, isConfirm {
+            return [
+                CreateOption(value: "yes", label: "yes"),
+                CreateOption(value: "no", label: "no")
+            ]
+        }
+        return options
+    }
+
+    /// Changes when the question changes. An `error` update does not, so a
+    /// rejected password keeps what the player typed.
+    var signature: String {
+        let values = options.map(\.value).joined(separator: "\u{1e}")
+        return "\(normalizedKind)\u{1e}\(label)\u{1e}\(values)"
+    }
+
+    /// Dialog title. The address on the step wins; the address from the form is the fallback.
+    func passwordPrompt(fallbackEmail: String) -> String {
+        let fromStep = email?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let address = fromStep.isEmpty
+            ? fallbackEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+            : fromStep
+        return "Please enter the password sent to \(address)"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? ""
+        guard kind.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .kind,
+                in: container,
+                debugDescription: "missing kind"
+            )
+        }
+        self.kind = kind
+        label = try container.decodeIfPresent(String.self, forKey: .label) ?? ""
+        info = Self.decodeInfo(container)
+        options = Self.decodeOptions(container)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        email = try container.decodeIfPresent(String.self, forKey: .email)
+    }
+
+    static func decodeJSON(_ object: Any) -> CreateStep? {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+        return try? JSONDecoder().decode(CreateStep.self, from: data)
+    }
+
+    private static func decodeInfo(_ container: KeyedDecodingContainer<CodingKeys>) -> [String] {
+        if let lines = try? container.decode([String].self, forKey: .info) {
+            return lines
+        }
+        if let text = try? container.decode(String.self, forKey: .info) {
+            return splitLines(text)
+        }
+        return []
+    }
+
+    private static func decodeOptions(_ container: KeyedDecodingContainer<CodingKeys>) -> [CreateOption] {
+        (try? container.decode([CreateOption].self, forKey: .options)) ?? []
+    }
+
+    /// Splits on LF or CRLF and drops a trailing empty piece from a final newline.
+    /// Spaces inside a line stay. `\r\n` is one Swift grapheme, so this walks scalars.
+    private static func splitLines(_ text: String) -> [String] {
+        var lines: [String] = []
+        var current = ""
+        let scalars = text.unicodeScalars
+        var index = scalars.startIndex
+        while index < scalars.endIndex {
+            let scalar = scalars[index]
+            let next = scalars.index(after: index)
+            if scalar == "\r" || scalar == "\n" {
+                if scalar == "\r", next < scalars.endIndex, scalars[next] == "\n" {
+                    index = scalars.index(after: next)
+                } else {
+                    index = next
+                }
+                lines.append(current)
+                current = ""
+                continue
+            }
+            current.unicodeScalars.append(scalar)
+            index = next
+        }
+        lines.append(current)
+        if lines.last?.isEmpty == true {
+            lines.removeLast()
+        }
+        return lines
+    }
+}
+
+struct CreateOption: Decodable {
+    var value: String
+    var label: String
+
+    private enum CodingKeys: String, CodingKey {
+        case value, label, text
+    }
+
+    init(value: String, label: String) {
+        self.value = value
+        self.label = label
+    }
+
+    init(from decoder: Decoder) throws {
+        if let single = try? decoder.singleValueContainer(),
+           let text = try? single.decode(String.self) {
+            value = text
+            label = text
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let value = try container.decodeIfPresent(String.self, forKey: .value)
+        let label = try container.decodeIfPresent(String.self, forKey: .label)
+        let text = try container.decodeIfPresent(String.self, forKey: .text)
+        let resolvedValue = value ?? text ?? label ?? ""
+        let resolvedLabel = label ?? text ?? value ?? ""
+        guard resolvedValue.isEmpty == false || resolvedLabel.isEmpty == false else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: container.codingPath, debugDescription: "empty option")
+            )
+        }
+        self.value = resolvedValue.isEmpty ? resolvedLabel : resolvedValue
+        self.label = resolvedLabel.isEmpty ? self.value : resolvedLabel
+    }
+}

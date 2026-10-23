@@ -23,8 +23,21 @@ struct LoginView: View {
                         Task { await session.login() }
                     }
                     .disabled(session.busy || session.name.isEmpty)
+                    Button("Create new character") {
+                        session.openCharacterCreation()
+                    }
+                    .disabled(session.busy)
                 } footer: {
-                    Text(session.status)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(session.status)
+                            .foregroundStyle(session.characterMissing ? Color.red : Color(white: 0.78))
+                        if session.characterMissing {
+                            Button("Create new character") {
+                                session.openCharacterCreation()
+                            }
+                            .disabled(session.busy)
+                        }
+                    }
                 }
             }
             .scrollContentBackground(.hidden)

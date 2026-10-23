@@ -17,6 +17,24 @@ final class IMSession: ObservableObject {
     @Published var parked = false
     @Published var busy = false
     @Published var command = ""
+    /// Set when login failed because this name is not a character yet.
+    @Published var characterMissing = false
+    /// Name/email form, then the creation wizard. Nothing is written to the
+    /// Keychain or UserDefaults until the server returns a login body.
+    @Published var creating = false
+    @Published var createName = ""
+    @Published var createEmail = ""
+    @Published var createError: String?
+    /// ANSI greeting for the creation wizard. Shown as sent, not as a transcript line.
+    @Published var createGreeting: String?
+    @Published var createStep: CreateStep?
+    @Published var createBusy = false
+    /// In memory only, so leaving the app to read the emailed password does not drop it.
+    private var createCID: String?
+    /// The password just submitted. Stored only after the login body arrives.
+    private var createPassword: String?
+    /// Bumped on cancel and on an ended creation so a late response is ignored.
+    private var createGeneration = 0
     @Published private(set) var savedName = ""
     @Published private(set) var savedTokenAvailable = false
     /// Set before the resume or catch-up lines are published, and cleared only
@@ -136,6 +154,7 @@ final class IMSession: ObservableObject {
 
     func login() async {
         busy = true
+        characterMissing = false
         defer { busy = false }
         if offersResume {
             hydrateSavedSession()
@@ -157,6 +176,90 @@ final class IMSession: ObservableObject {
             }
         }
         await passwordLogin()
+    }
+
+    /// Opens the name and email form. The login name is the starting point.
+    func openCharacterCreation() {
+        createGeneration += 1
+        createCID = nil
+        createPassword = nil
+        createGreeting = nil
+        createStep = nil
+        createError = nil
+        createBusy = false
+        createName = name
+        createEmail = ""
+        characterMissing = false
+        creating = true
+    }
+
+    func startCharacterCreation() async {
+        let trimmedName = createName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedEmail = createEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedName.isEmpty == false, trimmedEmail.isEmpty == false, createBusy == false else { return }
+        let generation = createGeneration
+        createBusy = true
+        createError = nil
+        defer { createBusy = false }
+        do {
+            let http = try await createSend(
+                method: "POST",
+                path: "/v1/create",
+                json: ["name": trimmedName, "email": trimmedEmail]
+            )
+            guard generation == createGeneration else {
+                abortLateCreation(http.data)
+                return
+            }
+            await handleCreateHTTP(http, phase: .start, generation: generation)
+        } catch {
+            guard generation == createGeneration else { return }
+            presentCreateFailure(failureMessage(error), phase: .start)
+        }
+    }
+
+    func answerCharacterCreation(_ value: String) async {
+        guard let cid = createCID, createBusy == false else { return }
+        guard value.isEmpty == false else { return }
+        if createStep?.isPassword == true {
+            createPassword = value
+        }
+        let generation = createGeneration
+        createBusy = true
+        defer { createBusy = false }
+        do {
+            let http = try await createSend(
+                method: "POST",
+                path: "/v1/create/\(pathComponent(cid))/answer",
+                json: ["value": value]
+            )
+            guard generation == createGeneration else {
+                abortLateCreation(http.data)
+                return
+            }
+            await handleCreateHTTP(http, phase: .answer, generation: generation)
+        } catch {
+            guard generation == createGeneration else { return }
+            presentCreateFailure(failureMessage(error), phase: .answer)
+        }
+    }
+
+    /// Cancel, or the creation screen leaving the hierarchy. DELETE is fire-and-forget.
+    /// Backgrounding the app does not come through here: the player has to read the email.
+    func cancelCharacterCreation() {
+        let cid = createCID
+        createGeneration += 1
+        clearCreationMemory()
+        status = "Character creation cancelled."
+        if let cid {
+            deleteCreation(cid)
+        }
+    }
+
+    /// Safety net when the wizard view goes away while a creation is still open.
+    func abandonCharacterCreationIfNeeded() {
+        guard createCID != nil else { return }
+        cancelCharacterCreation()
     }
 
     func send() async {
@@ -286,6 +389,7 @@ final class IMSession: ObservableObject {
     }
 
     private func passwordLogin() async {
+        characterMissing = false
         guard name.isEmpty == false else { return }
         guard password.isEmpty == false else {
             token = nil
@@ -315,6 +419,7 @@ final class IMSession: ObservableObject {
                 // Wrong password leaves the parked session alone. Do not close it.
                 status = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
                     ?? "Login failed (401)"
+                characterMissing = Self.indicatesMissingCharacter(status)
                 stopLive()
                 token = nil
                 return
@@ -322,6 +427,7 @@ final class IMSession: ObservableObject {
             if http.statusCode != 200 {
                 status = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
                     ?? "Login failed (\(http.statusCode))"
+                characterMissing = Self.indicatesMissingCharacter(status) || http.statusCode == 404
                 token = nil
                 return
             }
@@ -913,5 +1019,242 @@ final class IMSession: ObservableObject {
             return http.message
         }
         return error.localizedDescription
+    }
+
+    private enum CreatePhase {
+        case start
+        case answer
+    }
+
+    /// `POST /v1/create` and `POST /v1/create/{cid}/answer`.
+    /// A body with `token` is the login body and starts the normal session.
+    /// Answer 404, or a status of aborted/closed, returns to login with the message.
+    /// Other create errors stay on the form or on the current step.
+    private func handleCreateHTTP(
+        _ http: (status: Int, data: Data),
+        phase: CreatePhase,
+        generation: Int
+    ) async {
+        guard generation == createGeneration else { return }
+        let object = jsonObject(http.data) ?? [:]
+        if phase == .answer, http.status == 404 || http.status == 410 {
+            returnToLogin(errorText(from: http.data, status: http.status))
+            return
+        }
+        // A login body wins over an ended flag. Final success is the normal session.
+        if object["token"] is String,
+           let login = try? JSONDecoder().decode(LoginResponse.self, from: http.data) {
+            guard generation == createGeneration else { return }
+            await enterCreatedSession(login)
+            return
+        }
+        if phase == .answer, let ended = creationEndedMessage(object) {
+            returnToLogin(ended)
+            return
+        }
+        if let step = decodeCreateStep(in: object) {
+            if phase == .start {
+                guard let cid = stringField(object, "cid"), object["greeting"] is String else {
+                    createError = errorText(from: http.data, status: http.status)
+                    return
+                }
+                createCID = cid
+                createGreeting = object["greeting"] as? String ?? ""
+                createStep = step
+                createError = nil
+                return
+            }
+            if let cid = stringField(object, "cid") {
+                createCID = cid
+            }
+            if let greeting = object["greeting"] as? String {
+                createGreeting = greeting
+            }
+            createStep = step
+            return
+        }
+        let message = errorText(from: http.data, status: http.status)
+        if phase == .answer, isAbortError(message) {
+            returnToLogin(message)
+            return
+        }
+        presentCreateFailure(message, phase: phase)
+    }
+
+    /// Same session start as a successful login: Keychain token and session id,
+    /// then since polling. The previous character's disconnect gap is not reused.
+    private func enterCreatedSession(_ login: LoginResponse) async {
+        let keptPassword = createPassword
+        let keptName = createName.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Clear the id before the wizard view leaves, so its disappear hook does not DELETE.
+        createCID = nil
+        creating = false
+        createGreeting = nil
+        createStep = nil
+        createPassword = nil
+        createError = nil
+        createBusy = false
+        characterMissing = false
+        name = login.character.isEmpty ? keptName : login.character
+        if let keptPassword, keptPassword.isEmpty == false {
+            password = keptPassword
+        }
+        didAutoLogin = true
+        token = login.token
+        sessionId = login.sessionId
+        adoptCharacter(login.character)
+        parked = login.parked ?? false
+        savedName = name
+        clearDisconnectMarker()
+        clearShownDisconnect()
+        cancelResumeReveal()
+        replaceTranscript(
+            login.lines ?? [],
+            animatedScroll: true,
+            serverDisconnectedAt: nil,
+            trustCursor: false
+        )
+        persistAccount()
+        let announcement = login.resumed == true
+            ? "Resumed \(login.character)."
+            : "Playing as \(login.character)"
+        await settleAfterResume(announcement: announcement)
+    }
+
+    private func returnToLogin(_ message: String) {
+        createGeneration += 1
+        clearCreationMemory()
+        status = message
+    }
+
+    private func clearCreationMemory() {
+        createCID = nil
+        creating = false
+        createGreeting = nil
+        createStep = nil
+        createPassword = nil
+        createError = nil
+        createBusy = false
+        characterMissing = false
+    }
+
+    /// A response that arrived after Cancel. Abort that creation and do not log in.
+    private func abortLateCreation(_ data: Data) {
+        guard let object = jsonObject(data), let cid = stringField(object, "cid") else { return }
+        deleteCreation(cid)
+    }
+
+    private func presentCreateFailure(_ message: String, phase: CreatePhase) {
+        if phase == .start || createStep == nil {
+            createError = message
+            return
+        }
+        var step = createStep!
+        step.error = message
+        createStep = step
+    }
+
+    private func decodeCreateStep(in object: [String: Any]) -> CreateStep? {
+        if let nested = object["step"], let step = CreateStep.decodeJSON(nested) {
+            return step
+        }
+        return CreateStep.decodeJSON(object)
+    }
+
+    private func creationEndedMessage(_ object: [String: Any]) -> String? {
+        let raw = (object["status"] as? String) ?? (object["state"] as? String) ?? ""
+        let status = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let aborted = status == "aborted" || object["aborted"] as? Bool == true
+        let closed = status == "closed" || object["closed"] as? Bool == true
+        guard aborted || closed else { return nil }
+        if let error = object["error"] as? String, error.isEmpty == false {
+            return error
+        }
+        if status == "aborted" || status == "closed" {
+            return raw
+        }
+        return aborted ? "aborted" : "closed"
+    }
+
+    private func isAbortError(_ error: String) -> Bool {
+        let key = error.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return key == "aborted" || key == "closed"
+    }
+
+    private func errorText(from data: Data, status: Int) -> String {
+        if let object = jsonObject(data),
+           let error = object["error"] as? String,
+           error.isEmpty == false {
+            return error
+        }
+        return "Creation failed (\(status))"
+    }
+
+    private func stringField(_ object: [String: Any], _ key: String) -> String? {
+        guard let value = object[key] as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func jsonObject(_ data: Data) -> [String: Any]? {
+        guard data.isEmpty == false else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private func createSend(
+        method: String,
+        path: String,
+        json: [String: Any]?
+    ) async throws -> (status: Int, data: Data) {
+        var req = URLRequest(url: url(path))
+        req.httpMethod = method
+        if let json {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: json)
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw HTTPFailure(status: 0, message: "No response from the IM server.")
+        }
+        return (http.statusCode, data)
+    }
+
+    /// Does not wait, and does not care if the server already dropped the creation.
+    private func deleteCreation(_ cid: String) {
+        let endpoint = url("/v1/create/\(pathComponent(cid))")
+        Task {
+            var req = URLRequest(url: endpoint)
+            req.httpMethod = "DELETE"
+            _ = try? await URLSession.shared.data(for: req)
+        }
+    }
+
+    private func pathComponent(_ raw: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return raw.addingPercentEncoding(withAllowedCharacters: allowed) ?? raw
+    }
+
+    /// Login copy that means the name is not a character yet. The create
+    /// button is always on the login screen; this is the extra offer beside the error.
+    private static func indicatesMissingCharacter(_ message: String) -> Bool {
+        let text = message.lowercased()
+        let phrases = [
+            "does not exist",
+            "doesn't exist",
+            "doesnt exist",
+            "no such",
+            "unknown character",
+            "unknown player",
+            "unknown name",
+            "no character",
+            "no player",
+            "character not found",
+            "player not found",
+            "name not found",
+            "not exist",
+            "did i get that right"
+        ]
+        return phrases.contains { text.contains($0) }
     }
 }
