@@ -7,6 +7,7 @@ private let screen = Color.black
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
+    @FocusState private var commandFocused: Bool
 
     var body: some View {
         NavigationStack {
@@ -26,6 +27,7 @@ struct TranscriptView: View {
                             .padding(.vertical, 8)
                             .frame(minHeight: geo.size.height, alignment: .topLeading)
                         }
+                        .scrollDismissesKeyboard(.interactively)
                         .onChange(of: session.lines.last?.seq) { _, seq in
                             if let seq {
                                 proxy.scrollTo(seq, anchor: .bottom)
@@ -42,6 +44,7 @@ struct TranscriptView: View {
                         .foregroundStyle(ink)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .focused($commandFocused)
                         .onSubmit { Task { await session.send() } }
                     Button("Send") { Task { await session.send() } }
                         .foregroundStyle(ink)
@@ -66,6 +69,13 @@ struct TranscriptView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Quit") {
                         Task { await session.logout(closeMud: true) }
+                    }
+                    .foregroundStyle(ink)
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") {
+                        commandFocused = false
                     }
                     .foregroundStyle(ink)
                 }
