@@ -14,7 +14,7 @@ struct NilgiriIMApp: App {
                 .environmentObject(session)
                 .onAppear {
                     AppDelegate.session = session
-                    clearDeliveredNotificationsAndBadge()
+                    clearDeliveredNotificationsAndBadge(session)
                 }
                 .task {
                     await session.restoreOnLaunch()
@@ -23,7 +23,7 @@ struct NilgiriIMApp: App {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
-                clearDeliveredNotificationsAndBadge()
+                clearDeliveredNotificationsAndBadge(session)
             }
         }
     }
@@ -31,7 +31,8 @@ struct NilgiriIMApp: App {
 
 /// Launch and every return to the foreground. Delivered alerts are removed;
 /// scheduled ones stay. The badge uses the iOS 16 API, then the older icon property.
-private func clearDeliveredNotificationsAndBadge() {
+/// The server counter is cleared after that when a session is already open.
+private func clearDeliveredNotificationsAndBadge(_ session: IMSession) {
     let center = UNUserNotificationCenter.current()
     center.removeAllDeliveredNotifications()
     if #available(iOS 16.0, *) {
@@ -39,6 +40,7 @@ private func clearDeliveredNotificationsAndBadge() {
     } else {
         UIApplication.shared.applicationIconBadgeNumber = 0
     }
+    session.resetServerBadge()
 }
 
 struct RootView: View {
