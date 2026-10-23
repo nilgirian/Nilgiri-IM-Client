@@ -234,6 +234,13 @@ final class IMSession: ObservableObject {
         }
     }
 
+    /// Fire-and-forget. Login, resume, and since also zero the counter.
+    /// Older servers have no route and answer 404.
+    func resetServerBadge() {
+        guard token != nil, sessionId != nil else { return }
+        Task { try? await post("/badge/reset", [:]) }
+    }
+
     func catchUp() async {
         guard token != nil, sessionId != nil else { return }
         switch await fetchSince() {
