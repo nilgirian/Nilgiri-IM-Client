@@ -224,7 +224,7 @@ struct TranscriptView: View {
     /// horizontal padding, so the line meets both edges of the transcript.
     private func separatorRow(_ line: LineDTO) -> some View {
         let stamp = line.disconnectAt.map { DisconnectSeparator.stamp(at: $0) } ?? line.text
-        HStack(spacing: 8) {
+        return HStack(spacing: 8) {
             Rectangle()
                 .fill(Color.secondary)
                 .frame(height: 1)
@@ -269,14 +269,19 @@ private struct TranscriptBottomAnchor: ViewModifier {
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
-            let sizeAnchor: UnitPoint? = suspendSizePin ? nil : .bottom
-            content
-                .defaultScrollAnchor(.bottom, for: .initialOffset)
-                .defaultScrollAnchor(sizeAnchor, for: .sizeChanges)
+            anchored(content)
         } else if suspendSizePin {
             content
         } else {
             content.defaultScrollAnchor(.bottom)
         }
+    }
+
+    @available(iOS 18.0, *)
+    private func anchored(_ content: Content) -> some View {
+        let sizeAnchor: UnitPoint? = suspendSizePin ? nil : .bottom
+        return content
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(sizeAnchor, for: .sizeChanges)
     }
 }
