@@ -11,7 +11,10 @@ struct NilgiriIMApp: App {
                 .environmentObject(session)
                 .onAppear {
                     AppDelegate.session = session
-                    Task { await PushRegistration.request(session: session) }
+                }
+                .task {
+                    await session.restoreOnLaunch()
+                    await PushRegistration.request(session: session)
                 }
         }
     }
