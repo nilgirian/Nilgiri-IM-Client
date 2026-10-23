@@ -19,7 +19,7 @@ struct LoginView: View {
                     SecureField("Password", text: $session.password)
                 }
                 Section {
-                    Button("Enter Nilgiri") {
+                    Button(session.offersResume ? "Resume parked session" : "Enter Nilgiri") {
                         Task { await session.login() }
                     }
                     .disabled(session.busy || session.name.isEmpty)
