@@ -21,6 +21,15 @@ final class IMSession: ObservableObject {
     /// Retry dismisses the alert before the new attempt finishes. That dismiss must
     /// not clear an alert the attempt just raised.
     private var suppressOutageDismiss = false
+    /// What Retry repeats. Login and resume stay on the parked session.
+    /// Creation retries the form, the last answer, or the abort DELETE.
+    private enum OutageFollowUp {
+        case login
+        case create
+        case answer(String)
+        case delete(String)
+    }
+    private var outageFollowUp: OutageFollowUp = .login
     @Published var parked = false
     @Published var busy = false
     @Published var command = ""
@@ -169,6 +178,7 @@ final class IMSession: ObservableObject {
         characterMissing = false
         defer { busy = false }
         outageLatched = false
+        outageFollowUp = .login
         if offersResume {
             hydrateSavedSession()
             switch await resumeDirect() {
@@ -203,12 +213,23 @@ final class IMSession: ObservableObject {
         outageAlert = nil
     }
 
-    /// Retry is a new attempt. A stored bearer resumes; otherwise this is a login.
+    /// Retry repeats the request that failed. A stored bearer resumes.
+    /// Create retries the form. A step retries the last answer. An abort retries DELETE.
     func retryOutage() async {
         suppressOutageDismiss = true
+        let followUp = outageFollowUp
         outageAlert = nil
         outageLatched = false
-        await login()
+        switch followUp {
+        case .login:
+            await login()
+        case .create:
+            await startCharacterCreation()
+        case .answer(let value):
+            await answerCharacterCreation(value)
+        case .delete(let cid):
+            await performDeleteCreation(cid)
+        }
         // A dismiss of the alert Retry just closed can arrive after the new
         // attempt has raised another one. Leave the flag set so that dismiss
         // does not clear the new alert. If this attempt raised nothing, drop it.
@@ -250,9 +271,17 @@ final class IMSession: ObservableObject {
                 abortLateCreation(http.data)
                 return
             }
+            if let kind = OutageKind.http(status: http.status, data: http.data) {
+                reportOutage(kind, retry: .create)
+                return
+            }
             await handleCreateHTTP(http, phase: .start, generation: generation)
         } catch {
             guard generation == createGeneration else { return }
+            if let kind = OutageKind.transport(error) {
+                reportOutage(kind, retry: .create)
+                return
+            }
             presentCreateFailure(failureMessage(error), phase: .start)
         }
     }
@@ -276,9 +305,17 @@ final class IMSession: ObservableObject {
                 abortLateCreation(http.data)
                 return
             }
+            if let kind = OutageKind.http(status: http.status, data: http.data) {
+                reportOutage(kind, retry: .answer(value))
+                return
+            }
             await handleCreateHTTP(http, phase: .answer, generation: generation)
         } catch {
             guard generation == createGeneration else { return }
+            if let kind = OutageKind.transport(error) {
+                reportOutage(kind, retry: .answer(value))
+                return
+            }
             presentCreateFailure(failureMessage(error), phase: .answer)
         }
     }
@@ -600,10 +637,12 @@ final class IMSession: ObservableObject {
 
     /// Login, resume, reconnect, and character creation share this.
     /// Since polling calls it only while `outageLatched` is false.
-    private func reportOutage(_ kind: OutageKind) {
+    /// `retry` is recorded only when this call is the one that shows the alert.
+    private func reportOutage(_ kind: OutageKind, retry: OutageFollowUp = .login) {
         outageLatched = true
         status = kind.message
         guard outageAlert == nil else { return }
+        outageFollowUp = retry
         outageAlert = kind
     }
 
@@ -1303,13 +1342,29 @@ final class IMSession: ObservableObject {
         return (http.statusCode, data)
     }
 
-    /// Does not wait, and does not care if the server already dropped the creation.
+    /// Does not wait. A proxy or MUD outage still raises the shared alert.
+    /// 404 and 410 mean the creation is already gone, so those stay quiet.
     private func deleteCreation(_ cid: String) {
-        let endpoint = url("/v1/create/\(pathComponent(cid))")
-        Task {
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "DELETE"
-            _ = try? await URLSession.shared.data(for: req)
+        Task { await performDeleteCreation(cid) }
+    }
+
+    private func performDeleteCreation(_ cid: String) async {
+        do {
+            let http = try await createSend(
+                method: "DELETE",
+                path: "/v1/create/\(pathComponent(cid))",
+                json: nil
+            )
+            if http.status == 404 || http.status == 410 {
+                return
+            }
+            if let kind = OutageKind.http(status: http.status, data: http.data) {
+                reportOutage(kind, retry: .delete(cid))
+            }
+        } catch {
+            if let kind = OutageKind.transport(error) {
+                reportOutage(kind, retry: .delete(cid))
+            }
         }
     }
 
