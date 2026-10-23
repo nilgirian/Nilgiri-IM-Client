@@ -7,7 +7,7 @@ struct LoginResponse: Decodable {
     let lines: [LineDTO]?
 }
 
-struct LineDTO: Decodable, Identifiable {
+struct LineDTO: Decodable, Identifiable, Equatable {
     var id: Int64 { seq }
     let seq: Int64
     let at: Int64
