@@ -6,6 +6,8 @@ private let screen = Color.black
 private let transcriptBottomID = "transcript-bottom"
 /// Above this, the transcript stays lazy and the ease walks in short hops.
 private let modestTranscriptCount = 600
+/// Still at the bottom if the latest text is within this distance of the viewport.
+private let nearBottomSlack: CGFloat = 80
 
 /// One bottom snap per runloop turn. The flag lives on a class so arming it
 /// does not publish another view update.
@@ -36,6 +38,11 @@ struct TranscriptView: View {
     /// minimum height stays above it, so a short log still fills the visible area.
     @State private var inputBarHeight: CGFloat = 0
     @State private var bottomSnapGate = BottomSnapGate()
+    /// True when the latest text was at or near the bottom before the last size change.
+    @State private var nearBottom = true
+    /// Distance updates in this window are the layout catching up to a bottom snap,
+    /// not the reader scrolling away.
+    @State private var holdBottomUntil = Date.distantPast
 
     /// Count and the newest line, so a capped buffer and an insert both register
     /// without observing the whole transcript array.
@@ -67,6 +74,23 @@ struct TranscriptView: View {
                     .onChange(of: scenePhase) { _, _ in
                         considerReveal(proxy, reason: "phase")
                     }
+                    .onChange(of: geo.size) { _, newSize in
+                        guard newSize.width > 1, newSize.height > 1 else { return }
+                        reanchorAfterGeometryChange(proxy, wasNearBottom: nearBottom)
+                    }
+                    .onChange(of: geo.safeAreaInsets.bottom) { _, _ in
+                        reanchorAfterGeometryChange(proxy, wasNearBottom: nearBottom)
+                    }
+                    .onChange(of: inputBarHeight) { _, newHeight in
+                        guard newHeight > 1 else { return }
+                        reanchorAfterGeometryChange(proxy, wasNearBottom: nearBottom)
+                    }
+                    .modifier(TranscriptResizeStick(
+                        nearBottom: $nearBottom,
+                        revealPending: session.pendingResumeReveal,
+                        holdBottomUntil: holdBottomUntil,
+                        reanchor: { reanchorAfterGeometryChange(proxy, wasNearBottom: true) }
+                    ))
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         inputBar
                     }
@@ -311,10 +335,38 @@ struct TranscriptView: View {
         runningSeparatorID = nil
         let deferred = bottomScrollDeferred
         bottomScrollDeferred = false
+        // The ease ends on the latest line, so the next size change may stick.
+        holdBottom()
         session.finishResumeReveal(separatorID: separatorID)
         if deferred {
             scrollToBottomNow()
         }
+    }
+
+    /// Orientation, keyboard, split view, and Stage Manager all change the
+    /// container or the bottom inset before the text has reflowed. The scroll
+    /// view would otherwise pin with the old insets and land mid-transcript
+    /// or leave a gap under the last line. Wait until the next layout, then
+    /// once more after a short delay, and let a newer change cancel the older
+    /// one. A reconnect reveal owns the scroll until it finishes.
+    private func reanchorAfterGeometryChange(_ proxy: ScrollViewProxy, wasNearBottom: Bool) {
+        guard wasNearBottom else { return }
+        guard session.pendingResumeReveal == false else { return }
+        holdBottom()
+        bottomScrollGeneration += 1
+        let generation = bottomScrollGeneration
+        let scroll = {
+            guard generation == self.bottomScrollGeneration else { return }
+            guard self.session.pendingResumeReveal == false else { return }
+            self.scrollToBottomNow(proxy)
+        }
+        DispatchQueue.main.async(execute: scroll)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: scroll)
+    }
+
+    private func holdBottom() {
+        nearBottom = true
+        holdBottomUntil = Date().addingTimeInterval(0.25)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
@@ -340,6 +392,7 @@ struct TranscriptView: View {
     }
 
     private func scrollToBottomNow(_ proxy: ScrollViewProxy) {
+        holdBottom()
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -351,6 +404,7 @@ struct TranscriptView: View {
 
     /// Used when the ease ends and the proxy from the original call is not required.
     private func scrollToBottomNow() {
+        holdBottom()
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -376,11 +430,31 @@ struct TranscriptView: View {
         }
     }
 
+    @ViewBuilder
     private var bottomMarker: some View {
-        Color.clear
+        let marker = Color.clear
             .frame(height: 1)
             .allowsHitTesting(false)
             .id(transcriptBottomID)
+        if #available(iOS 18.0, *) {
+            marker
+        } else {
+            marker
+                .onAppear { holdBottom() }
+                .onDisappear { noteLeftBottom() }
+        }
+    }
+
+    /// iOS 17 has no scroll geometry. The bottom marker leaving the screen is
+    /// the reader moving up, unless a size change already replaced that scroll.
+    private func noteLeftBottom() {
+        let generation = bottomScrollGeneration
+        DispatchQueue.main.async {
+            guard generation == self.bottomScrollGeneration else { return }
+            guard self.session.pendingResumeReveal == false else { return }
+            guard Date() >= self.holdBottomUntil else { return }
+            self.nearBottom = false
+        }
     }
 
     @ViewBuilder
@@ -438,10 +512,11 @@ private struct InputBarHeightKey: PreferenceKey {
     }
 }
 
-/// Both the initial placement and later content-size changes pin to the bottom.
-/// Either one snaps a resume to the end before the ease can move, so both are off
-/// for the whole pending reveal. On iOS 18 the modifiers stay in the tree and the
-/// anchors become nil. On iOS 17 the single modifier is removed.
+/// Initial placement pins to the bottom. It is off for the whole pending reveal
+/// so a resume does not snap to the end before the ease can move. On iOS 18 the
+/// modifier stays in the tree and the anchor becomes nil. On iOS 17 it is removed.
+/// Size changes are not pinned here: that anchor runs before the reflow and the
+/// new insets exist, and it would also pull a reader who had scrolled up.
 private struct TranscriptBottomAnchor: ViewModifier {
     var enabled: Bool
 
@@ -460,6 +535,54 @@ private struct TranscriptBottomAnchor: ViewModifier {
         let anchor: UnitPoint? = enabled ? .bottom : nil
         return content
             .defaultScrollAnchor(anchor, for: .initialOffset)
-            .defaultScrollAnchor(anchor, for: .sizeChanges)
+            .defaultScrollAnchor(nil, for: .sizeChanges)
+    }
+}
+
+/// Container size and the bottom content inset, plus how far the viewport sits
+/// above the end of the text. The inset is only a change signal. The correction
+/// scroll runs later, against the settled layout, and never reuses this inset.
+private struct TranscriptScrollSample: Equatable {
+    var width: CGFloat
+    var height: CGFloat
+    var bottomInset: CGFloat
+    var distanceFromBottom: CGFloat
+}
+
+/// iOS 18: remember whether the reader was near the bottom, and re-anchor when
+/// the scroll container or its bottom inset changes. iOS 17 uses the container
+/// size and the bottom marker instead.
+private struct TranscriptResizeStick: ViewModifier {
+    @Binding var nearBottom: Bool
+    var revealPending: Bool
+    var holdBottomUntil: Date
+    var reanchor: () -> Void
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.onScrollGeometryChange(for: TranscriptScrollSample.self) { geo in
+                TranscriptScrollSample(
+                    width: geo.containerSize.width,
+                    height: geo.containerSize.height,
+                    bottomInset: geo.contentInsets.bottom,
+                    distanceFromBottom: geo.contentSize.height - geo.visibleRect.maxY
+                )
+            } action: { old, new in
+                guard revealPending == false else { return }
+                let containerChanged = abs(old.width - new.width) > 0.5
+                    || abs(old.height - new.height) > 0.5
+                    || abs(old.bottomInset - new.bottomInset) > 0.5
+                if containerChanged {
+                    let wasNear = old.distanceFromBottom <= nearBottomSlack || nearBottom
+                    guard wasNear else { return }
+                    nearBottom = true
+                    reanchor()
+                } else if Date() >= holdBottomUntil {
+                    nearBottom = new.distanceFromBottom <= nearBottomSlack
+                }
+            }
+        } else {
+            content
+        }
     }
 }
