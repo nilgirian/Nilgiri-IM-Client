@@ -163,7 +163,10 @@ enum HMVPrompt {
     }
 
     /// Removes every prompt from `raw`. The last one supplies the vitals.
-    /// Leftover text is trimmed; an empty result means the line was only a prompt.
+    /// Spaces and tabs that follow the prompt are removed with it. ANSI next to
+    /// the `>` is left in place, so a reset still applies to the text after it.
+    /// Everything else, including a newline or the leading spaces of the next
+    /// line, stays byte for byte. An empty result means the line was only a prompt.
     static func strip(_ raw: String) -> (text: String, vitals: Vitals?) {
         let (plain, map) = strippingANSI(raw)
         let ns = plain as NSString
@@ -183,65 +186,69 @@ enum HMVPrompt {
                   let original = originalRange(of: whole, in: plain, map: map, raw: raw) else { continue }
             vitals = Vitals(hp: hp, mana: mana, moves: moves)
             removals.append(original)
+            removals.append(contentsOf: trailingSeparators(after: original.upperBound, in: raw))
         }
         guard removals.isEmpty == false else { return (raw, vitals) }
-        let holes = merged(removals.map { eatingHorizontalSpace($0, in: raw) })
+        let holes = merged(removals)
         var text = ""
         var cursor = raw.startIndex
         for hole in holes {
             if cursor < hole.lowerBound {
-                append(raw[cursor..<hole.lowerBound], to: &text)
+                text.append(contentsOf: raw[cursor..<hole.lowerBound])
             }
             cursor = max(cursor, hole.upperBound)
         }
         if cursor < raw.endIndex {
-            append(raw[cursor...], to: &text)
+            text.append(contentsOf: raw[cursor...])
         }
-        let normalized = text
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-        let trimmed = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
-        let (remainder, _) = strippingANSI(trimmed)
-        if remainder.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return ("", vitals)
-        }
-        return (trimmed, vitals)
+        if text.isEmpty { return ("", vitals) }
+        let (remainder, _) = strippingANSI(text)
+        let visible = remainder.contains { $0.isNewline == false && $0 != " " && $0 != "\t" }
+        if visible { return (text, vitals) }
+        // Prompt plus its separator, or only a color code. A newline is a blank line.
+        if remainder.contains(where: \.isNewline) { return (text, vitals) }
+        return ("", vitals)
     }
 
-    /// Pulls in spaces next to the prompt so `<30h 100m 97v>` between two words
-    /// leaves one space, and a prompt-only line leaves nothing.
-    private static func eatingHorizontalSpace(
-        _ range: Range<String.Index>,
+    /// Spaces and tabs after the prompt. Color codes between `>` and those
+    /// spaces are skipped, not deleted, and a newline stops the scan so the
+    /// next line's own indent is left alone.
+    private static func trailingSeparators(
+        after start: String.Index,
         in raw: String
-    ) -> Range<String.Index> {
-        var lower = range.lowerBound
-        var upper = range.upperBound
-        while lower > raw.startIndex {
-            let previous = raw.index(before: lower)
-            if raw[previous] == " " || raw[previous] == "\t" {
-                lower = previous
-            } else {
-                break
+    ) -> [Range<String.Index>] {
+        var ranges: [Range<String.Index>] = []
+        var index = start
+        while index < raw.endIndex {
+            if raw[index] == " " || raw[index] == "\t" {
+                let begin = index
+                while index < raw.endIndex, raw[index] == " " || raw[index] == "\t" {
+                    index = raw.index(after: index)
+                }
+                ranges.append(begin..<index)
+                continue
             }
+            if let afterCode = endOfCSI(raw, from: index) {
+                index = afterCode
+                continue
+            }
+            break
         }
-        while upper < raw.endIndex, raw[upper] == " " || raw[upper] == "\t" {
-            upper = raw.index(after: upper)
-        }
-        return lower..<upper
+        return ranges
     }
 
-    /// One space when a prompt sat between two words. Newlines stay put.
-    private static func append(_ chunk: Substring, to text: inout String) {
-        guard chunk.isEmpty == false else { return }
-        let boundary = { (character: Character) in
-            character == " " || character == "\t" || character.isNewline
+    /// The index just after a CSI sequence starting at `index`, if one is there.
+    private static func endOfCSI(_ raw: String, from index: String.Index) -> String.Index? {
+        guard raw[index] == "\u{001B}" else { return nil }
+        let bracket = raw.index(after: index)
+        guard bracket < raw.endIndex, raw[bracket] == "[" else { return nil }
+        var cursor = raw.index(after: bracket)
+        while cursor < raw.endIndex {
+            let character = raw[cursor]
+            cursor = raw.index(after: cursor)
+            if character.isLetter { return cursor }
         }
-        if text.isEmpty == false,
-           let last = text.last, boundary(last) == false,
-           let first = chunk.first, boundary(first) == false {
-            text.append(" ")
-        }
-        text.append(contentsOf: chunk)
+        return cursor
     }
 
     private static func merged(_ ranges: [Range<String.Index>]) -> [Range<String.Index>] {
