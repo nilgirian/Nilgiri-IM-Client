@@ -50,10 +50,12 @@ struct RootView: View {
     @EnvironmentObject private var session: IMSession
 
     var body: some View {
-        if session.token == nil {
-            LoginView()
-        } else {
+        if session.token != nil {
             TranscriptView()
+        } else if session.creating {
+            CharacterCreateView()
+        } else {
+            LoginView()
         }
     }
 }
