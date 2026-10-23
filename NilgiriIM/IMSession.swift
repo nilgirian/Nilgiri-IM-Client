@@ -47,6 +47,11 @@ final class IMSession: ObservableObject {
         static let disconnectAt = "im.disconnectAt"
         static let disconnectSeq = "im.disconnectSeq"
         static let disconnectName = "im.disconnectName"
+        /// Server `disconnectedAt` (epoch ms) saved for a gap that has no new line yet.
+        static let disconnectServerMs = "im.disconnectServerMs"
+        /// Last server instant already drawn, so a later poll of the same value does not
+        /// add another separator.
+        static let shownDisconnectMs = "im.shownDisconnectMs"
     }
 
     private enum ResumeOutcome {
@@ -198,6 +203,7 @@ final class IMSession: ObservableObject {
             character = nil
             clearSessionSecrets()
             clearDisconnectMarker()
+            clearShownDisconnect()
             defaults.set("0", forKey: StoreKey.lastSeq)
             defaults.removeObject(forKey: StoreKey.character)
             status = "Unlinked. The MUD session is closed."
@@ -300,14 +306,22 @@ final class IMSession: ObservableObject {
             character = login.character
             parked = login.parked ?? false
             savedName = name
+            // A brand-new session has nothing to split. Older servers omit both flags.
+            let serverDisconnectedAt = login.resumed == false ? nil : login.disconnectedAt
             if login.resumed == false {
                 clearDisconnectMarker()
+                clearShownDisconnect()
                 cancelResumeReveal()
             }
             if login.resumed == true && includeSince {
-                append(login.lines ?? [], animatedScroll: true)
+                append(login.lines ?? [], animatedScroll: true, serverDisconnectedAt: serverDisconnectedAt)
             } else {
-                replaceTranscript(login.lines ?? [], animatedScroll: true)
+                replaceTranscript(
+                    login.lines ?? [],
+                    animatedScroll: true,
+                    serverDisconnectedAt: serverDisconnectedAt,
+                    allowServerOnly: login.resumed != false && nameMatchesHeld()
+                )
                 if includeSince && lines.isEmpty {
                     lastSeq = 0
                     persistCursor()
@@ -347,9 +361,14 @@ final class IMSession: ObservableObject {
                     return .offline
                 }
                 if lines.isEmpty {
-                    replaceTranscript(since.lines, animatedScroll: true)
+                    replaceTranscript(
+                        since.lines,
+                        animatedScroll: true,
+                        serverDisconnectedAt: since.disconnectedAt,
+                        allowServerOnly: true
+                    )
                 } else {
-                    append(since.lines, animatedScroll: true)
+                    append(since.lines, animatedScroll: true, serverDisconnectedAt: since.disconnectedAt)
                 }
                 if since.closed { return .closed }
                 return .ready
@@ -424,6 +443,7 @@ final class IMSession: ObservableObject {
         character = nil
         clearSessionSecrets()
         clearDisconnectMarker()
+        clearShownDisconnect()
         defaults.set("0", forKey: StoreKey.lastSeq)
         defaults.removeObject(forKey: StoreKey.character)
         if password.isEmpty == false && name.isEmpty == false {
@@ -521,7 +541,13 @@ final class IMSession: ObservableObject {
         }
     }
 
-    private func replaceTranscript(_ incoming: [LineDTO], animatedScroll: Bool = false) {
+    private func replaceTranscript(
+        _ incoming: [LineDTO],
+        animatedScroll: Bool = false,
+        serverDisconnectedAt: Int64? = nil,
+        allowServerOnly: Bool = false
+    ) {
+        let seenSeq = lastSeq
         var shown: [LineDTO] = []
         var maxSeq: Int64 = 0
         for line in incoming {
@@ -535,18 +561,33 @@ final class IMSession: ObservableObject {
         // Keep the newest window before the separator is placed, so a long
         // replace does not anchor the gap in lines that are about to be dropped.
         let window = shown.count > 4000 ? Array(shown.suffix(4000)) : shown
-        publishLines(trimmed(applyingDisconnectSeparator(window)), animatedScroll: animatedScroll)
+        publishLines(
+            trimmed(applyingDisconnectSeparator(
+                window,
+                seenSeq: seenSeq,
+                allowServerOnly: allowServerOnly,
+                serverDisconnectedAt: serverDisconnectedAt
+            )),
+            animatedScroll: animatedScroll
+        )
         persistCursor()
     }
 
-    private func append(_ incoming: [LineDTO], animatedScroll: Bool = false) {
+    private func append(
+        _ incoming: [LineDTO],
+        animatedScroll: Bool = false,
+        serverDisconnectedAt: Int64? = nil
+    ) {
         var next = lines
         for line in incoming where line.seq > lastSeq {
             lastSeq = line.seq
             guard shouldShow(line) else { continue }
             next.append(line)
         }
-        publishLines(trimmed(applyingDisconnectSeparator(next)), animatedScroll: animatedScroll)
+        publishLines(
+            trimmed(applyingDisconnectSeparator(next, serverDisconnectedAt: serverDisconnectedAt)),
+            animatedScroll: animatedScroll
+        )
         persistCursor()
     }
 
@@ -597,50 +638,105 @@ final class IMSession: ObservableObject {
     }
 
     /// First disconnect wins until a resume actually inserts the separator.
+    /// The stamp prefers a later server `disconnectedAt`; this only freezes the
+    /// device clock and the last seq the user had seen.
     private func noteDisconnect() {
         guard token != nil, sessionId != nil else { return }
         guard defaults.object(forKey: StoreKey.disconnectAt) == nil else { return }
         defaults.set(Date().timeIntervalSince1970, forKey: StoreKey.disconnectAt)
         defaults.set(String(lastSeq), forKey: StoreKey.disconnectSeq)
         defaults.set(character ?? name, forKey: StoreKey.disconnectName)
+        defaults.removeObject(forKey: StoreKey.disconnectServerMs)
     }
 
     private func clearDisconnectMarker() {
         defaults.removeObject(forKey: StoreKey.disconnectAt)
         defaults.removeObject(forKey: StoreKey.disconnectSeq)
         defaults.removeObject(forKey: StoreKey.disconnectName)
+        defaults.removeObject(forKey: StoreKey.disconnectServerMs)
     }
 
-    /// Places a local separator after the last server line the user had already
-    /// seen. The separator is not a server seq, so `lastSeq` stays the since cursor.
-    private func applyingDisconnectSeparator(_ source: [LineDTO]) -> [LineDTO] {
-        guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return source }
-        let heldName = defaults.string(forKey: StoreKey.disconnectName) ?? ""
-        let currentName = character ?? name
-        if heldName.isEmpty == false, namesEqual(heldName, currentName) == false {
+    private func clearShownDisconnect() {
+        defaults.removeObject(forKey: StoreKey.shownDisconnectMs)
+    }
+
+    private func shownDisconnectMs() -> Int64? {
+        guard let raw = defaults.string(forKey: StoreKey.shownDisconnectMs),
+              let ms = Int64(raw), ms > 0 else { return nil }
+        return ms
+    }
+
+    private func storedServerDisconnectMs() -> Int64? {
+        guard let raw = defaults.string(forKey: StoreKey.disconnectServerMs),
+              let ms = Int64(raw), ms > 0 else { return nil }
+        return ms
+    }
+
+    /// Remembers a server instant that has not already been drawn.
+    private func stashServerDisconnect(_ reportedMs: Int64?) {
+        guard let reportedMs, reportedMs > 0 else { return }
+        guard shownDisconnectMs() != Optional(reportedMs) else { return }
+        defaults.set(String(reportedMs), forKey: StoreKey.disconnectServerMs)
+    }
+
+    /// Places one local separator after the last server line the user had already
+    /// seen. The stamp uses the server's `disconnectedAt` (epoch ms) when that
+    /// field arrived on login or since, and the device clock otherwise. The
+    /// separator is not a server seq, so `lastSeq` stays the since cursor.
+    private func applyingDisconnectSeparator(
+        _ source: [LineDTO],
+        seenSeq: Int64 = 0,
+        allowServerOnly: Bool = false,
+        serverDisconnectedAt: Int64? = nil
+    ) -> [LineDTO] {
+        let reportedMs = serverDisconnectedAt.flatMap { $0 > 0 ? $0 : nil }
+        if disconnectMarkerNameMismatch() {
             clearDisconnectMarker()
-            return source
+            clearShownDisconnect()
         }
+        if defaults.object(forKey: StoreKey.disconnectAt) != nil {
+            stashServerDisconnect(reportedMs)
+        } else if allowServerOnly,
+                  let reportedMs,
+                  shownDisconnectMs() != Optional(reportedMs),
+                  seenSeq > 0,
+                  source.contains(where: { $0.isSeparator }) == false,
+                  source.contains(where: { $0.isServerLine && $0.seq > seenSeq }) {
+            // No device-clock gap (force quit, or a server that learned the drop
+            // first). Place this one backlog split, then remember the instant so
+            // the next poll of the same `disconnectedAt` does not draw it again.
+            defaults.set(Double(reportedMs) / 1000, forKey: StoreKey.disconnectAt)
+            defaults.set(String(seenSeq), forKey: StoreKey.disconnectSeq)
+            defaults.set(character ?? name, forKey: StoreKey.disconnectName)
+            defaults.set(String(reportedMs), forKey: StoreKey.disconnectServerMs)
+        }
+        guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return source }
         let disconnectSeq = Int64(defaults.string(forKey: StoreKey.disconnectSeq) ?? "") ?? 0
         let hasNewLine = source.contains { $0.isServerLine && $0.seq > disconnectSeq }
         guard hasNewLine else { return source }
-        let disconnected = Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
+        // Both instants are absolute. The device clock is the fallback when the
+        // server omits `disconnectedAt`. Display formats either one in TimeZone.current.
+        let deviceDate = Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
+        let serverMs = storedServerDisconnectMs()
+        let disconnected = serverMs.map(DisconnectSeparator.date(epochMilliseconds:)) ?? deviceDate
         let stamp = DisconnectSeparator.stamp(at: disconnected)
         var next = source
         let afterSeen = next.lastIndex(where: { $0.isServerLine && $0.seq <= disconnectSeq })
         let insertAt = afterSeen.map { $0 + 1 } ?? 0
-        if next.indices.contains(insertAt), next[insertAt].isSeparator {
+        // One row for this gap. A separator already at the insert point, or the same
+        // stamp already in the transcript, means the device clock and the server
+        // instant must not each add a line.
+        let alreadyShown = next.contains { $0.isSeparator && $0.text == stamp }
+        if (next.indices.contains(insertAt) && next[insertAt].isSeparator) || alreadyShown {
+            if let serverMs { defaults.set(String(serverMs), forKey: StoreKey.shownDisconnectMs) }
             clearDisconnectMarker()
             return next
         }
-        if next.contains(where: { $0.isSeparator && $0.text == stamp }) {
-            clearDisconnectMarker()
-            return next
-        }
+        let atMs = serverMs ?? Int64((disconnected.timeIntervalSince1970 * 1000.0).rounded())
         next.insert(
             LineDTO(
                 seq: -1,
-                at: Int64(disconnected.timeIntervalSince1970 * 1000),
+                at: atMs,
                 kind: "separator",
                 text: stamp,
                 localID: "separator-\(disconnectSeq)-\(stamp)",
@@ -648,8 +744,16 @@ final class IMSession: ObservableObject {
             ),
             at: insertAt
         )
+        if let serverMs { defaults.set(String(serverMs), forKey: StoreKey.shownDisconnectMs) }
         clearDisconnectMarker()
         return next
+    }
+
+    private func disconnectMarkerNameMismatch() -> Bool {
+        guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return false }
+        let heldName = defaults.string(forKey: StoreKey.disconnectName) ?? ""
+        let currentName = character ?? name
+        return heldName.isEmpty == false && namesEqual(heldName, currentName) == false
     }
 
     private func trimmed(_ source: [LineDTO]) -> [LineDTO] {

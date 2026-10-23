@@ -9,6 +9,23 @@ struct LoginResponse: Decodable {
     let resumed: Bool?
     /// False after a successful reattach; the server clears park on resume.
     let parked: Bool?
+    /// Epoch milliseconds when the server dropped the session. Older servers omit it.
+    let disconnectedAt: Int64?
+
+    private enum CodingKeys: String, CodingKey {
+        case token, sessionId, character, lines, resumed, parked, disconnectedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        token = try container.decode(String.self, forKey: .token)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        character = try container.decode(String.self, forKey: .character)
+        lines = try container.decodeIfPresent([LineDTO].self, forKey: .lines)
+        resumed = try container.decodeIfPresent(Bool.self, forKey: .resumed)
+        parked = try container.decodeIfPresent(Bool.self, forKey: .parked)
+        disconnectedAt = EpochMillis.decodeIfPresent(container, forKey: .disconnectedAt)
+    }
 }
 
 struct LineDTO: Decodable, Identifiable, Equatable {
@@ -51,12 +68,23 @@ struct LineDTO: Decodable, Identifiable, Equatable {
 }
 
 enum DisconnectSeparator {
-    /// `Oct 23, 2026 17:14:32` — en_US_POSIX, 24-hour, device timezone. No dashes.
+    /// Absolute instant from server epoch milliseconds. `Date` has no zone;
+    /// `stamp(at:)` is what places it on the device clock.
+    static func date(epochMilliseconds ms: Int64) -> Date {
+        Date(timeIntervalSince1970: Double(ms) / 1000.0)
+    }
+
+    /// `Oct 23, 2026 17:14:32` — en_US_POSIX, 24-hour, no dashes.
+    /// Always the device zone (`TimeZone.current`) and that zone's gregorian calendar.
+    /// No zone identifier is hardcoded, and the server's zone is never consulted.
+    /// The zone is applied after the POSIX locale: that locale otherwise formats in GMT.
     static func stamp(at date: Date) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone.current
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.timeZone = .current
+        formatter.calendar = calendar
+        formatter.timeZone = TimeZone.current
         formatter.dateFormat = "MMM d, yyyy HH:mm:ss"
         return formatter.string(from: date)
     }
@@ -65,6 +93,41 @@ enum DisconnectSeparator {
 struct SinceResponse: Decodable {
     let closed: Bool
     let lines: [LineDTO]
+    /// Epoch milliseconds when the server dropped the session. Older servers omit it.
+    let disconnectedAt: Int64?
+
+    private enum CodingKeys: String, CodingKey {
+        case closed, lines, disconnectedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        closed = try container.decode(Bool.self, forKey: .closed)
+        lines = try container.decode([LineDTO].self, forKey: .lines)
+        disconnectedAt = EpochMillis.decodeIfPresent(container, forKey: .disconnectedAt)
+    }
+}
+
+/// `disconnectedAt` is epoch milliseconds. Servers send an integer, sometimes a
+/// JSON number that decodes as a double, and older servers leave the field out.
+enum EpochMillis {
+    static func decodeIfPresent<K: CodingKey>(
+        _ container: KeyedDecodingContainer<K>,
+        forKey key: K
+    ) -> Int64? {
+        guard container.contains(key) else { return nil }
+        if (try? container.decodeNil(forKey: key)) == true { return nil }
+        if let ms = try? container.decode(Int64.self, forKey: key) {
+            return ms > 0 ? ms : nil
+        }
+        if let ms = try? container.decode(Double.self, forKey: key), ms.isFinite {
+            let rounded = ms.rounded()
+            // Reject values Double cannot round into Int64. A too-large conversion traps.
+            guard rounded > 0, rounded < Double(Int64.max) else { return nil }
+            return Int64(rounded)
+        }
+        return nil
+    }
 }
 
 struct ErrorResponse: Decodable {
