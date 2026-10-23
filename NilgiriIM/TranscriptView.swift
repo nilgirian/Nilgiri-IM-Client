@@ -1,4 +1,3 @@
-import os
 import SwiftUI
 
 private let terminalColumns = 80
@@ -7,7 +6,12 @@ private let screen = Color.black
 private let transcriptBottomID = "transcript-bottom"
 /// Above this, the transcript stays lazy and the ease walks in short hops.
 private let modestTranscriptCount = 600
-private let scrollLog = Logger(subsystem: "net.nilgiri.imclient", category: "scroll")
+
+/// One bottom snap per runloop turn. The flag lives on a class so arming it
+/// does not publish another view update.
+private final class BottomSnapGate {
+    var queued = false
+}
 
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
@@ -31,6 +35,13 @@ struct TranscriptView: View {
     /// Height of the input bar overlaid on the transcript. The scroll content's
     /// minimum height stays above it, so a short log still fills the visible area.
     @State private var inputBarHeight: CGFloat = 0
+    @State private var bottomSnapGate = BottomSnapGate()
+
+    /// Count and the newest line, so a capped buffer and an insert both register
+    /// without observing the whole transcript array.
+    private var linesScrollSignal: String {
+        "\(session.lines.count)#\(session.lines.last?.id ?? "")"
+    }
 
     var body: some View {
         NavigationStack {
@@ -47,15 +58,13 @@ struct TranscriptView: View {
                     .scrollPosition(id: $positionedID, anchor: positionAnchor)
                     .modifier(TranscriptBottomAnchor(enabled: session.pendingResumeReveal == false))
                     .onAppear { considerReveal(proxy, reason: "appear") }
-                    .onChange(of: session.lines) { _, _ in
+                    .onChange(of: linesScrollSignal) { _, _ in
                         considerReveal(proxy, reason: "lines")
                     }
                     .onChange(of: session.pendingResumeReveal) { _, _ in
                         considerReveal(proxy, reason: "pending")
                     }
-                    .onChange(of: scenePhase) { _, phase in
-                        let phaseName = String(describing: phase)
-                        scrollLog.debug("scenePhase=\(phaseName, privacy: .public)")
+                    .onChange(of: scenePhase) { _, _ in
                         considerReveal(proxy, reason: "phase")
                     }
                     .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -145,24 +154,19 @@ struct TranscriptView: View {
             }
             return
         }
-        guard scenePhase == .active else {
-            let phaseName = String(describing: scenePhase)
-            scrollLog.debug("reveal deferred reason=\(reason, privacy: .public) phase=\(phaseName, privacy: .public)")
-            return
-        }
+        guard scenePhase == .active else { return }
         if runningSeparatorID == separatorID, revealStarted != nil {
             if reason == "lines" {
                 bottomScrollDeferred = true
-                scrollLog.debug("lines during reveal; bottom snap suppressed")
             }
             return
         }
-        startReveal(proxy, separatorID: separatorID, reason: reason)
+        startReveal(proxy, separatorID: separatorID)
     }
 
     /// Jump to the separator only after the scene is active, then ease once a real
     /// layout pass has produced the row.
-    private func startReveal(_ proxy: ScrollViewProxy, separatorID: String, reason: String) {
+    private func startReveal(_ proxy: ScrollViewProxy, separatorID: String) {
         revealGeneration += 1
         bottomScrollGeneration += 1
         let generation = revealGeneration
@@ -173,15 +177,14 @@ struct TranscriptView: View {
         if separatorVisibleID != separatorID {
             separatorVisibleID = nil
         }
-        scrollLog.debug("reveal start reason=\(reason, privacy: .public) separator=\(separatorID, privacy: .public) lines=\(session.lines.count) anchor=off")
         DispatchQueue.main.async {
             guard generation == self.revealGeneration else { return }
-            self.jumpToSeparator(proxy, id: separatorID, attempt: 1)
+            self.jumpToSeparator(proxy, id: separatorID)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             guard generation == self.revealGeneration, self.easeStarted == false else { return }
             guard self.separatorVisibleID != separatorID else { return }
-            self.jumpToSeparator(proxy, id: separatorID, attempt: 2)
+            self.jumpToSeparator(proxy, id: separatorID)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             self.maybeEase(generation: generation, separatorID: separatorID, reason: "0.4s")
@@ -191,9 +194,8 @@ struct TranscriptView: View {
         }
     }
 
-    private func jumpToSeparator(_ proxy: ScrollViewProxy, id: String, attempt: Int) {
+    private func jumpToSeparator(_ proxy: ScrollViewProxy, id: String) {
         guard easeStarted == false else { return }
-        scrollLog.debug("jump to separator attempt=\(attempt) id=\(id, privacy: .public)")
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -207,7 +209,6 @@ struct TranscriptView: View {
         guard session.pendingResumeReveal, id == session.resumeSeparatorID else { return }
         guard separatorVisibleID != id else { return }
         separatorVisibleID = id
-        scrollLog.debug("separator onAppear id=\(id, privacy: .public)")
         guard let separatorID = runningSeparatorID, revealStarted != nil else { return }
         maybeEase(generation: revealGeneration, separatorID: separatorID, reason: "separator onAppear")
     }
@@ -218,14 +219,8 @@ struct TranscriptView: View {
         guard generation == revealGeneration, easeStarted == false else { return }
         let elapsed = revealStarted.map { Date().timeIntervalSince($0) } ?? 0
         let visible = separatorVisibleID == separatorID
-        let elapsedText = String(format: "%.2f", elapsed)
-        let visibleText = visible ? "yes" : "no"
         let ready = elapsed >= 0.4 && (visible || reason == "fallback")
-        guard ready else {
-            scrollLog.debug("ease waiting reason=\(reason, privacy: .public) elapsed=\(elapsedText, privacy: .public) visible=\(visibleText, privacy: .public)")
-            return
-        }
-        scrollLog.debug("ease go reason=\(reason, privacy: .public) elapsed=\(elapsedText, privacy: .public) visible=\(visibleText, privacy: .public) lines=\(session.lines.count)")
+        guard ready else { return }
         easeToBottom(generation: generation, separatorID: separatorID)
     }
 
@@ -234,7 +229,6 @@ struct TranscriptView: View {
         let hops = easeHops(from: separatorID)
         let count = hops.count
         if count <= 1 {
-            scrollLog.debug("ease single scrollPosition duration=1.0")
             withAnimation(.easeInOut(duration: 1.0)) {
                 positionAnchor = .bottom
                 positionedID = transcriptBottomID
@@ -243,15 +237,11 @@ struct TranscriptView: View {
             return
         }
         let slice = 1.0 / Double(count)
-        let sliceText = String(format: "%.2f", slice)
-        scrollLog.debug("ease stepped hops=\(count) slice=\(sliceText, privacy: .public)")
         for (index, hop) in hops.enumerated() {
             let delay = slice * Double(index)
             let anchor: UnitPoint = index == count - 1 ? .bottom : .top
-            let hopNumber = index + 1
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 guard generation == self.revealGeneration else { return }
-                scrollLog.debug("ease hop \(hopNumber)/\(count) id=\(hop, privacy: .public)")
                 withAnimation(.easeInOut(duration: slice)) {
                     self.positionAnchor = anchor
                     self.positionedID = hop
@@ -294,7 +284,6 @@ struct TranscriptView: View {
     }
 
     private func finishEase(separatorID: String) {
-        scrollLog.debug("ease finished; restoring bottom anchor")
         revealStarted = nil
         easeStarted = false
         runningSeparatorID = nil
@@ -302,7 +291,6 @@ struct TranscriptView: View {
         bottomScrollDeferred = false
         session.finishResumeReveal(separatorID: separatorID)
         if deferred {
-            scrollLog.debug("deferred bottom snap after ease")
             scrollToBottomNow()
         }
     }
@@ -310,29 +298,26 @@ struct TranscriptView: View {
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
         if session.pendingResumeReveal {
             bottomScrollDeferred = true
-            scrollLog.debug("suppress bottom snap")
             return
         }
+        // Several line updates can land in one turn. One snap still lands on the bottom.
+        guard bottomSnapGate.queued == false else { return }
+        bottomSnapGate.queued = true
         bottomScrollGeneration += 1
         let generation = bottomScrollGeneration
         let scroll = {
             guard generation == self.bottomScrollGeneration else { return }
-            guard self.session.pendingResumeReveal == false else {
-                self.scrollLogSuppress()
-                return
-            }
+            guard self.session.pendingResumeReveal == false else { return }
             self.scrollToBottomNow(proxy)
         }
-        DispatchQueue.main.async(execute: scroll)
+        DispatchQueue.main.async {
+            self.bottomSnapGate.queued = false
+            scroll()
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: scroll)
     }
 
-    private func scrollLogSuppress() {
-        scrollLog.debug("suppress delayed bottom snap")
-    }
-
     private func scrollToBottomNow(_ proxy: ScrollViewProxy) {
-        scrollLog.debug("bottom snap")
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -344,7 +329,6 @@ struct TranscriptView: View {
 
     /// Used when the ease ends and the proxy from the original call is not required.
     private func scrollToBottomNow() {
-        scrollLog.debug("bottom snap without proxy")
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
