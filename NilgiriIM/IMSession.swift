@@ -714,9 +714,11 @@ final class IMSession: ObservableObject {
         let disconnectSeq = Int64(defaults.string(forKey: StoreKey.disconnectSeq) ?? "") ?? 0
         let hasNewLine = source.contains { $0.isServerLine && $0.seq > disconnectSeq }
         guard hasNewLine else { return source }
+        // Both instants are absolute. The device clock is the fallback when the
+        // server omits `disconnectedAt`. Display formats either one in TimeZone.current.
         let deviceDate = Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
         let serverMs = storedServerDisconnectMs()
-        let disconnected = serverMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) } ?? deviceDate
+        let disconnected = serverMs.map(DisconnectSeparator.date(epochMilliseconds:)) ?? deviceDate
         let stamp = DisconnectSeparator.stamp(at: disconnected)
         var next = source
         let afterSeen = next.lastIndex(where: { $0.isServerLine && $0.seq <= disconnectSeq })

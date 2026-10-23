@@ -399,6 +399,7 @@ struct TranscriptView: View {
 
     /// Full-width hairline with the disconnect time centered on it. The row has no
     /// horizontal padding, so the line meets both edges of the transcript.
+    /// The stamp is formatted here, in the device's current zone, not from a server clock.
     private func separatorRow(_ line: LineDTO) -> some View {
         let stamp = line.disconnectAt.map { DisconnectSeparator.stamp(at: $0) } ?? line.text
         return HStack(spacing: 8) {

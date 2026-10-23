@@ -68,12 +68,23 @@ struct LineDTO: Decodable, Identifiable, Equatable {
 }
 
 enum DisconnectSeparator {
-    /// `Oct 23, 2026 17:14:32` — en_US_POSIX, 24-hour, device timezone. No dashes.
+    /// Absolute instant from server epoch milliseconds. `Date` has no zone;
+    /// `stamp(at:)` is what places it on the device clock.
+    static func date(epochMilliseconds ms: Int64) -> Date {
+        Date(timeIntervalSince1970: Double(ms) / 1000.0)
+    }
+
+    /// `Oct 23, 2026 17:14:32` — en_US_POSIX, 24-hour, no dashes.
+    /// Always the device zone (`TimeZone.current`) and that zone's gregorian calendar.
+    /// No zone identifier is hardcoded, and the server's zone is never consulted.
+    /// The zone is applied after the POSIX locale: that locale otherwise formats in GMT.
     static func stamp(at date: Date) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone.current
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.timeZone = .current
+        formatter.calendar = calendar
+        formatter.timeZone = TimeZone.current
         formatter.dateFormat = "MMM d, yyyy HH:mm:ss"
         return formatter.string(from: date)
     }
