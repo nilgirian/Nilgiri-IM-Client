@@ -4,6 +4,7 @@ struct LoginResponse: Decodable {
     let token: String
     let sessionId: String
     let character: String
+    let lines: [LineDTO]?
 }
 
 struct LineDTO: Decodable, Identifiable {

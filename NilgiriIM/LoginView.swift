@@ -27,6 +27,12 @@ struct LoginView: View {
                     Text(session.status)
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(Color.black)
+            .foregroundStyle(Color(white: 0.78))
+            .preferredColorScheme(.dark)
+            .toolbarBackground(Color.black, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
             .navigationTitle("Nilgiri IM")
         }
     }

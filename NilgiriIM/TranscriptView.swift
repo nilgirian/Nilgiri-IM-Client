@@ -1,5 +1,9 @@
 import SwiftUI
 
+private let terminalColumns = 80
+private let ink = Color(white: 0.78)
+private let screen = Color.black
+
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
@@ -7,35 +11,49 @@ struct TranscriptView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 6) {
-                            ForEach(session.lines) { line in
-                                Text(display(line.text))
-                                    .font(.system(.body, design: .monospaced))
-                                    .foregroundStyle(color(for: line.kind))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .id(line.seq)
+                GeometryReader { geo in
+                    let fontSize = max(8, (geo.size.width - 16) / CGFloat(terminalColumns) / 0.62)
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(session.lines) { line in
+                                    Ansi.text(line.text, fontSize: fontSize, columns: terminalColumns)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .id(line.seq)
+                                }
                             }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 8)
+                            .frame(minHeight: geo.size.height, alignment: .topLeading)
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                    }
-                    .onChange(of: session.lines.last?.seq) { _, seq in
-                        if let seq {
-                            proxy.scrollTo(seq, anchor: .bottom)
+                        .onChange(of: session.lines.last?.seq) { _, seq in
+                            if let seq {
+                                proxy.scrollTo(seq, anchor: .bottom)
+                            }
                         }
                     }
                 }
                 HStack {
+                    Text(">")
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(ink)
                     TextField("command", text: $session.command)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(ink)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .onSubmit { Task { await session.send() } }
                     Button("Send") { Task { await session.send() } }
+                        .foregroundStyle(ink)
                 }
                 .padding(12)
+                .background(screen)
             }
+            .background(screen)
+            .preferredColorScheme(.dark)
+            .toolbarBackground(screen, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
             .navigationTitle(session.character ?? "IM")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -43,11 +61,13 @@ struct TranscriptView: View {
                     Button("Park") {
                         Task { await session.logout(closeMud: false) }
                     }
+                    .foregroundStyle(ink)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Quit") {
                         Task { await session.logout(closeMud: true) }
                     }
+                    .foregroundStyle(ink)
                 }
             }
             .onChange(of: scenePhase) { _, phase in
@@ -66,17 +86,4 @@ struct TranscriptView: View {
         }
     }
 
-    private func display(_ text: String) -> String {
-        text.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[A-Za-z]", with: "", options: .regularExpression)
-    }
-
-    private func color(for kind: String) -> Color {
-        switch kind {
-        case "tell", "whisper", "pray": return .blue
-        case "combat_start": return .orange
-        case "death", "linkloss": return .red
-        case "idle": return .secondary
-        default: return .primary
-        }
-    }
 }
