@@ -92,7 +92,7 @@ final class IMSession: ObservableObject {
         static let hmvName = "im.hmvName"
     }
 
-    private enum ResumeOutcome {
+    private enum ResumeOutcome: Equatable {
         case ready
         case rejected
         case closed
