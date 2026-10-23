@@ -23,64 +23,45 @@ struct TranscriptView: View {
     @State private var bottomScrollGeneration = 0
     /// Invalidates an older reveal when a newer backlog arrives.
     @State private var revealGeneration = 0
+    /// Height of the input bar overlaid on the transcript. The scroll content's
+    /// minimum height stays above it, so a short log still fills the visible area.
+    @State private var inputBarHeight: CGFloat = 0
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                GeometryReader { geo in
-                    let fontSize = max(8, (geo.size.width - 16) / CGFloat(terminalColumns) / 0.62)
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            VStack(spacing: 0) {
-                                LazyVStack(alignment: .leading, spacing: 0) {
-                                    ForEach(session.lines) { line in
-                                        transcriptLine(line, fontSize: fontSize)
-                                            .id(line.id)
-                                    }
+            GeometryReader { geo in
+                let fontSize = max(8, (geo.size.width - 16) / CGFloat(terminalColumns) / 0.62)
+                let transcriptHeight = max(0, geo.size.height - inputBarHeight)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(session.lines) { line in
+                                    transcriptLine(line, fontSize: fontSize)
+                                        .id(line.id)
                                 }
-                                .padding(.vertical, 8)
-                                .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .topLeading)
-                                Color.clear
-                                    .frame(height: 1)
-                                    .allowsHitTesting(false)
-                                    .id(transcriptBottomID)
                             }
-                            .frame(width: geo.size.width)
+                            .padding(.vertical, 8)
+                            .frame(minWidth: geo.size.width, minHeight: transcriptHeight, alignment: .topLeading)
+                            Color.clear
+                                .frame(height: 1)
+                                .allowsHitTesting(false)
+                                .id(transcriptBottomID)
                         }
-                        .modifier(TranscriptBottomAnchor(suspendSizePin: pinToBottom == false))
-                        .onAppear { handleTranscriptScroll(proxy, linesChanged: false) }
-                        .onChange(of: session.lines) { _, _ in
-                            handleTranscriptScroll(proxy, linesChanged: true)
-                        }
+                        .frame(width: geo.size.width)
+                    }
+                    .modifier(TranscriptBottomAnchor(suspendSizePin: pinToBottom == false))
+                    .onAppear { handleTranscriptScroll(proxy, linesChanged: false) }
+                    .onChange(of: session.lines) { _, _ in
+                        handleTranscriptScroll(proxy, linesChanged: true)
+                    }
+                    .safeAreaInset(edge: .bottom, spacing: 0) {
+                        inputBar
                     }
                 }
-                HStack {
-                    Text(">")
-                        .font(.system(.body, design: .monospaced))
-                        .foregroundStyle(ink)
-                    TextField("command", text: $session.command)
-                        .font(.system(.body, design: .monospaced))
-                        .foregroundStyle(ink)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .focused($commandFocused)
-                        .onSubmit { Task { await sendCommand() } }
-                    Button("Send") { Task { await sendCommand() } }
-                        .foregroundStyle(ink)
-                }
-                .padding(12)
-                .background(screen)
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 15)
-                        .onEnded { value in
-                            let translation = value.translation
-                            if translation.height > abs(translation.width), translation.height > 0 {
-                                commandFocused = false
-                            }
-                        }
-                )
             }
             .background(screen)
+            .onPreferenceChange(InputBarHeightKey.self) { inputBarHeight = $0 }
             .preferredColorScheme(.dark)
             .toolbarBackground(screen, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
@@ -114,6 +95,41 @@ struct TranscriptView: View {
     private func sendCommand() async {
         await session.send()
         commandFocused = false
+    }
+
+    /// Sits in the scroll view's bottom safe area, so lines travel under the blur
+    /// and the bottom anchor still rests above the bar.
+    private var inputBar: some View {
+        HStack {
+            Text(">")
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(ink)
+            TextField("command", text: $session.command)
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(ink)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .focused($commandFocused)
+                .onSubmit { Task { await sendCommand() } }
+            Button("Send") { Task { await sendCommand() } }
+                .foregroundStyle(ink)
+        }
+        .padding(12)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: InputBarHeightKey.self, value: proxy.size.height)
+            }
+        }
+        .background(.ultraThinMaterial, ignoresSafeAreaEdges: .bottom)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 15)
+                .onEnded { value in
+                    let translation = value.translation
+                    if translation.height > abs(translation.width), translation.height > 0 {
+                        commandFocused = false
+                    }
+                }
+        )
     }
 
     /// Login fills `lines` before this view exists, so the first backlog is an appear,
@@ -229,6 +245,13 @@ struct TranscriptView: View {
         .accessibilityLabel("Disconnected \(stamp)")
     }
 
+}
+
+private struct InputBarHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
 }
 
 /// Lets the late separator pin see that the ease has already begun.

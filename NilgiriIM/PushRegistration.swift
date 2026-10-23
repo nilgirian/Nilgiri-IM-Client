@@ -38,6 +38,16 @@ enum PushRegistration {
 final class AppDelegate: NSObject, UIApplicationDelegate {
     static var session: IMSession?
 
+    /// The transcript and login screens are black with `.preferredColorScheme(.dark)`.
+    /// SwiftUI has no keyboard modifier, so the text fields pick up a dark keyboard here.
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        UITextField.appearance().keyboardAppearance = .dark
+        return true
+    }
+
     func application(
         _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
