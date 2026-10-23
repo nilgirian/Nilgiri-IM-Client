@@ -17,6 +17,9 @@ final class IMSession: ObservableObject {
     @Published var command = ""
     @Published private(set) var savedName = ""
     @Published private(set) var savedTokenAvailable = false
+    /// Bumped when a resume or catch-up backlog lands. Live lines leave it alone
+    /// so the transcript can animate that scroll without animating every line.
+    @Published private(set) var backlogScrollToken = 0
 
     private var lastSeq: Int64 = 0
     private var pollTask: Task<Void, Never>?
@@ -293,9 +296,9 @@ final class IMSession: ObservableObject {
                 clearDisconnectMarker()
             }
             if login.resumed == true && includeSince {
-                append(login.lines ?? [])
+                append(login.lines ?? [], animatedScroll: true)
             } else {
-                replaceTranscript(login.lines ?? [])
+                replaceTranscript(login.lines ?? [], animatedScroll: true)
                 if includeSince && lines.isEmpty {
                     lastSeq = 0
                     persistCursor()
@@ -335,9 +338,9 @@ final class IMSession: ObservableObject {
                     return .offline
                 }
                 if lines.isEmpty {
-                    replaceTranscript(since.lines)
+                    replaceTranscript(since.lines, animatedScroll: true)
                 } else {
-                    append(since.lines)
+                    append(since.lines, animatedScroll: true)
                 }
                 if since.closed { return .closed }
                 return .ready
@@ -508,7 +511,7 @@ final class IMSession: ObservableObject {
         }
     }
 
-    private func replaceTranscript(_ incoming: [LineDTO]) {
+    private func replaceTranscript(_ incoming: [LineDTO], animatedScroll: Bool = false) {
         var shown: [LineDTO] = []
         var maxSeq: Int64 = 0
         for line in incoming {
@@ -518,25 +521,33 @@ final class IMSession: ObservableObject {
             guard shouldShow(line) else { continue }
             shown.append(line)
         }
-        if shown.count > 4000 {
-            shown.removeFirst(shown.count - 4000)
-        }
-        lines = shown
         lastSeq = maxSeq
-        insertDisconnectSeparatorIfNeeded()
-        trimTranscript()
+        // Keep the newest window before the separator is placed, so a long
+        // replace does not anchor the gap in lines that are about to be dropped.
+        let window = shown.count > 4000 ? Array(shown.suffix(4000)) : shown
+        publishLines(trimmed(applyingDisconnectSeparator(window)), animatedScroll: animatedScroll)
         persistCursor()
     }
 
-    private func append(_ incoming: [LineDTO]) {
+    private func append(_ incoming: [LineDTO], animatedScroll: Bool = false) {
+        var next = lines
         for line in incoming where line.seq > lastSeq {
             lastSeq = line.seq
             guard shouldShow(line) else { continue }
-            lines.append(line)
+            next.append(line)
         }
-        insertDisconnectSeparatorIfNeeded()
-        trimTranscript()
+        publishLines(trimmed(applyingDisconnectSeparator(next)), animatedScroll: animatedScroll)
         persistCursor()
+    }
+
+    /// One assignment so SwiftUI scrolls once, after the separator is in place.
+    /// The token is bumped first so that scroll sees the resume and animates.
+    private func publishLines(_ next: [LineDTO], animatedScroll: Bool) {
+        guard next != lines else { return }
+        if animatedScroll {
+            backlogScrollToken += 1
+        }
+        lines = next
     }
 
     /// First disconnect wins until a resume actually inserts the separator.
@@ -556,31 +567,32 @@ final class IMSession: ObservableObject {
 
     /// Places a local separator after the last server line the user had already
     /// seen. The separator is not a server seq, so `lastSeq` stays the since cursor.
-    private func insertDisconnectSeparatorIfNeeded() {
-        guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return }
+    private func applyingDisconnectSeparator(_ source: [LineDTO]) -> [LineDTO] {
+        guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return source }
         let heldName = defaults.string(forKey: StoreKey.disconnectName) ?? ""
         let currentName = character ?? name
         if heldName.isEmpty == false, namesEqual(heldName, currentName) == false {
             clearDisconnectMarker()
-            return
+            return source
         }
         let disconnectSeq = Int64(defaults.string(forKey: StoreKey.disconnectSeq) ?? "") ?? 0
-        let hasNewLine = lines.contains { $0.isServerLine && $0.seq > disconnectSeq }
-        guard hasNewLine else { return }
+        let hasNewLine = source.contains { $0.isServerLine && $0.seq > disconnectSeq }
+        guard hasNewLine else { return source }
         let text = DisconnectSeparator.text(
             at: Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
         )
-        let afterSeen = lines.lastIndex(where: { $0.isServerLine && $0.seq <= disconnectSeq })
+        var next = source
+        let afterSeen = next.lastIndex(where: { $0.isServerLine && $0.seq <= disconnectSeq })
         let insertAt = afterSeen.map { $0 + 1 } ?? 0
-        if lines.indices.contains(insertAt), lines[insertAt].kind == "separator" {
+        if next.indices.contains(insertAt), next[insertAt].kind == "separator" {
             clearDisconnectMarker()
-            return
+            return next
         }
-        if lines.contains(where: { $0.kind == "separator" && $0.text == text }) {
+        if next.contains(where: { $0.kind == "separator" && $0.text == text }) {
             clearDisconnectMarker()
-            return
+            return next
         }
-        lines.insert(
+        next.insert(
             LineDTO(
                 seq: -1,
                 at: 0,
@@ -591,13 +603,16 @@ final class IMSession: ObservableObject {
             at: insertAt
         )
         clearDisconnectMarker()
+        return next
     }
 
-    private func trimTranscript() {
-        while lines.count > 4000 {
-            guard let index = lines.firstIndex(where: { $0.isServerLine }) else { break }
-            lines.remove(at: index)
+    private func trimmed(_ source: [LineDTO]) -> [LineDTO] {
+        var copy = source
+        while copy.count > 4000 {
+            guard let index = copy.firstIndex(where: { $0.isServerLine }) else { break }
+            copy.remove(at: index)
         }
+        return copy
     }
 
     private func shouldShow(_ line: LineDTO) -> Bool {

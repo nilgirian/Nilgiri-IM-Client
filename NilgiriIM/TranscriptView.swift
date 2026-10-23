@@ -9,6 +9,10 @@ struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
     @FocusState private var commandFocused: Bool
+    /// Last resume backlog this view already scrolled to. A newer token animates.
+    @State private var scrolledBacklogToken = 0
+    /// Cancels a scroll still waiting on the layout delay when a newer one is scheduled.
+    @State private var scrollGeneration = 0
 
     var body: some View {
         NavigationStack {
@@ -105,9 +109,24 @@ struct TranscriptView: View {
     // Login fills `lines` before this view exists, so the first backlog is not an
     // onChange. Resume replace, catch-up append, and a disconnect separator all
     // change the array. Wait until after layout; the bottom anchor is not ready
-    // on the triggering frame.
+    // on the triggering frame. A resume backlog animates; a live line still jumps.
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        let scroll = { proxy.scrollTo(transcriptBottomID, anchor: .bottom) }
+        scrollGeneration += 1
+        let generation = scrollGeneration
+        let animated = session.backlogScrollToken != scrolledBacklogToken
+        if animated {
+            scrolledBacklogToken = session.backlogScrollToken
+        }
+        let scroll = {
+            guard generation == scrollGeneration else { return }
+            if animated {
+                withAnimation {
+                    proxy.scrollTo(transcriptBottomID, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(transcriptBottomID, anchor: .bottom)
+            }
+        }
         DispatchQueue.main.async(execute: scroll)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: scroll)
     }
