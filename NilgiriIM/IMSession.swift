@@ -23,7 +23,7 @@ final class IMSession: ObservableObject {
         busy = true
         defer { busy = false }
         do {
-            let body = ["name": name, "password": password, "color": false] as [String: Any]
+            let body = ["name": name, "password": password, "color": true] as [String: Any]
             let data = try JSONSerialization.data(withJSONObject: body)
             var req = URLRequest(url: url("/v1/login"))
             req.httpMethod = "POST"
@@ -43,8 +43,10 @@ final class IMSession: ObservableObject {
             status = "Playing as \(login.character)"
             lastSeq = 0
             lines = []
+            append(login.lines ?? [])
             await park(false)
             startLive()
+            await PushRegistration.flush(session: self)
         } catch {
             status = error.localizedDescription
         }
@@ -155,8 +157,11 @@ final class IMSession: ObservableObject {
 
     private func append(_ incoming: [LineDTO]) {
         for line in incoming where line.seq > lastSeq {
-            lines.append(line)
             lastSeq = line.seq
+            if line.text.contains("Do you want text color") {
+                continue
+            }
+            lines.append(line)
         }
         if lines.count > 4000 {
             lines.removeFirst(lines.count - 4000)

@@ -9,7 +9,10 @@ struct NilgiriIMApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(session)
-                .onAppear { AppDelegate.session = session }
+                .onAppear {
+                    AppDelegate.session = session
+                    Task { await PushRegistration.request(session: session) }
+                }
         }
     }
 }
