@@ -9,6 +9,23 @@ struct LoginResponse: Decodable {
     let resumed: Bool?
     /// False after a successful reattach; the server clears park on resume.
     let parked: Bool?
+    /// Epoch milliseconds when the server dropped the session. Older servers omit it.
+    let disconnectedAt: Int64?
+
+    private enum CodingKeys: String, CodingKey {
+        case token, sessionId, character, lines, resumed, parked, disconnectedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        token = try container.decode(String.self, forKey: .token)
+        sessionId = try container.decode(String.self, forKey: .sessionId)
+        character = try container.decode(String.self, forKey: .character)
+        lines = try container.decodeIfPresent([LineDTO].self, forKey: .lines)
+        resumed = try container.decodeIfPresent(Bool.self, forKey: .resumed)
+        parked = try container.decodeIfPresent(Bool.self, forKey: .parked)
+        disconnectedAt = EpochMillis.decodeIfPresent(container, forKey: .disconnectedAt)
+    }
 }
 
 struct LineDTO: Decodable, Identifiable, Equatable {
@@ -65,6 +82,41 @@ enum DisconnectSeparator {
 struct SinceResponse: Decodable {
     let closed: Bool
     let lines: [LineDTO]
+    /// Epoch milliseconds when the server dropped the session. Older servers omit it.
+    let disconnectedAt: Int64?
+
+    private enum CodingKeys: String, CodingKey {
+        case closed, lines, disconnectedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        closed = try container.decode(Bool.self, forKey: .closed)
+        lines = try container.decode([LineDTO].self, forKey: .lines)
+        disconnectedAt = EpochMillis.decodeIfPresent(container, forKey: .disconnectedAt)
+    }
+}
+
+/// `disconnectedAt` is epoch milliseconds. Servers send an integer, sometimes a
+/// JSON number that decodes as a double, and older servers leave the field out.
+enum EpochMillis {
+    static func decodeIfPresent<K: CodingKey>(
+        _ container: KeyedDecodingContainer<K>,
+        forKey key: K
+    ) -> Int64? {
+        guard container.contains(key) else { return nil }
+        if (try? container.decodeNil(forKey: key)) == true { return nil }
+        if let ms = try? container.decode(Int64.self, forKey: key) {
+            return ms > 0 ? ms : nil
+        }
+        if let ms = try? container.decode(Double.self, forKey: key), ms.isFinite {
+            let rounded = ms.rounded()
+            // Reject values Double cannot round into Int64. A too-large conversion traps.
+            guard rounded > 0, rounded < Double(Int64.max) else { return nil }
+            return Int64(rounded)
+        }
+        return nil
+    }
 }
 
 struct ErrorResponse: Decodable {
