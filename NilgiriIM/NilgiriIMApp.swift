@@ -40,7 +40,10 @@ private func clearDeliveredNotificationsAndBadge(_ session: IMSession) {
     } else {
         UIApplication.shared.applicationIconBadgeNumber = 0
     }
-    session.resetServerBadge()
+    // IMSession is @MainActor. This helper is a nonisolated free function.
+    Task { @MainActor in
+        session.resetServerBadge()
+    }
 }
 
 struct RootView: View {
