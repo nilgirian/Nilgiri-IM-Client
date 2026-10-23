@@ -63,6 +63,9 @@ final class IMSession: ObservableObject {
         case rejected
         case closed
         case offline
+        /// Since applied a restored session that is not attached yet (`closed` and `resumed`).
+        /// Login follows. The transcript and the divider stay.
+        case detached
     }
 
     private struct HTTPFailure: Error {
@@ -122,6 +125,9 @@ final class IMSession: ObservableObject {
             startLive()
         case .closed:
             await dropClosedSession()
+        case .detached:
+            // since already inserted the divider. Login reattaches; it must not clear it.
+            await autoPasswordLogin()
         case .rejected:
             token = nil
             await autoPasswordLogin()
@@ -144,6 +150,8 @@ final class IMSession: ObservableObject {
             case .closed:
                 await dropClosedSession()
                 return
+            case .detached:
+                break
             case .rejected:
                 token = nil
             }
@@ -265,6 +273,11 @@ final class IMSession: ObservableObject {
         case .closed:
             stopLive()
             await dropClosedSession()
+        case .detached:
+            // A login is already reattaching this restore. Don't drop the bearer.
+            guard didAutoLogin == false else { return }
+            stopLive()
+            await autoPasswordLogin()
         case .rejected:
             stopLive()
             token = nil
@@ -319,6 +332,9 @@ final class IMSession: ObservableObject {
             parked = login.parked ?? false
             savedName = name
             // A brand-new session has nothing to split. Older servers omit both flags.
+            // A live reattach is resumed with no disconnectedAt: the device-clock
+            // marker is the fallback. A restored login repeats the since value;
+            // that instant is already shown, so it must not add a second row.
             let serverDisconnectedAt = login.resumed == false ? nil : login.disconnectedAt
             if login.resumed == false {
                 clearDisconnectMarker()
@@ -350,6 +366,8 @@ final class IMSession: ObservableObject {
     }
 
     /// Bearer token never expires. Prefer GET since, then unpark, before logging in again.
+    /// A detached restore (`closed` with `resumed`) has already placed the divider.
+    /// The caller logs in next and must not wipe that transcript.
     private func resumeDirect() async -> ResumeOutcome {
         let outcome = await fetchSince()
         guard outcome == .ready else { return outcome }
@@ -372,6 +390,9 @@ final class IMSession: ObservableObject {
                 guard let since = try? JSONDecoder().decode(SinceResponse.self, from: data) else {
                     return .offline
                 }
+                // Apply lines and disconnectedAt before looking at closed.
+                // A restored session's first since is closed and resumed, and
+                // that response is what places the divider.
                 if lines.isEmpty {
                     replaceTranscript(
                         since.lines,
@@ -381,7 +402,12 @@ final class IMSession: ObservableObject {
                 } else {
                     append(since.lines, animatedScroll: true, serverDisconnectedAt: since.disconnectedAt)
                 }
-                if since.closed { return .closed }
+                if since.closed {
+                    if since.resumed == true {
+                        return .detached
+                    }
+                    return .closed
+                }
                 return .ready
             case 401, 403, 404:
                 return .rejected

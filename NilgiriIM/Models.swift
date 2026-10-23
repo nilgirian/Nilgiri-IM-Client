@@ -93,11 +93,14 @@ enum DisconnectSeparator {
 struct SinceResponse: Decodable {
     let closed: Bool
     let lines: [LineDTO]
-    /// Epoch milliseconds when the server dropped the session. Older servers omit it.
+    /// Epoch milliseconds when the server dropped the session. Later polls omit it.
     let disconnectedAt: Int64?
+    /// True when a restarted server restored the session but it is not attached yet.
+    /// Later polls omit it. A real close leaves it out.
+    let resumed: Bool?
 
     private enum CodingKeys: String, CodingKey {
-        case closed, lines, disconnectedAt
+        case closed, lines, disconnectedAt, resumed
     }
 
     init(from decoder: Decoder) throws {
@@ -105,6 +108,7 @@ struct SinceResponse: Decodable {
         closed = try container.decode(Bool.self, forKey: .closed)
         lines = try container.decode([LineDTO].self, forKey: .lines)
         disconnectedAt = EpochMillis.decodeIfPresent(container, forKey: .disconnectedAt)
+        resumed = try container.decodeIfPresent(Bool.self, forKey: .resumed)
     }
 }
 
