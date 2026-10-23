@@ -324,7 +324,7 @@ final class IMSession: ObservableObject {
                     login.lines ?? [],
                     animatedScroll: true,
                     serverDisconnectedAt: serverDisconnectedAt,
-                    allowServerOnly: login.resumed != false && nameMatchesHeld()
+                    trustCursor: login.resumed != false && nameMatchesHeld()
                 )
                 if includeSince && lines.isEmpty {
                     lastSeq = 0
@@ -368,8 +368,7 @@ final class IMSession: ObservableObject {
                     replaceTranscript(
                         since.lines,
                         animatedScroll: true,
-                        serverDisconnectedAt: since.disconnectedAt,
-                        allowServerOnly: true
+                        serverDisconnectedAt: since.disconnectedAt
                     )
                 } else {
                     append(since.lines, animatedScroll: true, serverDisconnectedAt: since.disconnectedAt)
@@ -549,9 +548,10 @@ final class IMSession: ObservableObject {
         _ incoming: [LineDTO],
         animatedScroll: Bool = false,
         serverDisconnectedAt: Int64? = nil,
-        allowServerOnly: Bool = false
+        trustCursor: Bool = true
     ) {
-        let seenSeq = lastSeq
+        // Another character's saved cursor is not a gap in this transcript.
+        let seenSeq = trustCursor ? lastSeq : 0
         var shown: [LineDTO] = []
         var maxSeq: Int64 = 0
         for line in incoming {
@@ -569,7 +569,6 @@ final class IMSession: ObservableObject {
             trimmed(applyingDisconnectSeparator(
                 window,
                 seenSeq: seenSeq,
-                allowServerOnly: allowServerOnly,
                 serverDisconnectedAt: serverDisconnectedAt
             )),
             animatedScroll: animatedScroll
@@ -582,6 +581,7 @@ final class IMSession: ObservableObject {
         animatedScroll: Bool = false,
         serverDisconnectedAt: Int64? = nil
     ) {
+        let seenSeq = lastSeq
         var next = lines
         for line in incoming where line.seq > lastSeq {
             lastSeq = line.seq
@@ -589,7 +589,11 @@ final class IMSession: ObservableObject {
             next.append(line)
         }
         publishLines(
-            trimmed(applyingDisconnectSeparator(next, serverDisconnectedAt: serverDisconnectedAt)),
+            trimmed(applyingDisconnectSeparator(
+                next,
+                seenSeq: seenSeq,
+                serverDisconnectedAt: serverDisconnectedAt
+            )),
             animatedScroll: animatedScroll
         )
         persistCursor()
@@ -670,39 +674,39 @@ final class IMSession: ObservableObject {
         return ms
     }
 
-    /// Remembers a server instant that has not already been drawn.
+    /// Remembers a server instant only when it is newer than the last separator drawn.
     private func stashServerDisconnect(_ reportedMs: Int64?) {
-        guard let reportedMs, reportedMs > 0 else { return }
-        guard shownDisconnectMs() != Optional(reportedMs) else { return }
+        guard let reportedMs, isNewerServerInstant(reportedMs) else { return }
         defaults.set(String(reportedMs), forKey: StoreKey.disconnectServerMs)
     }
 
+    /// A missing record is older than any positive `disconnectedAt`.
+    private func isNewerServerInstant(_ reportedMs: Int64) -> Bool {
+        guard reportedMs > 0 else { return false }
+        guard let shown = shownDisconnectMs() else { return true }
+        return reportedMs > shown
+    }
+
     /// Places one local separator after the last server line the user had already
-    /// seen. The stamp uses the server's `disconnectedAt` (epoch ms) when that
-    /// field arrived on login or since, and the device clock otherwise. The
-    /// separator is not a server seq, so `lastSeq` stays the since cursor.
+    /// seen. A login or since `disconnectedAt` newer than the last separator is
+    /// enough — the app does not also need to have watched the drop. The device
+    /// clock is the fallback when the field is absent. The stamp is an absolute
+    /// `Date`, formatted later in `TimeZone.current`. The separator is not a
+    /// server seq, so `lastSeq` stays the since cursor.
     private func applyingDisconnectSeparator(
         _ source: [LineDTO],
         seenSeq: Int64 = 0,
-        allowServerOnly: Bool = false,
         serverDisconnectedAt: Int64? = nil
     ) -> [LineDTO] {
         let reportedMs = serverDisconnectedAt.flatMap { $0 > 0 ? $0 : nil }
         if disconnectMarkerNameMismatch() {
             clearDisconnectMarker()
-            clearShownDisconnect()
         }
         if defaults.object(forKey: StoreKey.disconnectAt) != nil {
             stashServerDisconnect(reportedMs)
-        } else if allowServerOnly,
-                  let reportedMs,
-                  shownDisconnectMs() != Optional(reportedMs),
-                  seenSeq > 0,
-                  source.contains(where: { $0.isSeparator }) == false,
-                  source.contains(where: { $0.isServerLine && $0.seq > seenSeq }) {
-            // No device-clock gap (force quit, or a server that learned the drop
-            // first). Place this one backlog split, then remember the instant so
-            // the next poll of the same `disconnectedAt` does not draw it again.
+        } else if let reportedMs, isNewerServerInstant(reportedMs), seenSeq > 0 {
+            // Server restart or a drop this process never observed. Remember the
+            // instant so a later line can still land under the same gap.
             defaults.set(Double(reportedMs) / 1000, forKey: StoreKey.disconnectAt)
             defaults.set(String(seenSeq), forKey: StoreKey.disconnectSeq)
             defaults.set(character ?? name, forKey: StoreKey.disconnectName)
@@ -711,7 +715,12 @@ final class IMSession: ObservableObject {
         guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return source }
         let disconnectSeq = Int64(defaults.string(forKey: StoreKey.disconnectSeq) ?? "") ?? 0
         let hasNewLine = source.contains { $0.isServerLine && $0.seq > disconnectSeq }
-        guard hasNewLine else { return source }
+        let hasAnchor = source.contains { $0.isServerLine && $0.seq <= disconnectSeq }
+        // Device-only gaps wait for a line after the drop. A newer server instant
+        // is drawn as soon as the lines the user had seen are on screen.
+        if hasNewLine == false {
+            guard storedServerDisconnectMs() != nil, hasAnchor else { return source }
+        }
         // Both instants are absolute. The device clock is the fallback when the
         // server omits `disconnectedAt`. Display formats either one in TimeZone.current.
         let deviceDate = Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
