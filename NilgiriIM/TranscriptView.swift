@@ -81,6 +81,9 @@ struct TranscriptView: View {
             .navigationTitle(session.character ?? "IM")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    sessionHeader
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Unlink") {
                         Task { await session.logout(closeMud: true) }
@@ -102,6 +105,23 @@ struct TranscriptView: View {
                 await PushRegistration.request(session: session)
             }
         }
+    }
+
+    /// Character name with the latest prompt beside it: "Sin  30h 100m 97v".
+    private var sessionHeader: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(session.character ?? "IM")
+                .font(.headline)
+                .lineLimit(1)
+            if let label = session.vitals?.label {
+                Text(label)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(ink)
+                    .lineLimit(1)
+                    .layoutPriority(1)
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private func sendCommand() async {

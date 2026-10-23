@@ -10,6 +10,8 @@ final class IMSession: ObservableObject {
     @Published var token: String?
     @Published var sessionId: String?
     @Published var character: String?
+    /// Last HMV prompt. Kept across catch-up and relaunch until a newer prompt arrives.
+    @Published private(set) var vitals: HMVPrompt.Vitals?
     @Published var lines: [LineDTO] = []
     @Published var status = "Parked on the IM server when this app is in the background."
     @Published var parked = false
@@ -34,6 +36,8 @@ final class IMSession: ObservableObject {
     private var lastParkOK = true
     private var pendingUnpark = false
     private var parkWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Prompt parsed from the batch currently being applied. Committed once.
+    private var pendingVitals: HMVPrompt.Vitals?
     private let defaults = UserDefaults.standard
 
     private enum StoreKey {
@@ -49,6 +53,9 @@ final class IMSession: ObservableObject {
         /// Last server instant already drawn, so a later poll of the same value does not
         /// add another separator.
         static let shownDisconnectMs = "im.shownDisconnectMs"
+        /// "hp,mana,moves" for the character in `hmvName`.
+        static let hmv = "im.hmv"
+        static let hmvName = "im.hmvName"
     }
 
     private enum ResumeOutcome {
@@ -83,6 +90,7 @@ final class IMSession: ObservableObject {
         token = SessionSecrets.get(SessionSecrets.Account.token)
         sessionId = SessionSecrets.get(SessionSecrets.Account.sessionId)
         savedTokenAvailable = token != nil && sessionId != nil
+        restoreVitals()
     }
 
     /// True when Enter should try the saved bearer token before posting a login.
@@ -307,7 +315,7 @@ final class IMSession: ObservableObject {
             let login = try JSONDecoder().decode(LoginResponse.self, from: respData)
             token = login.token
             sessionId = login.sessionId
-            character = login.character
+            adoptCharacter(login.character)
             parked = login.parked ?? false
             savedName = name
             // A brand-new session has nothing to split. Older servers omit both flags.
@@ -558,9 +566,10 @@ final class IMSession: ObservableObject {
             if line.seq > maxSeq {
                 maxSeq = line.seq
             }
-            guard shouldShow(line) else { continue }
-            shown.append(line)
+            guard let shownLine = presentable(line) else { continue }
+            shown.append(shownLine)
         }
+        commitVitals()
         lastSeq = maxSeq
         // Keep the newest window before the separator is placed, so a long
         // replace does not anchor the gap in lines that are about to be dropped.
@@ -585,9 +594,10 @@ final class IMSession: ObservableObject {
         var next = lines
         for line in incoming where line.seq > lastSeq {
             lastSeq = line.seq
-            guard shouldShow(line) else { continue }
-            next.append(line)
+            guard let shownLine = presentable(line) else { continue }
+            next.append(shownLine)
         }
+        commitVitals()
         publishLines(
             trimmed(applyingDisconnectSeparator(
                 next,
@@ -774,6 +784,52 @@ final class IMSession: ObservableObject {
 
     private func shouldShow(_ line: LineDTO) -> Bool {
         line.text.contains("Do you want text color") == false
+    }
+
+    /// Drops the color question and a line that is only an HMV prompt.
+    /// A prompt fused with other text keeps that text. The newest prompt in
+    /// the batch is remembered for the header.
+    private func presentable(_ line: LineDTO) -> LineDTO? {
+        guard shouldShow(line) else { return nil }
+        let stripped = HMVPrompt.strip(line.text)
+        if let found = stripped.vitals {
+            pendingVitals = found
+        }
+        guard stripped.text.isEmpty == false else { return nil }
+        guard stripped.text != line.text else { return line }
+        return LineDTO(seq: line.seq, at: line.at, kind: line.kind, text: stripped.text)
+    }
+
+    private func commitVitals() {
+        guard let found = pendingVitals else { return }
+        pendingVitals = nil
+        guard vitals != found else { return }
+        vitals = found
+        defaults.set(found.stored, forKey: StoreKey.hmv)
+        let owner = character ?? name
+        if owner.isEmpty == false {
+            defaults.set(owner, forKey: StoreKey.hmvName)
+        }
+    }
+
+    private func restoreVitals() {
+        guard let raw = defaults.string(forKey: StoreKey.hmv),
+              let held = defaults.string(forKey: StoreKey.hmvName),
+              let found = HMVPrompt.Vitals.parse(raw) else { return }
+        let owner = character ?? name
+        guard owner.isEmpty == false, namesEqual(held, owner) else { return }
+        vitals = found
+    }
+
+    /// Another character's saved prompt is not this header.
+    private func adoptCharacter(_ next: String?) {
+        character = next
+        guard let next, next.isEmpty == false else { return }
+        guard let held = defaults.string(forKey: StoreKey.hmvName),
+              namesEqual(held, next) == false else { return }
+        vitals = nil
+        defaults.removeObject(forKey: StoreKey.hmv)
+        defaults.removeObject(forKey: StoreKey.hmvName)
     }
 
     private func post(_ action: String, _ body: [String: Any]) async throws {
