@@ -17,9 +17,11 @@ final class IMSession: ObservableObject {
     @Published var command = ""
     @Published private(set) var savedName = ""
     @Published private(set) var savedTokenAvailable = false
-    /// Bumped when a resume or catch-up backlog lands. Live lines leave it alone
-    /// so the transcript can animate that scroll without animating every line.
+    /// Bumped when a resume or catch-up backlog inserts (or first reveals) a
+    /// disconnect separator. Live lines leave it alone.
     @Published private(set) var backlogScrollToken = 0
+    /// Id of the separator the transcript should park on before easing to the bottom.
+    @Published private(set) var resumeSeparatorID: String?
 
     private var lastSeq: Int64 = 0
     private var pollTask: Task<Void, Never>?
@@ -540,14 +542,33 @@ final class IMSession: ObservableObject {
         persistCursor()
     }
 
-    /// One assignment so SwiftUI scrolls once, after the separator is in place.
-    /// The token is bumped first so that scroll sees the resume and animates.
+    /// One assignment so the transcript lays out once, with the separator already
+    /// in place. The token is bumped first so the scroll handler sees the resume
+    /// before it would otherwise jump to the bottom.
     private func publishLines(_ next: [LineDTO], animatedScroll: Bool) {
         guard next != lines else { return }
-        if animatedScroll {
+        if animatedScroll, let separatorID = revealSeparatorID(previous: lines, next: next),
+           separatorID != resumeSeparatorID {
+            resumeSeparatorID = separatorID
             backlogScrollToken += 1
         }
         lines = next
+    }
+
+    /// Separator that splits lines the user had seen from lines added in this update.
+    /// A separator already revealed is returned too, and the caller skips it when
+    /// its id matches `resumeSeparatorID`, so later catch-up does not replay the ease.
+    private func revealSeparatorID(previous: [LineDTO], next: [LineDTO]) -> String? {
+        let previousIDs = Set(previous.map(\.id))
+        if let inserted = next.last(where: { $0.isSeparator && previousIDs.contains($0.id) == false }) {
+            return inserted.id
+        }
+        guard let index = next.lastIndex(where: { $0.isSeparator }) else { return nil }
+        let addedAfter = next.suffix(from: next.index(after: index)).contains {
+            $0.isServerLine && previousIDs.contains($0.id) == false
+        }
+        guard addedAfter else { return nil }
+        return next[index].id
     }
 
     /// First disconnect wins until a resume actually inserts the separator.
@@ -578,27 +599,27 @@ final class IMSession: ObservableObject {
         let disconnectSeq = Int64(defaults.string(forKey: StoreKey.disconnectSeq) ?? "") ?? 0
         let hasNewLine = source.contains { $0.isServerLine && $0.seq > disconnectSeq }
         guard hasNewLine else { return source }
-        let text = DisconnectSeparator.text(
-            at: Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
-        )
+        let disconnected = Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
+        let stamp = DisconnectSeparator.stamp(at: disconnected)
         var next = source
         let afterSeen = next.lastIndex(where: { $0.isServerLine && $0.seq <= disconnectSeq })
         let insertAt = afterSeen.map { $0 + 1 } ?? 0
-        if next.indices.contains(insertAt), next[insertAt].kind == "separator" {
+        if next.indices.contains(insertAt), next[insertAt].isSeparator {
             clearDisconnectMarker()
             return next
         }
-        if next.contains(where: { $0.kind == "separator" && $0.text == text }) {
+        if next.contains(where: { $0.isSeparator && $0.text == stamp }) {
             clearDisconnectMarker()
             return next
         }
         next.insert(
             LineDTO(
                 seq: -1,
-                at: 0,
+                at: Int64(disconnected.timeIntervalSince1970 * 1000),
                 kind: "separator",
-                text: text,
-                localID: "separator-\(disconnectSeq)-\(text)"
+                text: stamp,
+                localID: "separator-\(disconnectSeq)-\(stamp)",
+                disconnectAt: disconnected
             ),
             at: insertAt
         )

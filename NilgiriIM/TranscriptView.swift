@@ -9,10 +9,20 @@ struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
     @FocusState private var commandFocused: Bool
-    /// Last resume backlog this view already scrolled to. A newer token animates.
+    /// Last resume reveal this view has started. A newer token runs the separator ease.
     @State private var scrolledBacklogToken = 0
-    /// Cancels a scroll still waiting on the layout delay when a newer one is scheduled.
-    @State private var scrollGeneration = 0
+    /// While a reveal is in flight, appear and line-change must not jump to the bottom.
+    @State private var suppressBottomScroll = false
+    /// A live line arrived during the reveal and should jump to the bottom once it ends.
+    @State private var bottomScrollDeferred = false
+    /// Content-size pinning is what snaps a resume to the end and leaves the ease
+    /// with nowhere to travel. It is suspended until the ease finishes. The initial
+    /// bottom anchor stays in place on iOS 18, so this does not rebuild the scroll view.
+    @State private var pinToBottom = true
+    /// Invalidates a bottom scroll still waiting on the layout delay.
+    @State private var bottomScrollGeneration = 0
+    /// Invalidates an older reveal when a newer backlog arrives.
+    @State private var revealGeneration = 0
 
     var body: some View {
         NavigationStack {
@@ -28,19 +38,19 @@ struct TranscriptView: View {
                                             .id(line.id)
                                     }
                                 }
-                                .padding(.horizontal, 8)
                                 .padding(.vertical, 8)
-                                .frame(minHeight: geo.size.height, alignment: .topLeading)
+                                .frame(minWidth: geo.size.width, minHeight: geo.size.height, alignment: .topLeading)
                                 Color.clear
                                     .frame(height: 1)
                                     .allowsHitTesting(false)
                                     .id(transcriptBottomID)
                             }
+                            .frame(width: geo.size.width)
                         }
-                        .defaultScrollAnchor(.bottom)
-                        .onAppear { scrollToBottom(proxy) }
+                        .modifier(TranscriptBottomAnchor(suspendSizePin: pinToBottom == false))
+                        .onAppear { handleTranscriptScroll(proxy, linesChanged: false) }
                         .onChange(of: session.lines) { _, _ in
-                            scrollToBottom(proxy)
+                            handleTranscriptScroll(proxy, linesChanged: true)
                         }
                     }
                 }
@@ -106,24 +116,76 @@ struct TranscriptView: View {
         commandFocused = false
     }
 
-    // Login fills `lines` before this view exists, so the first backlog is not an
-    // onChange. Resume replace, catch-up append, and a disconnect separator all
-    // change the array. Wait until after layout; the bottom anchor is not ready
-    // on the triggering frame. A resume backlog animates; a live line still jumps.
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        scrollGeneration += 1
-        let generation = scrollGeneration
-        let animated = session.backlogScrollToken != scrolledBacklogToken
-        if animated {
+    /// Login fills `lines` before this view exists, so the first backlog is an appear,
+    /// not an onChange. A separator reveal owns the scroll until it eases to the bottom.
+    /// Anything else jumps to the bottom after layout, including the short retry.
+    private func handleTranscriptScroll(_ proxy: ScrollViewProxy, linesChanged: Bool) {
+        if session.backlogScrollToken != scrolledBacklogToken, let separatorID = session.resumeSeparatorID {
             scrolledBacklogToken = session.backlogScrollToken
+            runResumeReveal(proxy, separatorID: separatorID)
+            return
         }
-        let scroll = {
-            guard generation == scrollGeneration else { return }
-            if animated {
-                withAnimation {
-                    proxy.scrollTo(transcriptBottomID, anchor: .bottom)
+        if suppressBottomScroll {
+            if linesChanged {
+                bottomScrollDeferred = true
+            }
+            return
+        }
+        scrollToBottom(proxy)
+    }
+
+    /// (a) Sit on the separator with no animation, after the backlog has laid out.
+    /// (b) Hold there ~0.45s. Bottom scrolls and the bottom default anchor stay off,
+    ///     so a layout pass cannot snap the transcript to the end.
+    /// (c) Ease to the bottom over 1s. Then bottom-pinning and live-line jumps resume.
+    private func runResumeReveal(_ proxy: ScrollViewProxy, separatorID: String) {
+        revealGeneration += 1
+        bottomScrollGeneration += 1
+        let generation = revealGeneration
+        suppressBottomScroll = true
+        bottomScrollDeferred = false
+        pinToBottom = false
+
+        let gate = RevealGate()
+        let placeOnSeparator = {
+            guard generation == revealGeneration, gate.eased == false else { return }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                proxy.scrollTo(separatorID, anchor: .top)
+            }
+        }
+        DispatchQueue.main.async(execute: placeOnSeparator)
+        // Lazy rows often miss the first scrollTo. This second placement is still
+        // the unanimated separator pin, inside the settle window, and it will not
+        // run once the ease has started.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: placeOnSeparator)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            guard generation == revealGeneration else { return }
+            gate.eased = true
+            withAnimation(.easeInOut(duration: 1.0)) {
+                proxy.scrollTo(transcriptBottomID, anchor: .bottom)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.05) {
+                guard generation == revealGeneration else { return }
+                suppressBottomScroll = false
+                pinToBottom = true
+                if bottomScrollDeferred {
+                    bottomScrollDeferred = false
+                    scrollToBottom(proxy)
                 }
-            } else {
+            }
+        }
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        bottomScrollGeneration += 1
+        let generation = bottomScrollGeneration
+        let scroll = {
+            guard generation == bottomScrollGeneration, suppressBottomScroll == false else { return }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
                 proxy.scrollTo(transcriptBottomID, anchor: .bottom)
             }
         }
@@ -133,15 +195,65 @@ struct TranscriptView: View {
 
     @ViewBuilder
     private func transcriptLine(_ line: LineDTO, fontSize: CGFloat) -> some View {
-        if line.kind == "separator" {
-            Text(line.text)
-                .font(.system(size: fontSize, design: .monospaced))
-                .foregroundStyle(ink)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        if line.isSeparator {
+            separatorRow(line)
         } else {
             Ansi.text(line.text, fontSize: fontSize, columns: terminalColumns)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
         }
     }
 
+    /// Full-width hairline with the disconnect time centered on it. The row has no
+    /// horizontal padding, so the line meets both edges of the transcript.
+    private func separatorRow(_ line: LineDTO) -> some View {
+        let stamp = line.disconnectAt.map { DisconnectSeparator.stamp(at: $0) } ?? line.text
+        HStack(spacing: 8) {
+            Rectangle()
+                .fill(Color.secondary)
+                .frame(height: 1)
+                .frame(maxWidth: .infinity)
+            Text(stamp)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            Rectangle()
+                .fill(Color.secondary)
+                .frame(height: 1)
+                .frame(maxWidth: .infinity)
+        }
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Disconnected \(stamp)")
+    }
+
+}
+
+/// Lets the late separator pin see that the ease has already begun.
+private final class RevealGate {
+    var eased = false
+}
+
+/// `.defaultScrollAnchor(.bottom)` applies to the first layout and to later content-size
+/// changes. The size-change half is what yanks a resume backlog to the end while an
+/// ease is running, so the animation has no distance to travel. On iOS 18 the two roles
+/// are separate and the size-change anchor can be cleared without rebuilding the scroll
+/// view. On iOS 17 the single modifier has to come off for the same interval.
+private struct TranscriptBottomAnchor: ViewModifier {
+    var suspendSizePin: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            let sizeAnchor: UnitPoint? = suspendSizePin ? nil : .bottom
+            content
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(sizeAnchor, for: .sizeChanges)
+        } else if suspendSizePin {
+            content
+        } else {
+            content.defaultScrollAnchor(.bottom)
+        }
+    }
 }

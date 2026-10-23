@@ -20,15 +20,19 @@ struct LineDTO: Decodable, Identifiable, Equatable {
     let kind: String
     let text: String
     var localID: String?
+    /// Set only for a local disconnect separator. Server lines leave this nil.
+    var disconnectAt: Date?
 
     var isServerLine: Bool { localID == nil }
+    var isSeparator: Bool { kind == "separator" }
 
-    init(seq: Int64, at: Int64, kind: String, text: String, localID: String? = nil) {
+    init(seq: Int64, at: Int64, kind: String, text: String, localID: String? = nil, disconnectAt: Date? = nil) {
         self.seq = seq
         self.at = at
         self.kind = kind
         self.text = text
         self.localID = localID
+        self.disconnectAt = disconnectAt
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -42,19 +46,19 @@ struct LineDTO: Decodable, Identifiable, Equatable {
         kind = try container.decode(String.self, forKey: .kind)
         text = try container.decode(String.self, forKey: .text)
         localID = nil
+        disconnectAt = nil
     }
 }
 
 enum DisconnectSeparator {
-    /// `----------- Oct 23, 2026 17:14:32 --------`
-    static func text(at date: Date) -> String {
+    /// `Oct 23, 2026 17:14:32` — en_US_POSIX, 24-hour, device timezone. No dashes.
+    static func stamp(at date: Date) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.timeZone = .current
         formatter.dateFormat = "MMM d, yyyy HH:mm:ss"
-        let stamp = formatter.string(from: date)
-        return String(repeating: "-", count: 11) + " " + stamp + " " + String(repeating: "-", count: 8)
+        return formatter.string(from: date)
     }
 }
 
