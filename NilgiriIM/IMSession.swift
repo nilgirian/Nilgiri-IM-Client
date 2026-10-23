@@ -1,6 +1,9 @@
 import Foundation
 import Combine
+import os
 import UIKit
+
+private let scrollLog = Logger(subsystem: "net.nilgiri.imclient", category: "scroll")
 
 @MainActor
 final class IMSession: ObservableObject {
@@ -17,9 +20,10 @@ final class IMSession: ObservableObject {
     @Published var command = ""
     @Published private(set) var savedName = ""
     @Published private(set) var savedTokenAvailable = false
-    /// Bumped when a resume or catch-up backlog inserts (or first reveals) a
-    /// disconnect separator. Live lines leave it alone.
-    @Published private(set) var backlogScrollToken = 0
+    /// Set before the resume or catch-up lines are published, and cleared only
+    /// after the transcript finishes easing. While this is true the view must not
+    /// snap to the bottom.
+    @Published private(set) var pendingResumeReveal = false
     /// Id of the separator the transcript should park on before easing to the bottom.
     @Published private(set) var resumeSeparatorID: String?
 
@@ -186,6 +190,7 @@ final class IMSession: ObservableObject {
                 status = failureMessage(error)
                 return
             }
+            cancelResumeReveal()
             lines = []
             lastSeq = 0
             token = nil
@@ -200,6 +205,7 @@ final class IMSession: ObservableObject {
             persistAccount()
             await setParked(true)
             // Leave the Keychain pair in place so the next enter can resume.
+            cancelResumeReveal()
             token = nil
             status = "Parked. Resume keeps this character where they are."
         }
@@ -296,6 +302,7 @@ final class IMSession: ObservableObject {
             savedName = name
             if login.resumed == false {
                 clearDisconnectMarker()
+                cancelResumeReveal()
             }
             if login.resumed == true && includeSince {
                 append(login.lines ?? [], animatedScroll: true)
@@ -409,6 +416,7 @@ final class IMSession: ObservableObject {
     }
 
     private func dropClosedSession() async {
+        cancelResumeReveal()
         lines = []
         lastSeq = 0
         token = nil
@@ -543,16 +551,33 @@ final class IMSession: ObservableObject {
     }
 
     /// One assignment so the transcript lays out once, with the separator already
-    /// in place. The token is bumped first so the scroll handler sees the resume
-    /// before it would otherwise jump to the bottom.
+    /// in place. The pending flag is set first so that layout does not snap to
+    /// the bottom before the reveal can run.
     private func publishLines(_ next: [LineDTO], animatedScroll: Bool) {
         guard next != lines else { return }
         if animatedScroll, let separatorID = revealSeparatorID(previous: lines, next: next),
            separatorID != resumeSeparatorID {
             resumeSeparatorID = separatorID
-            backlogScrollToken += 1
+            pendingResumeReveal = true
+            scrollLog.debug("armed resume reveal separator=\(separatorID, privacy: .public) lines=\(next.count)")
         }
         lines = next
+    }
+
+    /// The transcript calls this after the ease to the bottom has finished.
+    func finishResumeReveal(separatorID: String) {
+        guard resumeSeparatorID == separatorID else {
+            scrollLog.debug("finish resume reveal ignored; separator changed")
+            return
+        }
+        pendingResumeReveal = false
+        scrollLog.debug("resume reveal finished")
+    }
+
+    private func cancelResumeReveal() {
+        guard pendingResumeReveal else { return }
+        pendingResumeReveal = false
+        scrollLog.debug("resume reveal cancelled")
     }
 
     /// Separator that splits lines the user had seen from lines added in this update.
