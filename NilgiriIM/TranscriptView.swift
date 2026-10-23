@@ -116,7 +116,7 @@ struct TranscriptView: View {
             if let label = session.vitals?.label {
                 Text(label)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundStyle(ink)
+                    .foregroundStyle(.yellow)
                     .lineLimit(1)
                     .layoutPriority(1)
             }
