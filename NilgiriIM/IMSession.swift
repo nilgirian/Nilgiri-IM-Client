@@ -10,6 +10,8 @@ final class IMSession: ObservableObject {
     @Published var token: String?
     @Published var sessionId: String?
     @Published var character: String?
+    /// Last HMV prompt. Kept across catch-up and relaunch until a newer prompt arrives.
+    @Published private(set) var vitals: HMVPrompt.Vitals?
     @Published var lines: [LineDTO] = []
     @Published var status = "Parked on the IM server when this app is in the background."
     @Published var parked = false
@@ -34,6 +36,8 @@ final class IMSession: ObservableObject {
     private var lastParkOK = true
     private var pendingUnpark = false
     private var parkWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Prompt parsed from the batch currently being applied. Committed once.
+    private var pendingVitals: HMVPrompt.Vitals?
     private let defaults = UserDefaults.standard
 
     private enum StoreKey {
@@ -49,6 +53,9 @@ final class IMSession: ObservableObject {
         /// Last server instant already drawn, so a later poll of the same value does not
         /// add another separator.
         static let shownDisconnectMs = "im.shownDisconnectMs"
+        /// "hp,mana,moves" for the character in `hmvName`.
+        static let hmv = "im.hmv"
+        static let hmvName = "im.hmvName"
     }
 
     private enum ResumeOutcome {
@@ -56,6 +63,9 @@ final class IMSession: ObservableObject {
         case rejected
         case closed
         case offline
+        /// Since applied a restored session that is not attached yet (`closed` and `resumed`).
+        /// Login follows. The transcript and the divider stay.
+        case detached
     }
 
     private struct HTTPFailure: Error {
@@ -83,6 +93,7 @@ final class IMSession: ObservableObject {
         token = SessionSecrets.get(SessionSecrets.Account.token)
         sessionId = SessionSecrets.get(SessionSecrets.Account.sessionId)
         savedTokenAvailable = token != nil && sessionId != nil
+        restoreVitals()
     }
 
     /// True when Enter should try the saved bearer token before posting a login.
@@ -114,6 +125,9 @@ final class IMSession: ObservableObject {
             startLive()
         case .closed:
             await dropClosedSession()
+        case .detached:
+            // since already inserted the divider. Login reattaches; it must not clear it.
+            await autoPasswordLogin()
         case .rejected:
             token = nil
             await autoPasswordLogin()
@@ -136,6 +150,8 @@ final class IMSession: ObservableObject {
             case .closed:
                 await dropClosedSession()
                 return
+            case .detached:
+                break
             case .rejected:
                 token = nil
             }
@@ -257,6 +273,11 @@ final class IMSession: ObservableObject {
         case .closed:
             stopLive()
             await dropClosedSession()
+        case .detached:
+            // A login is already reattaching this restore. Don't drop the bearer.
+            guard didAutoLogin == false else { return }
+            stopLive()
+            await autoPasswordLogin()
         case .rejected:
             stopLive()
             token = nil
@@ -307,10 +328,13 @@ final class IMSession: ObservableObject {
             let login = try JSONDecoder().decode(LoginResponse.self, from: respData)
             token = login.token
             sessionId = login.sessionId
-            character = login.character
+            adoptCharacter(login.character)
             parked = login.parked ?? false
             savedName = name
             // A brand-new session has nothing to split. Older servers omit both flags.
+            // A live reattach is resumed with no disconnectedAt: the device-clock
+            // marker is the fallback. A restored login repeats the since value;
+            // that instant is already shown, so it must not add a second row.
             let serverDisconnectedAt = login.resumed == false ? nil : login.disconnectedAt
             if login.resumed == false {
                 clearDisconnectMarker()
@@ -324,7 +348,7 @@ final class IMSession: ObservableObject {
                     login.lines ?? [],
                     animatedScroll: true,
                     serverDisconnectedAt: serverDisconnectedAt,
-                    allowServerOnly: login.resumed != false && nameMatchesHeld()
+                    trustCursor: login.resumed != false && nameMatchesHeld()
                 )
                 if includeSince && lines.isEmpty {
                     lastSeq = 0
@@ -342,6 +366,8 @@ final class IMSession: ObservableObject {
     }
 
     /// Bearer token never expires. Prefer GET since, then unpark, before logging in again.
+    /// A detached restore (`closed` with `resumed`) has already placed the divider.
+    /// The caller logs in next and must not wipe that transcript.
     private func resumeDirect() async -> ResumeOutcome {
         let outcome = await fetchSince()
         guard outcome == .ready else { return outcome }
@@ -364,17 +390,24 @@ final class IMSession: ObservableObject {
                 guard let since = try? JSONDecoder().decode(SinceResponse.self, from: data) else {
                     return .offline
                 }
+                // Apply lines and disconnectedAt before looking at closed.
+                // A restored session's first since is closed and resumed, and
+                // that response is what places the divider.
                 if lines.isEmpty {
                     replaceTranscript(
                         since.lines,
                         animatedScroll: true,
-                        serverDisconnectedAt: since.disconnectedAt,
-                        allowServerOnly: true
+                        serverDisconnectedAt: since.disconnectedAt
                     )
                 } else {
                     append(since.lines, animatedScroll: true, serverDisconnectedAt: since.disconnectedAt)
                 }
-                if since.closed { return .closed }
+                if since.closed {
+                    if since.resumed == true {
+                        return .detached
+                    }
+                    return .closed
+                }
                 return .ready
             case 401, 403, 404:
                 return .rejected
@@ -549,18 +582,20 @@ final class IMSession: ObservableObject {
         _ incoming: [LineDTO],
         animatedScroll: Bool = false,
         serverDisconnectedAt: Int64? = nil,
-        allowServerOnly: Bool = false
+        trustCursor: Bool = true
     ) {
-        let seenSeq = lastSeq
+        // Another character's saved cursor is not a gap in this transcript.
+        let seenSeq = trustCursor ? lastSeq : 0
         var shown: [LineDTO] = []
         var maxSeq: Int64 = 0
         for line in incoming {
             if line.seq > maxSeq {
                 maxSeq = line.seq
             }
-            guard shouldShow(line) else { continue }
-            shown.append(line)
+            guard let shownLine = presentable(line) else { continue }
+            shown.append(shownLine)
         }
+        commitVitals()
         lastSeq = maxSeq
         // Keep the newest window before the separator is placed, so a long
         // replace does not anchor the gap in lines that are about to be dropped.
@@ -569,7 +604,6 @@ final class IMSession: ObservableObject {
             trimmed(applyingDisconnectSeparator(
                 window,
                 seenSeq: seenSeq,
-                allowServerOnly: allowServerOnly,
                 serverDisconnectedAt: serverDisconnectedAt
             )),
             animatedScroll: animatedScroll
@@ -582,14 +616,20 @@ final class IMSession: ObservableObject {
         animatedScroll: Bool = false,
         serverDisconnectedAt: Int64? = nil
     ) {
+        let seenSeq = lastSeq
         var next = lines
         for line in incoming where line.seq > lastSeq {
             lastSeq = line.seq
-            guard shouldShow(line) else { continue }
-            next.append(line)
+            guard let shownLine = presentable(line) else { continue }
+            next.append(shownLine)
         }
+        commitVitals()
         publishLines(
-            trimmed(applyingDisconnectSeparator(next, serverDisconnectedAt: serverDisconnectedAt)),
+            trimmed(applyingDisconnectSeparator(
+                next,
+                seenSeq: seenSeq,
+                serverDisconnectedAt: serverDisconnectedAt
+            )),
             animatedScroll: animatedScroll
         )
         persistCursor()
@@ -670,39 +710,39 @@ final class IMSession: ObservableObject {
         return ms
     }
 
-    /// Remembers a server instant that has not already been drawn.
+    /// Remembers a server instant only when it is newer than the last separator drawn.
     private func stashServerDisconnect(_ reportedMs: Int64?) {
-        guard let reportedMs, reportedMs > 0 else { return }
-        guard shownDisconnectMs() != Optional(reportedMs) else { return }
+        guard let reportedMs, isNewerServerInstant(reportedMs) else { return }
         defaults.set(String(reportedMs), forKey: StoreKey.disconnectServerMs)
     }
 
+    /// A missing record is older than any positive `disconnectedAt`.
+    private func isNewerServerInstant(_ reportedMs: Int64) -> Bool {
+        guard reportedMs > 0 else { return false }
+        guard let shown = shownDisconnectMs() else { return true }
+        return reportedMs > shown
+    }
+
     /// Places one local separator after the last server line the user had already
-    /// seen. The stamp uses the server's `disconnectedAt` (epoch ms) when that
-    /// field arrived on login or since, and the device clock otherwise. The
-    /// separator is not a server seq, so `lastSeq` stays the since cursor.
+    /// seen. A login or since `disconnectedAt` newer than the last separator is
+    /// enough — the app does not also need to have watched the drop. The device
+    /// clock is the fallback when the field is absent. The stamp is an absolute
+    /// `Date`, formatted later in `TimeZone.current`. The separator is not a
+    /// server seq, so `lastSeq` stays the since cursor.
     private func applyingDisconnectSeparator(
         _ source: [LineDTO],
         seenSeq: Int64 = 0,
-        allowServerOnly: Bool = false,
         serverDisconnectedAt: Int64? = nil
     ) -> [LineDTO] {
         let reportedMs = serverDisconnectedAt.flatMap { $0 > 0 ? $0 : nil }
         if disconnectMarkerNameMismatch() {
             clearDisconnectMarker()
-            clearShownDisconnect()
         }
         if defaults.object(forKey: StoreKey.disconnectAt) != nil {
             stashServerDisconnect(reportedMs)
-        } else if allowServerOnly,
-                  let reportedMs,
-                  shownDisconnectMs() != Optional(reportedMs),
-                  seenSeq > 0,
-                  source.contains(where: { $0.isSeparator }) == false,
-                  source.contains(where: { $0.isServerLine && $0.seq > seenSeq }) {
-            // No device-clock gap (force quit, or a server that learned the drop
-            // first). Place this one backlog split, then remember the instant so
-            // the next poll of the same `disconnectedAt` does not draw it again.
+        } else if let reportedMs, isNewerServerInstant(reportedMs), seenSeq > 0 {
+            // Server restart or a drop this process never observed. Remember the
+            // instant so a later line can still land under the same gap.
             defaults.set(Double(reportedMs) / 1000, forKey: StoreKey.disconnectAt)
             defaults.set(String(seenSeq), forKey: StoreKey.disconnectSeq)
             defaults.set(character ?? name, forKey: StoreKey.disconnectName)
@@ -711,7 +751,12 @@ final class IMSession: ObservableObject {
         guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return source }
         let disconnectSeq = Int64(defaults.string(forKey: StoreKey.disconnectSeq) ?? "") ?? 0
         let hasNewLine = source.contains { $0.isServerLine && $0.seq > disconnectSeq }
-        guard hasNewLine else { return source }
+        let hasAnchor = source.contains { $0.isServerLine && $0.seq <= disconnectSeq }
+        // Device-only gaps wait for a line after the drop. A newer server instant
+        // is drawn as soon as the lines the user had seen are on screen.
+        if hasNewLine == false {
+            guard storedServerDisconnectMs() != nil, hasAnchor else { return source }
+        }
         // Both instants are absolute. The device clock is the fallback when the
         // server omits `disconnectedAt`. Display formats either one in TimeZone.current.
         let deviceDate = Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
@@ -765,6 +810,52 @@ final class IMSession: ObservableObject {
 
     private func shouldShow(_ line: LineDTO) -> Bool {
         line.text.contains("Do you want text color") == false
+    }
+
+    /// Drops the color question and a line that is only an HMV prompt.
+    /// A prompt fused with other text keeps that text. The newest prompt in
+    /// the batch is remembered for the header.
+    private func presentable(_ line: LineDTO) -> LineDTO? {
+        guard shouldShow(line) else { return nil }
+        let stripped = HMVPrompt.strip(line.text)
+        if let found = stripped.vitals {
+            pendingVitals = found
+        }
+        guard stripped.text.isEmpty == false else { return nil }
+        guard stripped.text != line.text else { return line }
+        return LineDTO(seq: line.seq, at: line.at, kind: line.kind, text: stripped.text)
+    }
+
+    private func commitVitals() {
+        guard let found = pendingVitals else { return }
+        pendingVitals = nil
+        guard vitals != found else { return }
+        vitals = found
+        defaults.set(found.stored, forKey: StoreKey.hmv)
+        let owner = character ?? name
+        if owner.isEmpty == false {
+            defaults.set(owner, forKey: StoreKey.hmvName)
+        }
+    }
+
+    private func restoreVitals() {
+        guard let raw = defaults.string(forKey: StoreKey.hmv),
+              let held = defaults.string(forKey: StoreKey.hmvName),
+              let found = HMVPrompt.Vitals.parse(raw) else { return }
+        let owner = character ?? name
+        guard owner.isEmpty == false, namesEqual(held, owner) else { return }
+        vitals = found
+    }
+
+    /// Another character's saved prompt is not this header.
+    private func adoptCharacter(_ next: String?) {
+        character = next
+        guard let next, next.isEmpty == false else { return }
+        guard let held = defaults.string(forKey: StoreKey.hmvName),
+              namesEqual(held, next) == false else { return }
+        vitals = nil
+        defaults.removeObject(forKey: StoreKey.hmv)
+        defaults.removeObject(forKey: StoreKey.hmvName)
     }
 
     private func post(_ action: String, _ body: [String: Any]) async throws {
