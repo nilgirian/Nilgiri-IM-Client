@@ -35,7 +35,6 @@ struct TranscriptView: View {
                             }
                         }
                         .defaultScrollAnchor(.bottom)
-                        .scrollDismissesKeyboard(.interactively)
                         .onAppear { scrollToBottom(proxy) }
                         .onChange(of: session.lines) { _, _ in
                             scrollToBottom(proxy)
@@ -52,12 +51,21 @@ struct TranscriptView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .focused($commandFocused)
-                        .onSubmit { Task { await session.send() } }
-                    Button("Send") { Task { await session.send() } }
+                        .onSubmit { Task { await sendCommand() } }
+                    Button("Send") { Task { await sendCommand() } }
                         .foregroundStyle(ink)
                 }
                 .padding(12)
                 .background(screen)
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 15)
+                        .onEnded { value in
+                            let translation = value.translation
+                            if translation.height > abs(translation.width), translation.height > 0 {
+                                commandFocused = false
+                            }
+                        }
+                )
             }
             .background(screen)
             .preferredColorScheme(.dark)
@@ -67,24 +75,12 @@ struct TranscriptView: View {
             .navigationTitle(session.character ?? "IM")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Park") {
-                        Task { await session.logout(closeMud: false) }
-                    }
-                    .foregroundStyle(ink)
-                }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Quit") {
+                    Button("Unlink") {
                         Task { await session.logout(closeMud: true) }
                     }
                     .foregroundStyle(ink)
-                }
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("Done") {
-                        commandFocused = false
-                    }
-                    .foregroundStyle(ink)
+                    .accessibilityLabel("Unlink")
                 }
             }
             .onChange(of: scenePhase) { _, phase in
@@ -100,6 +96,11 @@ struct TranscriptView: View {
                 await PushRegistration.request(session: session)
             }
         }
+    }
+
+    private func sendCommand() async {
+        await session.send()
+        commandFocused = false
     }
 
     // Login fills `lines` before this view exists, so the first backlog is not an
