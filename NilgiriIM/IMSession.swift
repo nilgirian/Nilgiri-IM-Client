@@ -17,6 +17,11 @@ final class IMSession: ObservableObject {
     @Published var command = ""
     @Published private(set) var savedName = ""
     @Published private(set) var savedTokenAvailable = false
+    /// Bumped when a resume or catch-up backlog inserts (or first reveals) a
+    /// disconnect separator. Live lines leave it alone.
+    @Published private(set) var backlogScrollToken = 0
+    /// Id of the separator the transcript should park on before easing to the bottom.
+    @Published private(set) var resumeSeparatorID: String?
 
     private var lastSeq: Int64 = 0
     private var pollTask: Task<Void, Never>?
@@ -35,6 +40,9 @@ final class IMSession: ObservableObject {
         static let name = "im.name"
         static let character = "im.character"
         static let lastSeq = "im.lastSeq"
+        static let disconnectAt = "im.disconnectAt"
+        static let disconnectSeq = "im.disconnectSeq"
+        static let disconnectName = "im.disconnectName"
     }
 
     private enum ResumeOutcome {
@@ -143,6 +151,9 @@ final class IMSession: ObservableObject {
     @discardableResult
     func park(_ value: Bool) async -> Bool {
         parked = value
+        if value {
+            noteDisconnect()
+        }
         if token != nil, sessionId != nil {
             persistAccount()
         }
@@ -181,6 +192,7 @@ final class IMSession: ObservableObject {
             sessionId = nil
             character = nil
             clearSessionSecrets()
+            clearDisconnectMarker()
             defaults.set("0", forKey: StoreKey.lastSeq)
             defaults.removeObject(forKey: StoreKey.character)
             status = "Unlinked. The MUD session is closed."
@@ -195,6 +207,7 @@ final class IMSession: ObservableObject {
 
     /// Resume clears park on the server, so backgrounding has to park again.
     func sceneWentBackground() async {
+        noteDisconnect()
         persistAccount()
         stopLive()
         guard token != nil, sessionId != nil else { return }
@@ -281,10 +294,13 @@ final class IMSession: ObservableObject {
             character = login.character
             parked = login.parked ?? false
             savedName = name
+            if login.resumed == false {
+                clearDisconnectMarker()
+            }
             if login.resumed == true && includeSince {
-                append(login.lines ?? [])
+                append(login.lines ?? [], animatedScroll: true)
             } else {
-                replaceTranscript(login.lines ?? [])
+                replaceTranscript(login.lines ?? [], animatedScroll: true)
                 if includeSince && lines.isEmpty {
                     lastSeq = 0
                     persistCursor()
@@ -324,9 +340,9 @@ final class IMSession: ObservableObject {
                     return .offline
                 }
                 if lines.isEmpty {
-                    replaceTranscript(since.lines)
+                    replaceTranscript(since.lines, animatedScroll: true)
                 } else {
-                    append(since.lines)
+                    append(since.lines, animatedScroll: true)
                 }
                 if since.closed { return .closed }
                 return .ready
@@ -399,6 +415,7 @@ final class IMSession: ObservableObject {
         sessionId = nil
         character = nil
         clearSessionSecrets()
+        clearDisconnectMarker()
         defaults.set("0", forKey: StoreKey.lastSeq)
         defaults.removeObject(forKey: StoreKey.character)
         if password.isEmpty == false && name.isEmpty == false {
@@ -484,14 +501,19 @@ final class IMSession: ObservableObject {
                     }
                 }
             }
-        } catch {
             if Task.isCancelled == false {
+                noteDisconnect()
                 status = "Live stream dropped; polling catch-up."
             }
+        } catch {
+            if Task.isCancelled { return }
+            if let urlError = error as? URLError, urlError.code == .cancelled { return }
+            noteDisconnect()
+            status = "Live stream dropped; polling catch-up."
         }
     }
 
-    private func replaceTranscript(_ incoming: [LineDTO]) {
+    private func replaceTranscript(_ incoming: [LineDTO], animatedScroll: Bool = false) {
         var shown: [LineDTO] = []
         var maxSeq: Int64 = 0
         for line in incoming {
@@ -501,24 +523,117 @@ final class IMSession: ObservableObject {
             guard shouldShow(line) else { continue }
             shown.append(line)
         }
-        if shown.count > 4000 {
-            shown.removeFirst(shown.count - 4000)
-        }
-        lines = shown
         lastSeq = maxSeq
+        // Keep the newest window before the separator is placed, so a long
+        // replace does not anchor the gap in lines that are about to be dropped.
+        let window = shown.count > 4000 ? Array(shown.suffix(4000)) : shown
+        publishLines(trimmed(applyingDisconnectSeparator(window)), animatedScroll: animatedScroll)
         persistCursor()
     }
 
-    private func append(_ incoming: [LineDTO]) {
+    private func append(_ incoming: [LineDTO], animatedScroll: Bool = false) {
+        var next = lines
         for line in incoming where line.seq > lastSeq {
             lastSeq = line.seq
             guard shouldShow(line) else { continue }
-            lines.append(line)
+            next.append(line)
         }
-        if lines.count > 4000 {
-            lines.removeFirst(lines.count - 4000)
-        }
+        publishLines(trimmed(applyingDisconnectSeparator(next)), animatedScroll: animatedScroll)
         persistCursor()
+    }
+
+    /// One assignment so the transcript lays out once, with the separator already
+    /// in place. The token is bumped first so the scroll handler sees the resume
+    /// before it would otherwise jump to the bottom.
+    private func publishLines(_ next: [LineDTO], animatedScroll: Bool) {
+        guard next != lines else { return }
+        if animatedScroll, let separatorID = revealSeparatorID(previous: lines, next: next),
+           separatorID != resumeSeparatorID {
+            resumeSeparatorID = separatorID
+            backlogScrollToken += 1
+        }
+        lines = next
+    }
+
+    /// Separator that splits lines the user had seen from lines added in this update.
+    /// A separator already revealed is returned too, and the caller skips it when
+    /// its id matches `resumeSeparatorID`, so later catch-up does not replay the ease.
+    private func revealSeparatorID(previous: [LineDTO], next: [LineDTO]) -> String? {
+        let previousIDs = Set(previous.map(\.id))
+        if let inserted = next.last(where: { $0.isSeparator && previousIDs.contains($0.id) == false }) {
+            return inserted.id
+        }
+        guard let index = next.lastIndex(where: { $0.isSeparator }) else { return nil }
+        let addedAfter = next.suffix(from: next.index(after: index)).contains {
+            $0.isServerLine && previousIDs.contains($0.id) == false
+        }
+        guard addedAfter else { return nil }
+        return next[index].id
+    }
+
+    /// First disconnect wins until a resume actually inserts the separator.
+    private func noteDisconnect() {
+        guard token != nil, sessionId != nil else { return }
+        guard defaults.object(forKey: StoreKey.disconnectAt) == nil else { return }
+        defaults.set(Date().timeIntervalSince1970, forKey: StoreKey.disconnectAt)
+        defaults.set(String(lastSeq), forKey: StoreKey.disconnectSeq)
+        defaults.set(character ?? name, forKey: StoreKey.disconnectName)
+    }
+
+    private func clearDisconnectMarker() {
+        defaults.removeObject(forKey: StoreKey.disconnectAt)
+        defaults.removeObject(forKey: StoreKey.disconnectSeq)
+        defaults.removeObject(forKey: StoreKey.disconnectName)
+    }
+
+    /// Places a local separator after the last server line the user had already
+    /// seen. The separator is not a server seq, so `lastSeq` stays the since cursor.
+    private func applyingDisconnectSeparator(_ source: [LineDTO]) -> [LineDTO] {
+        guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return source }
+        let heldName = defaults.string(forKey: StoreKey.disconnectName) ?? ""
+        let currentName = character ?? name
+        if heldName.isEmpty == false, namesEqual(heldName, currentName) == false {
+            clearDisconnectMarker()
+            return source
+        }
+        let disconnectSeq = Int64(defaults.string(forKey: StoreKey.disconnectSeq) ?? "") ?? 0
+        let hasNewLine = source.contains { $0.isServerLine && $0.seq > disconnectSeq }
+        guard hasNewLine else { return source }
+        let disconnected = Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
+        let stamp = DisconnectSeparator.stamp(at: disconnected)
+        var next = source
+        let afterSeen = next.lastIndex(where: { $0.isServerLine && $0.seq <= disconnectSeq })
+        let insertAt = afterSeen.map { $0 + 1 } ?? 0
+        if next.indices.contains(insertAt), next[insertAt].isSeparator {
+            clearDisconnectMarker()
+            return next
+        }
+        if next.contains(where: { $0.isSeparator && $0.text == stamp }) {
+            clearDisconnectMarker()
+            return next
+        }
+        next.insert(
+            LineDTO(
+                seq: -1,
+                at: Int64(disconnected.timeIntervalSince1970 * 1000),
+                kind: "separator",
+                text: stamp,
+                localID: "separator-\(disconnectSeq)-\(stamp)",
+                disconnectAt: disconnected
+            ),
+            at: insertAt
+        )
+        clearDisconnectMarker()
+        return next
+    }
+
+    private func trimmed(_ source: [LineDTO]) -> [LineDTO] {
+        var copy = source
+        while copy.count > 4000 {
+            guard let index = copy.firstIndex(where: { $0.isServerLine }) else { break }
+            copy.remove(at: index)
+        }
+        return copy
     }
 
     private func shouldShow(_ line: LineDTO) -> Bool {
