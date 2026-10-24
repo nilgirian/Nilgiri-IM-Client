@@ -28,7 +28,7 @@ struct CharacterCreateView: View {
                 }
             }
             .preferredColorScheme(.dark)
-            .toolbarBackground(creationScreen, for: .navigationBar)
+            .toolbarBackground(Chrome.barBackground, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
             .navigationTitle("Character Creation")
@@ -220,7 +220,7 @@ struct CharacterCreateView: View {
         .frame(maxHeight: maxHeight)
         .frame(height: fittedHeight)
         .foregroundStyle(creationInk)
-        .background(.ultraThinMaterial)
+        .background(Chrome.barBackground)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .background {
             GeometryReader { proxy in
@@ -274,7 +274,7 @@ struct CharacterCreateView: View {
         .padding(16)
         .frame(maxWidth: 420)
         .foregroundStyle(creationInk)
-        .background(.ultraThinMaterial)
+        .background(Chrome.barBackground)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .padding(.horizontal, 24)
     }
