@@ -16,6 +16,7 @@
 		A10000000000000000000008 /* Ansi.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001A /* Ansi.swift */; };
 		A10000000000000000000009 /* SessionSecrets.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001B /* SessionSecrets.swift */; };
 		A1000000000000000000000A /* CharacterCreateView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001C /* CharacterCreateView.swift */; };
+		A1000000000000000000000B /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001D /* Theme.swift */; };
 		A10000000000000000000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -30,6 +31,7 @@
 		A1000000000000000000001A /* Ansi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ansi.swift; sourceTree = "<group>"; };
 		A1000000000000000000001B /* SessionSecrets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionSecrets.swift; sourceTree = "<group>"; };
 		A1000000000000000000001C /* CharacterCreateView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CharacterCreateView.swift; sourceTree = "<group>"; };
+		A1000000000000000000001D /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 		A10000000000000000000017 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A10000000000000000000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A10000000000000000000019 /* NilgiriIM.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = NilgiriIM.entitlements; sourceTree = "<group>"; };
@@ -62,6 +64,7 @@
 				A10000000000000000000013 /* Models.swift */,
 				A10000000000000000000014 /* LoginView.swift */,
 				A1000000000000000000001C /* CharacterCreateView.swift */,
+				A1000000000000000000001D /* Theme.swift */,
 				A10000000000000000000015 /* TranscriptView.swift */,
 				A10000000000000000000016 /* PushRegistration.swift */,
 				A1000000000000000000001A /* Ansi.swift */,
@@ -150,6 +153,7 @@
 				A10000000000000000000003 /* Models.swift in Sources */,
 				A10000000000000000000004 /* LoginView.swift in Sources */,
 				A1000000000000000000000A /* CharacterCreateView.swift in Sources */,
+				A1000000000000000000000B /* Theme.swift in Sources */,
 				A10000000000000000000005 /* TranscriptView.swift in Sources */,
 				A10000000000000000000006 /* PushRegistration.swift in Sources */,
 				A10000000000000000000008 /* Ansi.swift in Sources */,

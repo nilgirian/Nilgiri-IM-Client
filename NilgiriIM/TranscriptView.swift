@@ -166,7 +166,7 @@ struct TranscriptView: View {
         .accessibilityElement(children: .combine)
     }
 
-    /// Same frost as the input bar: `.ultraThinMaterial.opacity(0.5)`, extended
+    /// Same frost as the input bar (`Chrome.barBackground`), extended
     /// into the top safe area the way the input bar extends into the bottom.
     private var topBar: some View {
         sessionHeader
@@ -178,7 +178,7 @@ struct TranscriptView: View {
                     Color.clear.preference(key: HeaderBarHeightKey.self, value: proxy.size.height)
                 }
             }
-            .background(.ultraThinMaterial.opacity(0.5), ignoresSafeAreaEdges: .top)
+            .background(Chrome.barBackground, ignoresSafeAreaEdges: .top)
     }
 
     /// Floats just under the name bar, on the trailing side. Lighter than the
@@ -221,7 +221,7 @@ struct TranscriptView: View {
                 .foregroundStyle(ink)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
-                .background(.ultraThinMaterial.opacity(0.5), in: Capsule())
+                .background(Chrome.barBackground, in: Capsule())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("New lines")
@@ -263,7 +263,7 @@ struct TranscriptView: View {
                 Color.clear.preference(key: InputBarHeightKey.self, value: proxy.size.height)
             }
         }
-        .background(.ultraThinMaterial.opacity(0.5), ignoresSafeAreaEdges: .bottom)
+        .background(Chrome.barBackground, ignoresSafeAreaEdges: .bottom)
         .simultaneousGesture(
             DragGesture(minimumDistance: 15)
                 .onEnded { value in
