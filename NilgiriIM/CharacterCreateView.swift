@@ -5,8 +5,9 @@ private let creationInk = Color(white: 0.88)
 private let creationScreen = Color.black
 
 /// Name and email, then the creation wizard. Descriptions scroll behind the
-/// choice panel. Leaving this screen cancels the creation. Backgrounding does
-/// not: the password step has to stay up while the player reads the email.
+/// choice panel. Leaving this screen cancels the creation. Backgrounding
+/// cancels too, except the password step, which stays up while the player
+/// reads the email.
 struct CharacterCreateView: View {
     @EnvironmentObject private var session: IMSession
     @State private var selectedIndex: Int?
@@ -14,7 +15,7 @@ struct CharacterCreateView: View {
     @State private var passwordAnswer = ""
     /// Visible height of the choice panel, so the transcript can scroll clear of it.
     @State private var panelHeight: CGFloat = 0
-    /// Full height of the choice panel's controls, before the 62% cap.
+    /// Full height of the choice panel's controls, before the height cap.
     @State private var stepContentHeight: CGFloat = 0
 
     var body: some View {
@@ -100,7 +101,9 @@ struct CharacterCreateView: View {
     private var wizard: some View {
         GeometryReader { geo in
             let fontSize = max(8, (geo.size.width - 16) / CGFloat(creationColumns) / 0.62)
-            let panelCap = geo.size.height * 0.62
+            let phoneLandscape = UIDevice.current.userInterfaceIdiom == .phone
+                && geo.size.width > geo.size.height
+            let panelCap = geo.size.height * (phoneLandscape ? 0.55 : 0.62)
             ZStack {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -150,7 +153,7 @@ struct CharacterCreateView: View {
         .background(creationScreen)
         .onPreferenceChange(CreatePanelHeightKey.self) { panelHeight = $0 }
         .onPreferenceChange(CreateStepContentHeightKey.self) { stepContentHeight = $0 }
-        .onChange(of: session.createStep?.signature) { _, _ in
+        .onChange(of: session.createStepSerial) { _, _ in
             selectedIndex = nil
             textAnswer = ""
             passwordAnswer = ""
@@ -301,7 +304,7 @@ private struct CreateStepContentHeightKey: PreferenceKey {
     }
 }
 
-/// Visible height of the choice panel, including the 62% cap.
+/// Visible height of the choice panel, including its height cap.
 private struct CreatePanelHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
