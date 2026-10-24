@@ -10,7 +10,14 @@ struct LoginView: View {
                     TextField("Name", text: $session.name)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .textContentType(.username)
+                        .onChange(of: session.name) { old, new in
+                            guard old != new else { return }
+                            if session.acknowledgeNameWrite(new) { return }
+                            session.password = ""
+                        }
                     SecureField("Password", text: $session.password)
+                        .textContentType(.password)
                 }
                 Section {
                     Button(session.offersResume ? "Resume parked session" : "Enter Nilgiri") {

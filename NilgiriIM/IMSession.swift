@@ -49,7 +49,7 @@ final class IMSession: ObservableObject {
     /// Bumped for every decoded step so the wizard resets its fields, including a reroll.
     @Published private(set) var createStepSerial = 0
     /// Server description lines for the creation transcript, in arrival order.
-    /// Password steps are not copied; their text stays in the dialog.
+    /// Password-step info is included. The password itself is never in that text.
     /// Each entry is one server line, unchanged.
     @Published var createLog: [String] = []
     @Published var createBusy = false
@@ -64,6 +64,12 @@ final class IMSession: ObservableObject {
     /// of that same block is not copied again.
     private var createLogBlock: [String]?
     @Published private(set) var savedName = ""
+    /// True after the app writes `name` (restore, or the name taken after creation)
+    /// until the user edits Name to something else. LoginView must not clear Password
+    /// for the app's write.
+    private(set) var suppressNameClear = false
+    /// `name` stored with `suppressNameClear`.
+    private var nameAssignedByApp: String?
     @Published private(set) var savedTokenAvailable = false
     /// Set before the resume or catch-up lines are published, and cleared only
     /// after the transcript finishes easing. While this is true the view must not
@@ -125,7 +131,7 @@ final class IMSession: ObservableObject {
     init() {
         defaults.removeObject(forKey: "im.serverURL")
         if let storedName = defaults.string(forKey: StoreKey.name), storedName.isEmpty == false {
-            name = storedName
+            assignNameFromApp(storedName)
             savedName = storedName
         }
         if let storedCharacter = defaults.string(forKey: StoreKey.character), storedCharacter.isEmpty == false {
@@ -141,6 +147,25 @@ final class IMSession: ObservableObject {
         sessionId = SessionSecrets.get(SessionSecrets.Account.sessionId)
         savedTokenAvailable = token != nil && sessionId != nil
         restoreVitals()
+    }
+
+    /// Restore and the name taken after creation. Login must not clear Password for this write.
+    private func assignNameFromApp(_ value: String) {
+        nameAssignedByApp = value
+        suppressNameClear = true
+        name = value
+    }
+
+    /// True when `newName` is the app's own write and Password must stay.
+    /// A user edit to a different name returns false and drops the marker.
+    func acknowledgeNameWrite(_ newName: String) -> Bool {
+        guard suppressNameClear else { return false }
+        if nameAssignedByApp == newName {
+            return true
+        }
+        suppressNameClear = false
+        nameAssignedByApp = nil
+        return false
     }
 
     /// True when Enter should try the saved bearer token before posting a login.
@@ -1238,7 +1263,7 @@ final class IMSession: ObservableObject {
         createError = nil
         createBusy = false
         characterMissing = false
-        name = login.character.isEmpty ? keptName : login.character
+        assignNameFromApp(login.character.isEmpty ? keptName : login.character)
         if let keptPassword, keptPassword.isEmpty == false {
             password = keptPassword
         }
@@ -1282,12 +1307,10 @@ final class IMSession: ObservableObject {
         characterMissing = false
     }
 
-    /// Copies a non-password step's info onto the creation transcript.
-    /// Lines are stored as the server sent them. A password step stays in the
-    /// dialog. An error re-send of the same info is not copied twice. A new
-    /// roll, with new info and no error, is always copied.
+    /// Copies a step's info onto the creation transcript, including a password step.
+    /// Lines are stored as the server sent them. An error re-send of the same
+    /// info is not copied twice. A new roll, with new info and no error, is always copied.
     private func appendCreateLog(_ step: CreateStep) {
-        guard step.isPassword == false else { return }
         let block = step.info
         let failed = step.error?.isEmpty == false
         if let createLogBlock, block == createLogBlock, failed {
