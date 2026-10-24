@@ -21,8 +21,9 @@ struct TranscriptView: View {
     @FocusState private var commandFocused: Bool
     /// Programmatic scroll target. Nil leaves the scroll view alone.
     @State private var positionedID: String?
-    /// Where `positionedID` sits in the visible region. The separator jump uses
-    /// `.top`; the ease to the latest line uses `.bottom`.
+    /// Where `positionedID` sits in the visible region. Resume parks the separator
+    /// on `.bottom`, just above the input bar; the ease to the latest line uses
+    /// `.bottom` as well.
     @State private var positionAnchor: UnitPoint = .bottom
     /// A live line arrived during the reveal and should jump to the bottom once it ends.
     @State private var bottomScrollDeferred = false
@@ -43,6 +44,10 @@ struct TranscriptView: View {
     /// Distance updates in this window are the layout catching up to a bottom snap,
     /// not the reader scrolling away.
     @State private var holdBottomUntil = Date.distantPast
+    /// New lines arrived while the reader was up in the backlog.
+    @State private var showNewLines = false
+    /// Upward swipe on the input bar. One row of compass commands.
+    @State private var actionPanelShown = false
 
     /// Count and the newest line, so a capped buffer and an insert both register
     /// without observing the whole transcript array.
@@ -91,6 +96,17 @@ struct TranscriptView: View {
                         holdBottomUntil: holdBottomUntil,
                         reanchor: { reanchorAfterGeometryChange(proxy, wasNearBottom: true) }
                     ))
+                    .onChange(of: nearBottom) { _, atBottom in
+                        if atBottom {
+                            showNewLines = false
+                        }
+                    }
+                    .overlay(alignment: .bottom) {
+                        if showNewLines, nearBottom == false, session.pendingResumeReveal == false {
+                            newLinesButton(proxy)
+                                .padding(.bottom, 8)
+                        }
+                    }
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         inputBar
                     }
@@ -99,7 +115,7 @@ struct TranscriptView: View {
             .background(screen)
             .onPreferenceChange(InputBarHeightKey.self) { inputBarHeight = $0 }
             .preferredColorScheme(.dark)
-            .toolbarBackground(screen, for: .navigationBar)
+            .toolbarBackground(.ultraThinMaterial.opacity(0.5), for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
             .navigationTitle(session.character ?? "IM")
@@ -113,6 +129,9 @@ struct TranscriptView: View {
                         Task { await session.logout(closeMud: true) }
                     }
                     .foregroundStyle(ink)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(.ultraThinMaterial.opacity(0.5), in: Capsule())
                     .accessibilityLabel("Unlink")
                 }
             }
@@ -135,7 +154,7 @@ struct TranscriptView: View {
     private var sessionHeader: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(session.character ?? "IM")
-                .font(.headline)
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
                 .lineLimit(1)
             if let label = session.vitals?.label {
                 Text(label)
@@ -153,26 +172,64 @@ struct TranscriptView: View {
         commandFocused = false
     }
 
+    /// Same path as a typed command: `session.send()` posts `session.command`.
+    /// A direction tap must not wipe text the reader is still composing.
+    private func sendDirection(_ text: String) async {
+        let draft = session.command
+        session.command = text
+        await session.send()
+        if session.command.isEmpty {
+            session.command = draft
+        }
+    }
+
+    private func newLinesButton(_ proxy: ScrollViewProxy) -> some View {
+        Button {
+            showNewLines = false
+            scrollToBottom(proxy)
+        } label: {
+            Text("↓ New lines")
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundStyle(ink)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(.ultraThinMaterial.opacity(0.5), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("New lines")
+    }
+
     /// Sits in the scroll view's bottom safe area, so lines travel under the blur
     /// and the bottom anchor still rests above the bar. Half-strength frost lets
     /// the log show through; the prompt stays the light terminal ink on dark.
+    /// An upward swipe opens one row of direction commands on that same frost.
     private var inputBar: some View {
-        HStack {
-            Text(">")
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(ink)
-            TextField("command", text: $session.command)
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(ink)
-                .textFieldStyle(.plain)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .focused($commandFocused)
-                .onSubmit { Task { await sendCommand() } }
-            Button("Send") { Task { await sendCommand() } }
-                .foregroundStyle(ink)
+        VStack(spacing: 0) {
+            if actionPanelShown {
+                ActionPanel { command in
+                    Task { await sendDirection(command) }
+                }
+                Rectangle()
+                    .fill(Color.white.opacity(0.12))
+                    .frame(height: 1)
+            }
+            HStack {
+                Text(">")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(ink)
+                TextField("command", text: $session.command)
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(ink)
+                    .textFieldStyle(.plain)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($commandFocused)
+                    .onSubmit { Task { await sendCommand() } }
+                Button("Send") { Task { await sendCommand() } }
+                    .foregroundStyle(ink)
+            }
+            .padding(12)
         }
-        .padding(12)
         .background {
             GeometryReader { proxy in
                 Color.clear.preference(key: InputBarHeightKey.self, value: proxy.size.height)
@@ -183,21 +240,27 @@ struct TranscriptView: View {
             DragGesture(minimumDistance: 15)
                 .onEnded { value in
                     let translation = value.translation
-                    if translation.height > abs(translation.width), translation.height > 0 {
+                    if translation.height < -30, abs(translation.height) > abs(translation.width) {
+                        actionPanelShown.toggle()
+                    } else if translation.height > abs(translation.width), translation.height > 0 {
                         commandFocused = false
+                        actionPanelShown = false
                     }
                 }
         )
     }
 
     /// Bottom snaps stay off for the whole time a resume reveal is pending, including
-    /// before the scene is active. Appear and line changes still jump to the bottom
-    /// when nothing is pending.
+    /// before the scene is active. Appear still opens at the bottom. Later lines
+    /// follow only while the reader is already there; a backlog stays put.
     private func considerReveal(_ proxy: ScrollViewProxy, reason: String) {
         guard session.pendingResumeReveal, let separatorID = session.resumeSeparatorID else {
-            if reason == "appear" || reason == "lines" {
-                scrollToBottom(proxy)
+            guard reason == "appear" || reason == "lines" else { return }
+            if reason == "lines", nearBottom == false {
+                showNewLines = true
+                return
             }
+            scrollToBottom(proxy)
             return
         }
         guard scenePhase == .active else { return }
@@ -240,14 +303,18 @@ struct TranscriptView: View {
         }
     }
 
+    /// Park the separator on the visible bottom, just above the input bar, then
+    /// the ease walks to the latest line. The bar is a bottom safe-area inset of
+    /// `inputBarHeight` (the viewport is `geo.size.height - inputBarHeight`), so
+    /// `anchor: .bottom` is that edge rather than the top of the transcript.
     private func jumpToSeparator(_ proxy: ScrollViewProxy, id: String) {
         guard easeStarted == false else { return }
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            positionAnchor = .top
+            positionAnchor = .bottom
             positionedID = id
-            proxy.scrollTo(id, anchor: .top)
+            proxy.scrollTo(id, anchor: .bottom)
         }
     }
 
@@ -366,6 +433,7 @@ struct TranscriptView: View {
 
     private func holdBottom() {
         nearBottom = true
+        showNewLines = false
         holdBottomUntil = Date().addingTimeInterval(0.25)
     }
 
@@ -505,6 +573,46 @@ struct TranscriptView: View {
 
 }
 
+/// One row of compass commands on the input bar's frost. Each tap posts the
+/// full direction through `session.send()`, the same as typing it.
+private struct ActionPanel: View {
+    var send: (String) -> Void
+
+    private struct Direction: Identifiable {
+        let label: String
+        let command: String
+        var id: String { command }
+    }
+
+    private static let directions = [
+        Direction(label: "N", command: "north"),
+        Direction(label: "S", command: "south"),
+        Direction(label: "E", command: "east"),
+        Direction(label: "W", command: "west"),
+        Direction(label: "U", command: "up"),
+        Direction(label: "D", command: "down"),
+    ]
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(Self.directions) { direction in
+                Button(direction.label) {
+                    send(direction.command)
+                }
+                .buttonStyle(.plain)
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(ink)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .contentShape(Rectangle())
+                .accessibilityLabel(direction.command)
+            }
+        }
+        .padding(.horizontal, 4)
+        .padding(.top, 4)
+    }
+}
+
 private struct InputBarHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -547,6 +655,8 @@ private struct TranscriptScrollSample: Equatable {
     var height: CGFloat
     var bottomInset: CGFloat
     var distanceFromBottom: CGFloat
+    var contentHeight: CGFloat
+    var visibleMinY: CGFloat
 }
 
 /// iOS 18: remember whether the reader was near the bottom, and re-anchor when
@@ -565,7 +675,9 @@ private struct TranscriptResizeStick: ViewModifier {
                     width: geo.containerSize.width,
                     height: geo.containerSize.height,
                     bottomInset: geo.contentInsets.bottom,
-                    distanceFromBottom: geo.contentSize.height - geo.visibleRect.maxY
+                    distanceFromBottom: geo.contentSize.height - geo.visibleRect.maxY,
+                    contentHeight: geo.contentSize.height,
+                    visibleMinY: geo.visibleRect.minY
                 )
             } action: { old, new in
                 guard revealPending == false else { return }
@@ -578,7 +690,17 @@ private struct TranscriptResizeStick: ViewModifier {
                     nearBottom = true
                     reanchor()
                 } else if Date() >= holdBottomUntil {
-                    nearBottom = new.distanceFromBottom <= nearBottomSlack
+                    // A burst of lines grows the content under a reader who has
+                    // not moved. That is still the bottom, so the next line can
+                    // follow. A real scroll changes the visible origin.
+                    let contentGrew = new.contentHeight > old.contentHeight + 0.5
+                    let stayedPut = abs(new.visibleMinY - old.visibleMinY) < 1
+                    let wasAtBottom = nearBottom || old.distanceFromBottom <= nearBottomSlack
+                    if contentGrew, stayedPut, wasAtBottom {
+                        nearBottom = true
+                    } else {
+                        nearBottom = new.distanceFromBottom <= nearBottomSlack
+                    }
                 }
             }
         } else {
