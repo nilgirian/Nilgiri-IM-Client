@@ -141,9 +141,16 @@ struct ErrorResponse: Decodable {
 /// Why the IM host could not serve this attempt.
 /// `proxy` is the machine in front (unreachable, or Apache 502/503).
 /// `server` is the MUD itself (`503` and `{"error":"mud_unavailable"}`).
+/// Character creation `busy`, `mud_timeout`, `504`, and a `502` whose error
+/// mentions timeout are not this dialog. Those stay on the creation form.
 enum OutageKind: Equatable {
     case proxy
     case server
+
+    private struct Body: Decodable {
+        let error: String?
+        let message: String?
+    }
 
     var message: String {
         switch self {
@@ -157,15 +164,53 @@ enum OutageKind: Equatable {
     /// `503` with `mud_unavailable` is the MUD. Any other `502` or `503` is Apache
     /// with the IM server down. A `502` that already carries `mud_unavailable`
     /// is not relabeled as the proxy.
+    /// `503` `busy`, `504`, `mud_timeout`, and a `502` whose error contains
+    /// "timeout" are creation-form errors, not this alert.
     static func http(status: Int, data: Data) -> OutageKind? {
-        let error = (try? JSONDecoder().decode(ErrorResponse.self, from: data))?.error
+        let error = body(from: data)?.error
         if error == "mud_unavailable" {
             return status == 503 ? .server : nil
+        }
+        if isCreationFormFailure(status: status, error: error) {
+            return nil
         }
         if status == 502 || status == 503 {
             return .proxy
         }
         return nil
+    }
+
+    /// Copy for the creation form. Nil when this response is a real outage.
+    /// `busy` is app copy. A timeout uses the server's `message` when it sent one.
+    static func creationFormMessage(status: Int, data: Data) -> String? {
+        let parsed = body(from: data)
+        let error = parsed?.error ?? ""
+        guard isCreationFormFailure(status: status, error: parsed?.error) else { return nil }
+        if status == 503 && error == "busy" {
+            return "Character creation is busy. Try again in a moment."
+        }
+        let serverMessage = parsed?.message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if serverMessage.isEmpty == false {
+            return serverMessage
+        }
+        if status == 502 && error.localizedCaseInsensitiveContains("timeout") && error != "mud_timeout" {
+            return error
+        }
+        return "Nilgiri did not answer in time."
+    }
+
+    /// `503` `{"error":"busy"}`, `504`, `mud_timeout`, or `502` with "timeout" in the error.
+    private static func isCreationFormFailure(status: Int, error: String?) -> Bool {
+        let error = error ?? ""
+        if status == 503 && error == "busy" { return true }
+        if status == 504 || error == "mud_timeout" { return true }
+        if status == 502 && error.localizedCaseInsensitiveContains("timeout") { return true }
+        return false
+    }
+
+    private static func body(from data: Data) -> Body? {
+        guard data.isEmpty == false else { return nil }
+        return try? JSONDecoder().decode(Body.self, from: data)
     }
 
     /// DNS, connection refused, timeout, and TLS failures. Other URL errors,

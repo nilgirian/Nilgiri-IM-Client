@@ -59,6 +59,15 @@ struct RootView: View {
                 LoginView()
             }
         }
+        .onAppear {
+            syncOrientationLock()
+        }
+        .onChange(of: session.token) { _, _ in
+            syncOrientationLock()
+        }
+        .onChange(of: session.creating) { _, _ in
+            syncOrientationLock()
+        }
         .alert(
             session.outageAlert?.message ?? "",
             isPresented: Binding(
@@ -76,6 +85,20 @@ struct RootView: View {
             Button("Retry") {
                 Task { await session.retryOutage() }
             }
+        }
+    }
+
+    /// Login and character creation are portrait on iPhone. The transcript and iPad stay free.
+    private func syncOrientationLock() {
+        let portraitOnly = session.token == nil && UIDevice.current.userInterfaceIdiom == .phone
+        AppDelegate.orientationLock = portraitOnly ? .portrait : .all
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        for scene in scenes {
+            if portraitOnly {
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait))
+            }
+            let root = scene.keyWindow?.rootViewController ?? scene.windows.first?.rootViewController
+            root?.setNeedsUpdateOfSupportedInterfaceOrientations()
         }
     }
 }

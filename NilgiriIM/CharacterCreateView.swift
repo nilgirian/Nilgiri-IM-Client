@@ -26,7 +26,7 @@ struct CharacterCreateView: View {
             .toolbarBackground(creationScreen, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
-            .navigationTitle("Create character")
+            .navigationTitle("Character Creation")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -59,8 +59,15 @@ struct CharacterCreateView: View {
                     Text(createError)
                         .foregroundStyle(.red)
                 }
-                Button("Create") {
+                Button {
                     Task { await session.startCharacterCreation() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Text("Create")
+                        if session.createBusy {
+                            ProgressView()
+                        }
+                    }
                 }
                 .disabled(canStart == false)
             }
@@ -74,6 +81,16 @@ struct CharacterCreateView: View {
         session.createBusy == false
             && session.createName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             && session.createEmail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    /// The step button stays labeled Next. A spinner shows while the answer is in flight.
+    private var creationContinueLabel: some View {
+        HStack(spacing: 8) {
+            Text("Next")
+            if session.createBusy {
+                ProgressView()
+            }
+        }
     }
 
     private var wizard: some View {
@@ -152,8 +169,10 @@ struct CharacterCreateView: View {
                         .accessibilityAddTraits(selectedIndex == index ? .isSelected : AccessibilityTraits())
                     }
                 }
-                Button("Next") {
+                Button {
                     submit(answer(for: step))
+                } label: {
+                    creationContinueLabel
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color(white: 0.28))
@@ -189,8 +208,10 @@ struct CharacterCreateView: View {
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            Button("Next") {
+            Button {
                 submit(passwordAnswer)
+            } label: {
+                creationContinueLabel
             }
             .buttonStyle(.borderedProminent)
             .tint(Color(white: 0.28))

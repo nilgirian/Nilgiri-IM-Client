@@ -6,12 +6,6 @@ struct LoginView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("IM server") {
-                    TextField("https://nilgiri.net/im", text: $session.serverURL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                }
                 Section("Character") {
                     TextField("Name", text: $session.name)
                         .textInputAutocapitalization(.never)
@@ -46,7 +40,17 @@ struct LoginView: View {
             .preferredColorScheme(.dark)
             .toolbarBackground(Color.black, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
-            .navigationTitle("Nilgiri IM")
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Nilgiri the Forgotten World")
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text("Nilgiri the Forgotten World")
+                        .font(.headline)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                }
+            }
         }
     }
 }

@@ -37,6 +37,15 @@ enum PushRegistration {
 
 final class AppDelegate: NSObject, UIApplicationDelegate {
     static var session: IMSession?
+    /// Login and character creation set this to portrait on iPhone. The transcript restores `.all`.
+    static var orientationLock: UIInterfaceOrientationMask = .all
+
+    func application(
+        _ application: UIApplication,
+        supportedInterfaceOrientationsFor window: UIWindow?
+    ) -> UIInterfaceOrientationMask {
+        AppDelegate.orientationLock
+    }
 
     /// The transcript and login screens are black with `.preferredColorScheme(.dark)`.
     /// SwiftUI has no keyboard modifier, so the text fields pick up a dark keyboard here.
