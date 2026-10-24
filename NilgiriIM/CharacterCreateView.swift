@@ -13,6 +13,7 @@ struct CharacterCreateView: View {
     @State private var selectedIndex: Int?
     @State private var textAnswer = ""
     @State private var passwordAnswer = ""
+    @FocusState private var passwordFocused: Bool
     /// Visible height of the choice panel, so the transcript can scroll clear of it.
     @State private var panelHeight: CGFloat = 0
     /// Full height of the choice panel's controls, before the height cap.
@@ -39,6 +40,14 @@ struct CharacterCreateView: View {
                         session.cancelCharacterCreation()
                     }
                     .foregroundStyle(Color(white: 0.78))
+                }
+                if session.createStep?.isPassword == true {
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button("Done") {
+                            passwordFocused = false
+                        }
+                    }
                 }
             }
         }
@@ -124,7 +133,13 @@ struct CharacterCreateView: View {
                                 .frame(height: panelHeight + 12)
                                 .accessibilityHidden(true)
                         }
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture().onEnded {
+                            passwordFocused = false
+                        })
                     }
+                    .scrollDismissesKeyboard(.interactively)
                     .onAppear {
                         guard session.createLog.isEmpty == false else { return }
                         scrollCreateLog(to: 0, proxy: proxy)
@@ -136,17 +151,19 @@ struct CharacterCreateView: View {
                 }
                 .background(creationScreen)
                 if let step = session.createStep {
-                    if step.isPassword {
-                        Color.black.opacity(0.25).ignoresSafeArea()
-                        passwordDialog(step)
-                    } else {
-                        VStack {
-                            Spacer(minLength: 0)
+                    VStack {
+                        // The log scrolls behind this. On the password step it must
+                        // still receive taps and drags so the keyboard can dismiss.
+                        Spacer(minLength: 0)
+                            .allowsHitTesting(step.isPassword == false)
+                        if step.isPassword {
+                            passwordDialog(step)
+                        } else {
                             stepPanel(step, maxHeight: panelCap)
-                                .padding(.horizontal, 16)
-                                .padding(.bottom, 12)
                         }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 12)
                 }
             }
         }
@@ -240,17 +257,15 @@ struct CharacterCreateView: View {
         }
     }
 
+    /// Prompt, field, error, and Next. Server text for this step is in the log.
+    /// Pinned to the bottom so the keyboard lifts it with the rest of the chrome.
     private func passwordDialog(_ step: CreateStep) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(step.passwordPrompt(fallbackEmail: session.createEmail))
                 .font(.headline)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            ForEach(Array(step.info.enumerated()), id: \.offset) { _, line in
-                Text(line.isEmpty ? " " : line)
-                    .font(.system(size: 14, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
             SecureField("Password", text: $passwordAnswer)
+                .focused($passwordFocused)
                 .textFieldStyle(.plain)
                 .padding(10)
                 .background(Color.black.opacity(0.35))
@@ -272,11 +287,15 @@ struct CharacterCreateView: View {
             .disabled(session.createBusy || passwordAnswer.isEmpty)
         }
         .padding(16)
-        .frame(maxWidth: 420)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .foregroundStyle(creationInk)
         .background(Chrome.barBackground)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .padding(.horizontal, 24)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: CreatePanelHeightKey.self, value: proxy.size.height)
+            }
+        }
     }
 
     private func answer(for step: CreateStep) -> String {
