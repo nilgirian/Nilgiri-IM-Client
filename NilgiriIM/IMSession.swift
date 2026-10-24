@@ -4,7 +4,8 @@ import UIKit
 
 @MainActor
 final class IMSession: ObservableObject {
-    @Published var serverURL = "https://nilgiri.net/im"
+    /// Always the public IM host. A URL saved by an older build is removed and never read.
+    let serverURL = "https://nilgiri.net/im"
     @Published var name = ""
     @Published var password = ""
     @Published var token: String?
@@ -75,7 +76,6 @@ final class IMSession: ObservableObject {
     private let defaults = UserDefaults.standard
 
     private enum StoreKey {
-        static let serverURL = "im.serverURL"
         static let name = "im.name"
         static let character = "im.character"
         static let lastSeq = "im.lastSeq"
@@ -110,9 +110,7 @@ final class IMSession: ObservableObject {
     }
 
     init() {
-        if let storedURL = defaults.string(forKey: StoreKey.serverURL), storedURL.isEmpty == false {
-            serverURL = storedURL
-        }
+        defaults.removeObject(forKey: "im.serverURL")
         if let storedName = defaults.string(forKey: StoreKey.name), storedName.isEmpty == false {
             name = storedName
             savedName = storedName
@@ -135,10 +133,6 @@ final class IMSession: ObservableObject {
     /// True when Enter should try the saved bearer token before posting a login.
     var offersResume: Bool {
         guard savedTokenAvailable || (token != nil && sessionId != nil) else { return false }
-        let storedURL = defaults.string(forKey: StoreKey.serverURL) ?? ""
-        if storedURL.isEmpty == false, normalized(serverURL) != normalized(storedURL) {
-            return false
-        }
         if savedName.isEmpty { return false }
         if namesEqual(name, savedName) { return true }
         if let character, namesEqual(name, character) { return true }
@@ -271,6 +265,10 @@ final class IMSession: ObservableObject {
                 abortLateCreation(http.data)
                 return
             }
+            if let message = OutageKind.creationFormMessage(status: http.status, data: http.data) {
+                presentCreationInlineError(message, phase: .start)
+                return
+            }
             if let kind = OutageKind.http(status: http.status, data: http.data) {
                 reportOutage(kind, retry: .create)
                 return
@@ -303,6 +301,10 @@ final class IMSession: ObservableObject {
             )
             guard generation == createGeneration else {
                 abortLateCreation(http.data)
+                return
+            }
+            if let message = OutageKind.creationFormMessage(status: http.status, data: http.data) {
+                presentCreationInlineError(message, phase: .answer)
                 return
             }
             if let kind = OutageKind.http(status: http.status, data: http.data) {
@@ -738,7 +740,6 @@ final class IMSession: ObservableObject {
         if password.isEmpty == false {
             SessionSecrets.set(password, account: SessionSecrets.Account.password)
         }
-        defaults.set(serverURL, forKey: StoreKey.serverURL)
         if name.isEmpty == false {
             defaults.set(name, forKey: StoreKey.name)
             savedName = name
@@ -1265,6 +1266,13 @@ final class IMSession: ObservableObject {
     private func abortLateCreation(_ data: Data) {
         guard let object = jsonObject(data), let cid = stringField(object, "cid") else { return }
         deleteCreation(cid)
+    }
+
+    /// Busy and MUD-timeout responses stay on the form (and on the current step).
+    /// They do not raise the proxy or server dialog.
+    private func presentCreationInlineError(_ message: String, phase: CreatePhase) {
+        createError = message
+        presentCreateFailure(message, phase: phase)
     }
 
     private func presentCreateFailure(_ message: String, phase: CreatePhase) {
