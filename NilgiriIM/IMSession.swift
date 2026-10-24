@@ -1178,12 +1178,14 @@ final class IMSession: ObservableObject {
         }
         if let step = decodeCreateStep(in: object) {
             if phase == .start {
-                guard let cid = stringField(object, "cid"), object["greeting"] is String else {
-                    createError = errorText(from: http.data, status: http.status)
+                guard let cid = stringField(object, "cid") else {
+                    createError = (200...299).contains(http.status)
+                        ? "Character creation returned an unexpected response."
+                        : errorText(from: http.data, status: http.status)
                     return
                 }
                 createCID = cid
-                createGreeting = object["greeting"] as? String ?? ""
+                createGreeting = greetingText(object["greeting"]) ?? ""
                 createStep = step
                 createError = nil
                 return
@@ -1191,8 +1193,8 @@ final class IMSession: ObservableObject {
             if let cid = stringField(object, "cid") {
                 createCID = cid
             }
-            if let greeting = object["greeting"] as? String {
-                createGreeting = greeting
+            if let g = greetingText(object["greeting"]) {
+                createGreeting = g
             }
             createStep = step
             return
@@ -1312,11 +1314,34 @@ final class IMSession: ObservableObject {
         return key == "aborted" || key == "closed"
     }
 
+    /// A greeting is one string, or an array of strings joined with newlines.
+    /// Each line is kept exactly as the server sent it.
+    private func greetingText(_ value: Any?) -> String? {
+        if let text = value as? String {
+            return text
+        }
+        if let lines = value as? [String] {
+            return lines.joined(separator: "\n")
+        }
+        if let items = value as? [Any] {
+            var lines: [String] = []
+            for item in items {
+                guard let line = item as? String else { return nil }
+                lines.append(line)
+            }
+            return lines.joined(separator: "\n")
+        }
+        return nil
+    }
+
     private func errorText(from data: Data, status: Int) -> String {
         if let object = jsonObject(data),
            let error = object["error"] as? String,
            error.isEmpty == false {
             return error
+        }
+        if (200...299).contains(status) {
+            return "Character creation returned an unexpected response."
         }
         return "Creation failed (\(status))"
     }
