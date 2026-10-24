@@ -4,14 +4,18 @@ private let creationColumns = 80
 private let creationInk = Color(white: 0.88)
 private let creationScreen = Color.black
 
-/// Name and email, then each creation step over the ANSI greeting.
-/// Leaving this screen cancels the creation. Backgrounding does not: the
-/// password step has to stay up while the player reads the email.
+/// Name and email, then the creation wizard. Descriptions scroll behind the
+/// choice panel. Leaving this screen cancels the creation. Backgrounding does
+/// not: the password step has to stay up while the player reads the email.
 struct CharacterCreateView: View {
     @EnvironmentObject private var session: IMSession
     @State private var selectedIndex: Int?
     @State private var textAnswer = ""
     @State private var passwordAnswer = ""
+    /// Visible height of the choice panel, so the transcript can scroll clear of it.
+    @State private var panelHeight: CGFloat = 0
+    /// Full height of the choice panel's controls, before the 62% cap.
+    @State private var stepContentHeight: CGFloat = 0
 
     var body: some View {
         NavigationStack {
@@ -96,11 +100,36 @@ struct CharacterCreateView: View {
     private var wizard: some View {
         GeometryReader { geo in
             let fontSize = max(8, (geo.size.width - 16) / CGFloat(creationColumns) / 0.62)
+            let panelCap = geo.size.height * 0.62
             ZStack {
-                ScrollView {
-                    Ansi.text(session.createGreeting ?? "", fontSize: fontSize, columns: creationColumns)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(8)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            Ansi.text(session.createGreeting ?? "", fontSize: fontSize, columns: creationColumns)
+                                .frame(maxWidth: .infinity, alignment: .topLeading)
+                                .padding(8)
+                            ForEach(Array(session.createLog.enumerated()), id: \.offset) { index, line in
+                                Text(verbatim: line.isEmpty ? " " : line)
+                                    .font(.system(size: fontSize, design: .monospaced))
+                                    .foregroundStyle(creationInk)
+                                    .multilineTextAlignment(.leading)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 8)
+                                    .id(createLogLineID(index))
+                            }
+                            Color.clear
+                                .frame(height: panelHeight + 12)
+                                .accessibilityHidden(true)
+                        }
+                    }
+                    .onAppear {
+                        guard session.createLog.isEmpty == false else { return }
+                        scrollCreateLog(to: 0, proxy: proxy)
+                    }
+                    .onChange(of: session.createLog.count) { oldCount, newCount in
+                        guard newCount > oldCount else { return }
+                        scrollCreateLog(to: oldCount, proxy: proxy)
+                    }
                 }
                 .background(creationScreen)
                 if let step = session.createStep {
@@ -110,8 +139,7 @@ struct CharacterCreateView: View {
                     } else {
                         VStack {
                             Spacer(minLength: 0)
-                            stepPanel(step)
-                                .frame(maxHeight: geo.size.height * 0.62)
+                            stepPanel(step, maxHeight: panelCap)
                                 .padding(.horizontal, 16)
                                 .padding(.bottom, 12)
                         }
@@ -120,6 +148,8 @@ struct CharacterCreateView: View {
             }
         }
         .background(creationScreen)
+        .onPreferenceChange(CreatePanelHeightKey.self) { panelHeight = $0 }
+        .onPreferenceChange(CreateStepContentHeightKey.self) { stepContentHeight = $0 }
         .onChange(of: session.createStep?.signature) { _, _ in
             selectedIndex = nil
             textAnswer = ""
@@ -127,17 +157,14 @@ struct CharacterCreateView: View {
         }
     }
 
-    private func stepPanel(_ step: CreateStep) -> some View {
-        ScrollView {
+    /// Label, error, choices or text field, and Next. Description lines stay in the transcript.
+    private func stepPanel(_ step: CreateStep, maxHeight: CGFloat) -> some View {
+        let fittedHeight: CGFloat? = stepContentHeight > 0 ? min(stepContentHeight, maxHeight) : nil
+        return ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 Text(step.label)
                     .font(.headline)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                ForEach(Array(step.info.enumerated()), id: \.offset) { _, line in
-                    Text(line.isEmpty ? " " : line)
-                        .font(.system(size: 14, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
                 if let error = step.error, error.isEmpty == false {
                     Text(error)
                         .foregroundStyle(.red)
@@ -180,10 +207,34 @@ struct CharacterCreateView: View {
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(key: CreateStepContentHeightKey.self, value: proxy.size.height)
+                }
+            }
         }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(maxHeight: maxHeight)
+        .frame(height: fittedHeight)
         .foregroundStyle(creationInk)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: CreatePanelHeightKey.self, value: proxy.size.height)
+            }
+        }
+    }
+
+    private func createLogLineID(_ index: Int) -> String {
+        "create-log-\(index)"
+    }
+
+    /// The newest block starts at `index`. Scroll once the row is in the tree.
+    private func scrollCreateLog(to index: Int, proxy: ScrollViewProxy) {
+        DispatchQueue.main.async {
+            proxy.scrollTo(createLogLineID(index), anchor: .top)
+        }
     }
 
     private func passwordDialog(_ step: CreateStep) -> some View {
@@ -239,5 +290,21 @@ struct CharacterCreateView: View {
     private func submit(_ value: String) {
         guard session.createBusy == false, value.isEmpty == false else { return }
         Task { await session.answerCharacterCreation(value) }
+    }
+}
+
+/// Height of the choice controls, used to hug the panel to its content.
+private struct CreateStepContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// Visible height of the choice panel, including the 62% cap.
+private struct CreatePanelHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }

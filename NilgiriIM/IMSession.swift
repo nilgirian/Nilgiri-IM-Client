@@ -45,6 +45,10 @@ final class IMSession: ObservableObject {
     /// ANSI greeting for the creation wizard. Shown as sent, not as a transcript line.
     @Published var createGreeting: String?
     @Published var createStep: CreateStep?
+    /// Server description lines for the creation transcript, in arrival order.
+    /// Password steps are not copied; their text stays in the dialog.
+    /// Each entry is one server line, unchanged.
+    @Published var createLog: [String] = []
     @Published var createBusy = false
     /// In memory only, so leaving the app to read the emailed password does not drop it.
     private var createCID: String?
@@ -52,6 +56,10 @@ final class IMSession: ObservableObject {
     private var createPassword: String?
     /// Bumped on cancel and on an ended creation so a late response is ignored.
     private var createGeneration = 0
+    /// Last step copied into `createLog`. An error re-send of that step is not copied again.
+    private var createLogSignature: String?
+    /// Info lines of that same step. A re-send whose text matches is not copied again.
+    private var createLogBlock: [String]?
     @Published private(set) var savedName = ""
     @Published private(set) var savedTokenAvailable = false
     /// Set before the resume or catch-up lines are published, and cleared only
@@ -232,7 +240,7 @@ final class IMSession: ObservableObject {
         }
     }
 
-    /// Opens the name and email form. The login name is the starting point.
+    /// Opens the name and email form. The name is left blank; the saved character is not copied in.
     func openCharacterCreation() {
         createGeneration += 1
         createCID = nil
@@ -241,7 +249,8 @@ final class IMSession: ObservableObject {
         createStep = nil
         createError = nil
         createBusy = false
-        createName = name
+        resetCreateLog()
+        createName = ""
         createEmail = ""
         characterMissing = false
         creating = true
@@ -1187,6 +1196,7 @@ final class IMSession: ObservableObject {
                 createCID = cid
                 createGreeting = greetingText(object["greeting"]) ?? ""
                 createStep = step
+                appendCreateLog(step)
                 createError = nil
                 return
             }
@@ -1197,6 +1207,7 @@ final class IMSession: ObservableObject {
                 createGreeting = g
             }
             createStep = step
+            appendCreateLog(step)
             return
         }
         let message = errorText(from: http.data, status: http.status)
@@ -1217,6 +1228,7 @@ final class IMSession: ObservableObject {
         creating = false
         createGreeting = nil
         createStep = nil
+        resetCreateLog()
         createPassword = nil
         createError = nil
         createBusy = false
@@ -1258,10 +1270,30 @@ final class IMSession: ObservableObject {
         creating = false
         createGreeting = nil
         createStep = nil
+        resetCreateLog()
         createPassword = nil
         createError = nil
         createBusy = false
         characterMissing = false
+    }
+
+    /// Copies a non-password step's info onto the creation transcript.
+    /// Lines are stored as the server sent them. A password step stays in the
+    /// dialog. The same step sent again after an error is not copied twice.
+    private func appendCreateLog(_ step: CreateStep) {
+        guard step.isPassword == false else { return }
+        let block = step.info
+        if step.signature == createLogSignature { return }
+        if let createLogBlock, block == createLogBlock { return }
+        createLogSignature = step.signature
+        createLogBlock = block
+        createLog.append(contentsOf: block)
+    }
+
+    private func resetCreateLog() {
+        createLog = []
+        createLogSignature = nil
+        createLogBlock = nil
     }
 
     /// A response that arrived after Cancel. Abort that creation and do not log in.
