@@ -38,6 +38,9 @@ struct TranscriptView: View {
     /// Height of the input bar overlaid on the transcript. The scroll content's
     /// minimum height stays above it, so a short log still fills the visible area.
     @State private var inputBarHeight: CGFloat = 0
+    /// Height of the name and HMV bar. Short logs stay below it, as they stay
+    /// above the input bar.
+    @State private var headerBarHeight: CGFloat = 0
     @State private var bottomSnapGate = BottomSnapGate()
     /// True when the latest text was at or near the bottom before the last size change.
     @State private var nearBottom = true
@@ -59,7 +62,7 @@ struct TranscriptView: View {
         NavigationStack {
             GeometryReader { geo in
                 let fontSize = max(8, (geo.size.width - 16) / CGFloat(terminalColumns) / 0.62)
-                let transcriptHeight = max(0, geo.size.height - inputBarHeight)
+                let transcriptHeight = max(0, geo.size.height - headerBarHeight - inputBarHeight)
                 ScrollViewReader { proxy in
                     ScrollView {
                         lineStack(fontSize: fontSize)
@@ -90,6 +93,10 @@ struct TranscriptView: View {
                         guard newHeight > 1 else { return }
                         reanchorAfterGeometryChange(proxy, wasNearBottom: nearBottom)
                     }
+                    .onChange(of: headerBarHeight) { _, newHeight in
+                        guard newHeight > 1 else { return }
+                        reanchorAfterGeometryChange(proxy, wasNearBottom: nearBottom)
+                    }
                     .modifier(TranscriptResizeStick(
                         nearBottom: $nearBottom,
                         revealPending: session.pendingResumeReveal,
@@ -107,34 +114,26 @@ struct TranscriptView: View {
                                 .padding(.bottom, 8)
                         }
                     }
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        topBar
+                    }
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         inputBar
+                    }
+                }
+                .overlay(alignment: .topTrailing) {
+                    if headerBarHeight > 1 {
+                        unlinkButton
+                            .padding(.top, headerBarHeight + 8)
+                            .padding(.trailing, 12)
                     }
                 }
             }
             .background(screen)
             .onPreferenceChange(InputBarHeightKey.self) { inputBarHeight = $0 }
+            .onPreferenceChange(HeaderBarHeightKey.self) { headerBarHeight = $0 }
             .preferredColorScheme(.dark)
-            .toolbarBackground(.ultraThinMaterial.opacity(0.5), for: .navigationBar)
-            .toolbarBackground(.visible, for: .navigationBar)
-            .toolbarColorScheme(.dark, for: .navigationBar)
-            .navigationTitle(session.character ?? "IM")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    sessionHeader
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Unlink") {
-                        Task { await session.logout(closeMud: true) }
-                    }
-                    .foregroundStyle(ink)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(.ultraThinMaterial.opacity(0.5), in: Capsule())
-                    .accessibilityLabel("Unlink")
-                }
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .onChange(of: scenePhase) { _, phase in
                 Task {
                     if phase == .background {
@@ -165,6 +164,35 @@ struct TranscriptView: View {
             }
         }
         .accessibilityElement(children: .combine)
+    }
+
+    /// Same frost as the input bar: `.ultraThinMaterial.opacity(0.5)`, extended
+    /// into the top safe area the way the input bar extends into the bottom.
+    private var topBar: some View {
+        sessionHeader
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity)
+            .background {
+                GeometryReader { proxy in
+                    Color.clear.preference(key: HeaderBarHeightKey.self, value: proxy.size.height)
+                }
+            }
+            .background(.ultraThinMaterial.opacity(0.5), ignoresSafeAreaEdges: .top)
+    }
+
+    /// Floats just under the name bar, on the trailing side. Lighter than the
+    /// bar so it does not read as part of that chrome.
+    private var unlinkButton: some View {
+        Button("Unlink") {
+            Task { await session.logout(closeMud: true) }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(ink)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(.ultraThinMaterial.opacity(0.25), in: Capsule())
+        .accessibilityLabel("Unlink")
     }
 
     private func sendCommand() async {
@@ -610,6 +638,13 @@ private struct ActionPanel: View {
         }
         .padding(.horizontal, 4)
         .padding(.top, 4)
+    }
+}
+
+private struct HeaderBarHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
