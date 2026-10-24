@@ -36,8 +36,9 @@ final class IMSession: ObservableObject {
     @Published var command = ""
     /// Set when login failed because this name is not a character yet.
     @Published var characterMissing = false
-    /// Name/email form, then the creation wizard. Nothing is written to the
-    /// Keychain or UserDefaults until the server returns a login body.
+    /// Name/email form, then the creation wizard. The account is not written
+    /// until the server returns a login body. An open creation id is stored
+    /// so a killed app can drop the draft.
     @Published var creating = false
     @Published var createName = ""
     @Published var createEmail = ""
@@ -45,20 +46,22 @@ final class IMSession: ObservableObject {
     /// ANSI greeting for the creation wizard. Shown as sent, not as a transcript line.
     @Published var createGreeting: String?
     @Published var createStep: CreateStep?
+    /// Bumped for every decoded step so the wizard resets its fields, including a reroll.
+    @Published private(set) var createStepSerial = 0
     /// Server description lines for the creation transcript, in arrival order.
     /// Password steps are not copied; their text stays in the dialog.
     /// Each entry is one server line, unchanged.
     @Published var createLog: [String] = []
     @Published var createBusy = false
-    /// In memory only, so leaving the app to read the emailed password does not drop it.
+    /// Open creation. Also stored under the UserDefaults key `createCID` so the
+    /// next launch can drop a draft the app did not get to cancel.
     private var createCID: String?
     /// The password just submitted. Stored only after the login body arrives.
     private var createPassword: String?
     /// Bumped on cancel and on an ended creation so a late response is ignored.
     private var createGeneration = 0
-    /// Last step copied into `createLog`. An error re-send of that step is not copied again.
-    private var createLogSignature: String?
-    /// Info lines of that same step. A re-send whose text matches is not copied again.
+    /// Info lines of the last step copied into `createLog`. An error re-send
+    /// of that same block is not copied again.
     private var createLogBlock: [String]?
     @Published private(set) var savedName = ""
     @Published private(set) var savedTokenAvailable = false
@@ -98,6 +101,8 @@ final class IMSession: ObservableObject {
         /// "hp,mana,moves" for the character in `hmvName`.
         static let hmv = "im.hmv"
         static let hmvName = "im.hmvName"
+        /// Draft id while creation is open. Cleared on finish and on cancel.
+        static let createCID = "createCID"
     }
 
     private enum ResumeOutcome: Equatable {
@@ -150,6 +155,7 @@ final class IMSession: ObservableObject {
     func restoreOnLaunch() async {
         guard didRestore == false else { return }
         didRestore = true
+        discardOrphanedCreation()
         guard token != nil, sessionId != nil else { return }
         busy = true
         status = "Resuming parked session…"
@@ -243,7 +249,7 @@ final class IMSession: ObservableObject {
     /// Opens the name and email form. The name is left blank; the saved character is not copied in.
     func openCharacterCreation() {
         createGeneration += 1
-        createCID = nil
+        setCreateCID(nil)
         createPassword = nil
         createGreeting = nil
         createStep = nil
@@ -331,8 +337,9 @@ final class IMSession: ObservableObject {
         }
     }
 
-    /// Cancel, or the creation screen leaving the hierarchy. DELETE is fire-and-forget.
-    /// Backgrounding the app does not come through here: the player has to read the email.
+    /// Cancel, the creation screen leaving, or the app backgrounding before the
+    /// password step. DELETE is fire-and-forget. The password step stays up:
+    /// the player has to switch away to read the email.
     func cancelCharacterCreation() {
         let cid = createCID
         createGeneration += 1
@@ -1193,21 +1200,19 @@ final class IMSession: ObservableObject {
                         : errorText(from: http.data, status: http.status)
                     return
                 }
-                createCID = cid
+                setCreateCID(cid)
                 createGreeting = greetingText(object["greeting"]) ?? ""
-                createStep = step
-                appendCreateLog(step)
+                publishCreateStep(step)
                 createError = nil
                 return
             }
             if let cid = stringField(object, "cid") {
-                createCID = cid
+                setCreateCID(cid)
             }
             if let g = greetingText(object["greeting"]) {
                 createGreeting = g
             }
-            createStep = step
-            appendCreateLog(step)
+            publishCreateStep(step)
             return
         }
         let message = errorText(from: http.data, status: http.status)
@@ -1224,7 +1229,7 @@ final class IMSession: ObservableObject {
         let keptPassword = createPassword
         let keptName = createName.trimmingCharacters(in: .whitespacesAndNewlines)
         // Clear the id before the wizard view leaves, so its disappear hook does not DELETE.
-        createCID = nil
+        setCreateCID(nil)
         creating = false
         createGreeting = nil
         createStep = nil
@@ -1266,7 +1271,7 @@ final class IMSession: ObservableObject {
     }
 
     private func clearCreationMemory() {
-        createCID = nil
+        setCreateCID(nil)
         creating = false
         createGreeting = nil
         createStep = nil
@@ -1279,21 +1284,47 @@ final class IMSession: ObservableObject {
 
     /// Copies a non-password step's info onto the creation transcript.
     /// Lines are stored as the server sent them. A password step stays in the
-    /// dialog. The same step sent again after an error is not copied twice.
+    /// dialog. An error re-send of the same info is not copied twice. A new
+    /// roll, with new info and no error, is always copied.
     private func appendCreateLog(_ step: CreateStep) {
         guard step.isPassword == false else { return }
         let block = step.info
-        if step.signature == createLogSignature { return }
-        if let createLogBlock, block == createLogBlock { return }
-        createLogSignature = step.signature
+        let failed = step.error?.isEmpty == false
+        if let createLogBlock, block == createLogBlock, failed {
+            return
+        }
         createLogBlock = block
         createLog.append(contentsOf: block)
     }
 
     private func resetCreateLog() {
         createLog = []
-        createLogSignature = nil
         createLogBlock = nil
+    }
+
+    /// Every decoded step, including a reroll whose kind, label, and options match.
+    private func publishCreateStep(_ step: CreateStep) {
+        createStep = step
+        createStepSerial += 1
+        appendCreateLog(step)
+    }
+
+    /// Keeps the in-memory id and the `createCID` default together.
+    private func setCreateCID(_ cid: String?) {
+        createCID = cid
+        if let cid, cid.isEmpty == false {
+            defaults.set(cid, forKey: StoreKey.createCID)
+        } else {
+            defaults.removeObject(forKey: StoreKey.createCID)
+        }
+    }
+
+    /// A creation left open when the app died. The stored id is cleared and
+    /// DELETE /v1/create/{cid} is sent without waiting.
+    private func discardOrphanedCreation() {
+        guard let cid = defaults.string(forKey: StoreKey.createCID), cid.isEmpty == false else { return }
+        defaults.removeObject(forKey: StoreKey.createCID)
+        deleteCreation(cid)
     }
 
     /// A response that arrived after Cancel. Abort that creation and do not log in.

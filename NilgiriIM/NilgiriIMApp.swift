@@ -48,6 +48,7 @@ private func clearDeliveredNotificationsAndBadge(_ session: IMSession) {
 
 struct RootView: View {
     @EnvironmentObject private var session: IMSession
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
@@ -62,10 +63,18 @@ struct RootView: View {
         .onAppear {
             syncOrientationLock()
         }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background && session.creating && session.createStep?.isPassword != true {
+                session.cancelCharacterCreation()
+            }
+        }
         .onChange(of: session.token) { _, _ in
             syncOrientationLock()
         }
         .onChange(of: session.creating) { _, _ in
+            syncOrientationLock()
+        }
+        .onChange(of: session.createGreeting == nil) { _, _ in
             syncOrientationLock()
         }
         .alert(
@@ -88,9 +97,12 @@ struct RootView: View {
         }
     }
 
-    /// Login and character creation are portrait on iPhone. The transcript and iPad stay free.
+    /// Login and the name/email form are portrait on iPhone. Wizard steps
+    /// rotate once the greeting is showing. The transcript and iPad stay free.
     private func syncOrientationLock() {
-        let portraitOnly = session.token == nil && UIDevice.current.userInterfaceIdiom == .phone
+        let phone = UIDevice.current.userInterfaceIdiom == .phone
+        let portraitOnly = phone && session.token == nil
+            && (session.creating == false || session.createGreeting == nil)
         AppDelegate.orientationLock = portraitOnly ? .portrait : .all
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         for scene in scenes {
