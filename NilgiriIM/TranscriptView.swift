@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 private let terminalColumns = 80
 private let ink = Color(white: 0.78)
@@ -118,11 +119,15 @@ struct TranscriptView: View {
                         topBar
                     }
                     .safeAreaInset(edge: .bottom, spacing: 0) {
-                        inputBar
+                        if session.atMenu {
+                            GameMenuPanel()
+                        } else {
+                            inputBar
+                        }
                     }
                 }
                 .overlay(alignment: .topTrailing) {
-                    if headerBarHeight > 1 {
+                    if headerBarHeight > 1, session.atMenu == false {
                         unlinkButton
                             .padding(.top, headerBarHeight + 8)
                             .padding(.trailing, 12)
@@ -141,6 +146,12 @@ struct TranscriptView: View {
                     } else if phase == .active {
                         await session.sceneBecameActive()
                     }
+                }
+            }
+            .onChange(of: session.atMenu) { _, atMenu in
+                if atMenu {
+                    commandFocused = false
+                    actionPanelShown = false
                 }
             }
             .task {
@@ -599,6 +610,177 @@ struct TranscriptView: View {
         .accessibilityLabel("Disconnected \(stamp)")
     }
 
+}
+
+/// Welcome menu, in the input bar's place. Enter sends `1`. Quit sends `0`
+/// and unlinks. Change password is a dialog, not menu choice `2`.
+/// The frost is the same `Chrome.barBackground` as the bars and creation chrome.
+private struct GameMenuPanel: View {
+    @EnvironmentObject private var session: IMSession
+    @State private var changingPassword = false
+    @State private var currentPassword = ""
+    @State private var newPassword = ""
+    @State private var confirmPassword = ""
+    @State private var passwordError: String?
+    @State private var passwordBusy = false
+    @FocusState private var passwordField: PasswordField?
+
+    private enum PasswordField: Hashable {
+        case current, new, confirm
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if changingPassword {
+                passwordDialog
+            } else {
+                choices
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .foregroundStyle(ink)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: InputBarHeightKey.self, value: proxy.size.height)
+            }
+        }
+        .background(Chrome.barBackground, ignoresSafeAreaEdges: .bottom)
+        .toolbar {
+            if changingPassword {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") {
+                        passwordField = nil
+                    }
+                }
+            }
+        }
+    }
+
+    private var choices: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button {
+                Task { await session.chooseMenu("1") }
+            } label: {
+                HStack(spacing: 8) {
+                    Text("Enter the game")
+                    if session.menuBusy {
+                        ProgressView()
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(Color(white: 0.28))
+            Button("Change password") {
+                passwordError = nil
+                changingPassword = true
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Quit") {
+                Task { await session.chooseMenu("0") }
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel("Quit")
+        }
+        .disabled(session.menuBusy)
+    }
+
+    /// Current, new, and confirm. The server sentence is shown unchanged.
+    /// 400, 409, 502, and 504 are short messages from the session.
+    private var passwordDialog: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Change password")
+                .font(.headline)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            secureLine("Current password", text: $currentPassword, field: .current, contentType: .password) {
+                passwordField = .new
+            }
+            secureLine("New password", text: $newPassword, field: .new, contentType: .newPassword) {
+                passwordField = .confirm
+            }
+            secureLine("Confirm new password", text: $confirmPassword, field: .confirm, contentType: .newPassword) {
+                Task { await submitPassword() }
+            }
+            if let passwordError, passwordError.isEmpty == false {
+                Text(verbatim: passwordError)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 16) {
+                Button("Cancel") {
+                    closePasswordDialog()
+                }
+                .buttonStyle(.plain)
+                Button {
+                    Task { await submitPassword() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Text("Change")
+                        if passwordBusy {
+                            ProgressView()
+                        }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color(white: 0.28))
+                .disabled(passwordBusy || currentPassword.isEmpty || newPassword.isEmpty || confirmPassword.isEmpty)
+            }
+        }
+    }
+
+    private func secureLine(
+        _ title: String,
+        text: Binding<String>,
+        field: PasswordField,
+        contentType: UITextContentType,
+        onSubmit: @escaping () -> Void
+    ) -> some View {
+        SecureField(title, text: text)
+            .focused($passwordField, equals: field)
+            .textContentType(contentType)
+            .textFieldStyle(.plain)
+            .privacySensitive()
+            .padding(10)
+            .background(Color.black.opacity(0.35))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .submitLabel(field == .confirm ? .done : .next)
+            .onSubmit(onSubmit)
+    }
+
+    private func submitPassword() async {
+        guard passwordBusy == false else { return }
+        if currentPassword.isEmpty || newPassword.isEmpty {
+            passwordError = "Enter the current and new password."
+            return
+        }
+        if newPassword != confirmPassword {
+            passwordError = "New passwords do not match."
+            return
+        }
+        passwordBusy = true
+        defer { passwordBusy = false }
+        let current = currentPassword
+        let proposed = newPassword
+        if let message = await session.changePassword(current: current, new: proposed) {
+            passwordError = message
+            return
+        }
+        closePasswordDialog()
+    }
+
+    private func closePasswordDialog() {
+        changingPassword = false
+        currentPassword = ""
+        newPassword = ""
+        confirmPassword = ""
+        passwordError = nil
+        passwordField = nil
+    }
 }
 
 /// One row of compass commands on the input bar's frost. Each tap posts the

@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import UIKit
+import UserNotifications
 
 @MainActor
 final class IMSession: ObservableObject {
@@ -34,6 +35,15 @@ final class IMSession: ObservableObject {
     @Published var parked = false
     @Published var busy = false
     @Published var command = ""
+    /// True while the welcome menu is up. Login, creation, since, and the
+    /// stream's `: {"menu":true|false}` comments all write this. The panel
+    /// sends 0 or 1; the server answers PRESS RETURN itself.
+    @Published private(set) var atMenu = false
+    /// A menu choice is in flight. The panel ignores a second tap.
+    @Published private(set) var menuBusy = false
+    /// Quit, or parking on the menu, is leaving for good.
+    /// A close that arrives after the menu flag drops must not log in again.
+    private var menuExit = false
     /// Set when login failed because this name is not a character yet.
     @Published var characterMissing = false
     /// Name/email form, then the creation wizard. The account is not written
@@ -196,17 +206,17 @@ final class IMSession: ObservableObject {
         case .outage(let kind):
             holdSessionThroughOutage(kind)
         case .closed:
-            await dropClosedSession()
+            await handleClosedSession()
         case .detached:
             // since already inserted the divider. Login reattaches; it must not clear it.
             await autoPasswordLogin()
         case .rejected:
-            token = nil
-            await autoPasswordLogin()
+            await handleRejectedSession(thenLogin: true)
         }
     }
 
     func login() async {
+        menuExit = false
         busy = true
         characterMissing = false
         defer { busy = false }
@@ -226,12 +236,12 @@ final class IMSession: ObservableObject {
                 holdSessionThroughOutage(kind)
                 return
             case .closed:
-                await dropClosedSession()
+                await handleClosedSession()
                 return
             case .detached:
                 break
             case .rejected:
-                token = nil
+                if await handleRejectedSession(thenLogin: false) { return }
             }
         }
         await passwordLogin()
@@ -382,32 +392,119 @@ final class IMSession: ObservableObject {
     }
 
     func send() async {
+        // The welcome menu is the panel. A typed line would answer it.
+        guard atMenu == false else { return }
+        menuExit = false
         let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.isEmpty == false else { return }
         command = ""
         do {
-            try await post("/input", ["text": text])
+            let data = try await post("/input", ["text": text])
+            noteMenuFlag(data)
         } catch {
             status = failureMessage(error)
         }
     }
 
+    /// Welcome-menu choice. `1` enters the game. `0` quits and unlinks.
+    /// Change-password is the dialog, not choice `2`.
+    /// The server answers PRESS RETURN itself; this does not send a blank line.
+    func chooseMenu(_ choice: String) async {
+        guard atMenu, menuBusy == false else { return }
+        guard choice == "0" || choice == "1" else { return }
+        menuBusy = true
+        if choice == "0" {
+            menuExit = true
+        } else {
+            menuExit = false
+        }
+        defer { menuBusy = false }
+        do {
+            let data = try await post("/input", ["text": choice])
+            // A since poll may have already dropped this menu session.
+            guard token != nil else { return }
+            if responseClosed(data) {
+                finishMenuUnlink()
+                return
+            }
+            noteMenuFlag(data)
+            if choice == "0", atMenu {
+                menuExit = false
+            }
+        } catch {
+            if choice == "0", token != nil {
+                menuExit = false
+            }
+            if token != nil {
+                status = failureMessage(error)
+            }
+        }
+    }
+
+    /// `POST /v1/sessions/{id}/password` with `{current, new}` while the menu is up.
+    /// Nil means the password was stored. Any other string is shown as-is when it
+    /// is the game's own sentence, or a short message for 400/409/502/504.
+    /// The passwords are never written to the status line or a log.
+    func changePassword(current: String, new newPassword: String) async -> String? {
+        if current.isEmpty || newPassword.isEmpty {
+            return "Enter the current and new password."
+        }
+        do {
+            let data = try await post("/password", ["current": current, "new": newPassword])
+            let object = jsonObject(data) ?? [:]
+            if boolValue(object, "ok") == true {
+                password = newPassword
+                SessionSecrets.set(newPassword, account: SessionSecrets.Account.password)
+                status = "Password changed."
+                return nil
+            }
+            if let sentence = object["error"] as? String, sentence.isEmpty == false {
+                return sentence
+            }
+            return "Could not change the password."
+        } catch let failure as HTTPFailure {
+            return passwordFailureMessage(status: failure.status, serverMessage: failure.message)
+        } catch {
+            return "Could not change the password."
+        }
+    }
+
     @discardableResult
     func park(_ value: Bool) async -> Bool {
+        let closingMenu = value && atMenu
         parked = value
-        if value {
+        if value, closingMenu == false {
             noteDisconnect()
         }
-        if token != nil, sessionId != nil {
+        // A menu park is about to drop the session. Leave the Keychain token
+        // unset so a kill during the request cannot resume it.
+        if token != nil, sessionId != nil, closingMenu == false {
             persistAccount()
         }
         do {
-            try await post("/park", ["parked": value])
+            let data = try await post("/park", ["parked": value])
+            // Unlink during this request already returned to the login screen.
+            guard token != nil else { return true }
+            // Parking on the menu sends choice 0 and answers {"closed":true}.
+            if responseClosed(data) {
+                finishMenuUnlink()
+                return true
+            }
+            if closingMenu {
+                menuExit = false
+            }
+            noteMenuFlag(data)
             status = value
                 ? "Parked. Tells, death, combat start, idle, and link loss can notify."
                 : "Live. Full transcript while the app is open."
             return true
         } catch {
+            if token == nil {
+                return true
+            }
+            if closingMenu {
+                menuExit = false
+            }
             status = failureMessage(error)
             return false
         }
@@ -436,6 +533,8 @@ final class IMSession: ObservableObject {
             token = nil
             sessionId = nil
             character = nil
+            atMenu = false
+            menuBusy = false
             clearSessionSecrets()
             clearDisconnectMarker()
             clearShownDisconnect()
@@ -453,9 +552,18 @@ final class IMSession: ObservableObject {
     }
 
     /// Resume clears park on the server, so backgrounding has to park again.
+    /// Backgrounding on the welcome menu unlinks: the server answers choice 0
+    /// with {"closed":true}, and that drops the Keychain session.
     func sceneWentBackground() async {
-        noteDisconnect()
+        let closingMenu = atMenu
+        if closingMenu == false {
+            noteDisconnect()
+        }
         persistAccount()
+        if closingMenu {
+            menuExit = true
+            clearSessionSecrets()
+        }
         stopLive()
         guard token != nil, sessionId != nil else { return }
         await setParked(true)
@@ -466,6 +574,8 @@ final class IMSession: ObservableObject {
         // Returning to the app is one reconnect attempt, not a poll tick.
         outageLatched = false
         await setParked(false)
+        // A menu park may have closed the session while this was waiting.
+        guard token != nil, sessionId != nil else { return }
         if desiredParked == false {
             if lastParkOK {
                 pendingUnpark = false
@@ -503,7 +613,7 @@ final class IMSession: ObservableObject {
             }
         case .closed:
             stopLive()
-            await dropClosedSession()
+            await handleClosedSession()
         case .detached:
             // A login is already reattaching this restore. Don't drop the bearer.
             guard didAutoLogin == false else { return }
@@ -511,8 +621,7 @@ final class IMSession: ObservableObject {
             await autoPasswordLogin()
         case .rejected:
             stopLive()
-            token = nil
-            await autoPasswordLogin()
+            await handleRejectedSession(thenLogin: true)
         }
     }
 
@@ -555,6 +664,8 @@ final class IMSession: ObservableObject {
                 status = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
                     ?? "Login failed (401)"
                 characterMissing = Self.indicatesMissingCharacter(status)
+                atMenu = false
+                menuBusy = false
                 stopLive()
                 token = nil
                 return
@@ -563,15 +674,28 @@ final class IMSession: ObservableObject {
                 status = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
                     ?? "Login failed (\(http.statusCode))"
                 characterMissing = Self.indicatesMissingCharacter(status) || http.statusCode == 404
+                atMenu = false
+                menuBusy = false
                 token = nil
                 return
             }
             let login = try JSONDecoder().decode(LoginResponse.self, from: respData)
+            let switching = isDifferentCharacter(login.character)
+            if switching {
+                resetPreviousCharacterMemory()
+            }
             token = login.token
             sessionId = login.sessionId
             adoptCharacter(login.character)
             parked = login.parked ?? false
             savedName = name
+            // A fresh login stops on the menu. A resumed reattach is linkdead:
+            // stay in the game unless the server still says menu.
+            applyArrivedMenu(
+                menu: login.menu,
+                state: login.state,
+                whenAbsent: login.resumed == true ? .playing : .menu
+            )
             // A brand-new session has nothing to split. Older servers omit both flags.
             // A live reattach is resumed with no disconnectedAt: the device-clock
             // marker is the fallback. A restored login repeats the since value;
@@ -582,14 +706,14 @@ final class IMSession: ObservableObject {
                 clearShownDisconnect()
                 cancelResumeReveal()
             }
-            if login.resumed == true && includeSince {
+            if switching == false && login.resumed == true && includeSince {
                 append(login.lines ?? [], animatedScroll: true, serverDisconnectedAt: serverDisconnectedAt)
             } else {
                 replaceTranscript(
                     login.lines ?? [],
                     animatedScroll: true,
                     serverDisconnectedAt: serverDisconnectedAt,
-                    trustCursor: login.resumed != false && nameMatchesHeld()
+                    trustCursor: switching == false && login.resumed != false && nameMatchesHeld()
                 )
                 if includeSince && lines.isEmpty {
                     lastSeq = 0
@@ -597,10 +721,10 @@ final class IMSession: ObservableObject {
                 }
             }
             persistAccount()
-            let announcement = login.resumed == true
-                ? "Resumed \(login.character)."
-                : "Playing as \(login.character)"
-            await settleAfterResume(announcement: announcement)
+            if switching {
+                resetServerBadge()
+            }
+            await settleAfterResume(announcement: arrivalAnnouncement(login.character, resumed: login.resumed))
         } catch {
             if let kind = OutageKind.transport(error) {
                 didAutoLogin = false
@@ -617,7 +741,14 @@ final class IMSession: ObservableObject {
     private func resumeDirect() async -> ResumeOutcome {
         let outcome = await fetchSince()
         guard outcome == .ready else { return outcome }
-        let announcement = character.map { "Resumed \($0)." } ?? "Resumed parked session."
+        // Linkdead resume is already in the game. A session left on the menu
+        // shows the panel and does not send 1.
+        let announcement: String
+        if atMenu, let character, character.isEmpty == false {
+            announcement = "At the menu as \(character)."
+        } else {
+            announcement = character.map { "Resumed \($0)." } ?? "Resumed parked session."
+        }
         await settleAfterResume(announcement: announcement)
         return .ready
     }
@@ -630,6 +761,8 @@ final class IMSession: ObservableObject {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
+            // Menu unlink clears the token. A late since must not log in again.
+            guard self.token != nil else { return .offline }
             guard let http = resp as? HTTPURLResponse else { return .offline }
             switch http.statusCode {
             case 200:
@@ -648,6 +781,7 @@ final class IMSession: ObservableObject {
                 } else {
                     append(since.lines, animatedScroll: true, serverDisconnectedAt: since.disconnectedAt)
                 }
+                applyArrivedMenu(menu: since.menu, state: since.state, whenAbsent: .keep)
                 if since.closed {
                     if since.resumed == true {
                         return .detached
@@ -747,6 +881,8 @@ final class IMSession: ObservableObject {
         cancelResumeReveal()
         lines = []
         lastSeq = 0
+        atMenu = false
+        menuBusy = false
         token = nil
         sessionId = nil
         character = nil
@@ -828,13 +964,19 @@ final class IMSession: ObservableObject {
         do {
             let (bytes, _) = try await URLSession.shared.bytes(for: req)
             for try await line in bytes.lines {
-                if Task.isCancelled { return }
+                if Task.isCancelled || self.token == nil { return }
                 if line.hasPrefix("data: ") {
                     let payload = String(line.dropFirst(6))
                     if let data = payload.data(using: .utf8),
                        let dto = try? JSONDecoder().decode(LineDTO.self, from: data) {
                         append([dto])
                     }
+                    continue
+                }
+                // Comment lines carry the menu flag only. Game text stays on data lines.
+                // The server answers PRESS RETURN; this client does not send it.
+                if line.hasPrefix(":") {
+                    applyMenuComment(line)
                 }
             }
             if Task.isCancelled == false {
@@ -1129,7 +1271,8 @@ final class IMSession: ObservableObject {
         defaults.removeObject(forKey: StoreKey.hmvName)
     }
 
-    private func post(_ action: String, _ body: [String: Any]) async throws {
+    @discardableResult
+    private func post(_ action: String, _ body: [String: Any]) async throws -> Data {
         guard let requestURL = sessionURL(action) else {
             throw HTTPFailure(status: 0, message: "No session to update.")
         }
@@ -1146,6 +1289,214 @@ final class IMSession: ObservableObject {
             let message = (try? JSONDecoder().decode(ErrorResponse.self, from: data))?.error
                 ?? "Request failed (\(http.statusCode))"
             throw HTTPFailure(status: http.statusCode, message: message)
+        }
+        return data
+    }
+
+    /// Where a login or since body left the character when `menu` and `state` are absent.
+    private enum MenuWhenAbsent {
+        /// Fresh login and finished creation stop on the welcome menu.
+        case menu
+        /// Linkdead reattach is already in the game.
+        case playing
+        /// Since and stream comments only move the flag when they send one.
+        case keep
+    }
+
+    private func arrivalAnnouncement(_ character: String, resumed: Bool?) -> String {
+        if atMenu {
+            return "At the menu as \(character)."
+        }
+        if resumed == true {
+            return "Resumed \(character)."
+        }
+        return "Playing as \(character)"
+    }
+
+    /// `menu` wins when both fields arrive. `state` is `menu` or `playing`.
+    private func applyArrivedMenu(menu: Bool?, state: String?, whenAbsent: MenuWhenAbsent) {
+        if let menu {
+            atMenu = menu
+            return
+        }
+        if let state {
+            switch state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "menu":
+                atMenu = true
+                return
+            case "playing":
+                atMenu = false
+                return
+            default:
+                break
+            }
+        }
+        switch whenAbsent {
+        case .menu:
+            atMenu = true
+        case .playing:
+            atMenu = false
+        case .keep:
+            break
+        }
+    }
+
+    /// SSE comment `: {"menu":true|false}`. Anything else is ignored.
+    /// The comment is not game text and is never written into the transcript.
+    private func applyMenuComment(_ line: String) {
+        let payload = line.dropFirst().drop(while: { $0 == " " || $0 == "\t" })
+        guard let data = String(payload).data(using: .utf8),
+              let object = jsonObject(data) else { return }
+        let menu = boolValue(object, "menu")
+        let state = object["state"] as? String
+        guard menu != nil || (state?.isEmpty == false) else { return }
+        applyArrivedMenu(menu: menu, state: state, whenAbsent: .keep)
+    }
+
+    private func noteMenuFlag(_ data: Data) {
+        guard let object = jsonObject(data) else { return }
+        applyArrivedMenu(
+            menu: boolValue(object, "menu"),
+            state: object["state"] as? String,
+            whenAbsent: .keep
+        )
+    }
+
+    private func responseClosed(_ data: Data) -> Bool {
+        guard let object = jsonObject(data) else { return false }
+        return boolValue(object, "closed") == true
+    }
+
+    /// JSON booleans only. A numeric 0 or 1 is not a menu flag.
+    private func boolValue(_ object: [String: Any], _ key: String) -> Bool? {
+        guard let value = object[key] else { return nil }
+        if let number = value as? NSNumber {
+            guard CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+            return number.boolValue
+        }
+        if let raw = value as? String {
+            switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true": return true
+            case "false": return false
+            default: return nil
+            }
+        }
+        return nil
+    }
+
+    /// 400, 409, 502, and 504 stay short. The game's own sentence arrives as 200 `error`.
+    private func passwordFailureMessage(status: Int, serverMessage: String) -> String {
+        switch status {
+        case 400:
+            return "Enter the current and new password."
+        case 409:
+            if serverMessage.compare("busy", options: .caseInsensitive) == .orderedSame {
+                return "Busy. Try again."
+            }
+            return "Not at the menu."
+        case 502:
+            return "The game connection dropped."
+        case 504:
+            return "The game did not answer."
+        default:
+            return "Could not change the password."
+        }
+    }
+
+    /// A different character replaces the one this device was holding.
+    /// The server drops the other session; the transcript, ids, menu, and badge go too.
+    private func isDifferentCharacter(_ next: String) -> Bool {
+        guard next.isEmpty == false, let held = heldCharacterName() else { return false }
+        return namesEqual(held, next) == false
+    }
+
+    private func heldCharacterName() -> String? {
+        if let character, character.isEmpty == false { return character }
+        if savedName.isEmpty == false { return savedName }
+        return nil
+    }
+
+    private func resetPreviousCharacterMemory() {
+        stopLive()
+        cancelResumeReveal()
+        resumeSeparatorID = nil
+        lines = []
+        lastSeq = 0
+        pendingVitals = nil
+        vitals = nil
+        atMenu = false
+        menuBusy = false
+        menuExit = false
+        command = ""
+        parked = false
+        token = nil
+        sessionId = nil
+        character = nil
+        clearSessionSecrets()
+        clearDisconnectMarker()
+        clearShownDisconnect()
+        defaults.set("0", forKey: StoreKey.lastSeq)
+        defaults.removeObject(forKey: StoreKey.character)
+        defaults.removeObject(forKey: StoreKey.hmv)
+        defaults.removeObject(forKey: StoreKey.hmvName)
+        zeroLocalBadge()
+    }
+
+    /// Menu quit, or park while the menu is up (`{"closed":true}`).
+    /// The Keychain token and session id go. The password stays for the next enter.
+    private func finishMenuUnlink() {
+        menuExit = false
+        stopLive()
+        cancelResumeReveal()
+        resumeSeparatorID = nil
+        lines = []
+        lastSeq = 0
+        atMenu = false
+        menuBusy = false
+        command = ""
+        parked = false
+        token = nil
+        sessionId = nil
+        character = nil
+        clearSessionSecrets()
+        clearDisconnectMarker()
+        clearShownDisconnect()
+        defaults.set("0", forKey: StoreKey.lastSeq)
+        defaults.removeObject(forKey: StoreKey.character)
+        zeroLocalBadge()
+        status = "Unlinked. The MUD session is closed."
+    }
+
+    /// Playing sessions still reattach. A close while the menu is up, or a quit
+    /// that already dropped the menu flag, stays on the login screen.
+    private func handleClosedSession() async {
+        if atMenu || menuExit {
+            finishMenuUnlink()
+            return
+        }
+        await dropClosedSession()
+    }
+
+    /// True when the caller must stop. Menu rejects do not log in again.
+    private func handleRejectedSession(thenLogin: Bool) async -> Bool {
+        if atMenu || menuExit {
+            finishMenuUnlink()
+            return true
+        }
+        token = nil
+        if thenLogin {
+            await autoPasswordLogin()
+        }
+        return false
+    }
+
+    private func zeroLocalBadge() {
+        let center = UNUserNotificationCenter.current()
+        center.removeAllDeliveredNotifications()
+        if #available(iOS 16.0, *) {
+            center.setBadgeCount(0)
+        } else {
+            UIApplication.shared.applicationIconBadgeNumber = 0
         }
     }
 
@@ -1268,11 +1619,18 @@ final class IMSession: ObservableObject {
             password = keptPassword
         }
         didAutoLogin = true
+        let nextCharacter = login.character.isEmpty ? keptName : login.character
+        let switching = isDifferentCharacter(nextCharacter)
+        if switching {
+            resetPreviousCharacterMemory()
+        }
         token = login.token
         sessionId = login.sessionId
         adoptCharacter(login.character)
         parked = login.parked ?? false
         savedName = name
+        // Finished creation stops on the menu, same as a fresh login.
+        applyArrivedMenu(menu: login.menu, state: login.state, whenAbsent: .menu)
         clearDisconnectMarker()
         clearShownDisconnect()
         cancelResumeReveal()
@@ -1283,10 +1641,11 @@ final class IMSession: ObservableObject {
             trustCursor: false
         )
         persistAccount()
-        let announcement = login.resumed == true
-            ? "Resumed \(login.character)."
-            : "Playing as \(login.character)"
-        await settleAfterResume(announcement: announcement)
+        if switching {
+            resetServerBadge()
+        }
+        let shownCharacter = login.character.isEmpty ? keptName : login.character
+        await settleAfterResume(announcement: arrivalAnnouncement(shownCharacter, resumed: login.resumed))
     }
 
     private func returnToLogin(_ message: String) {

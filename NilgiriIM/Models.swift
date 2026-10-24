@@ -11,9 +11,15 @@ struct LoginResponse: Decodable {
     let parked: Bool?
     /// Epoch milliseconds when the server dropped the session. Older servers omit it.
     let disconnectedAt: Int64?
+    /// True while the character is sitting on the welcome menu.
+    /// Fresh logins and finished creations are at the menu. A linkdead
+    /// reattach that is already in the game sends false.
+    let menu: Bool?
+    /// `menu` or `playing`. The boolean `menu` wins when both are present.
+    let state: String?
 
     private enum CodingKeys: String, CodingKey {
-        case token, sessionId, character, lines, resumed, parked, disconnectedAt
+        case token, sessionId, character, lines, resumed, parked, disconnectedAt, menu, state
     }
 
     init(from decoder: Decoder) throws {
@@ -25,6 +31,8 @@ struct LoginResponse: Decodable {
         resumed = try container.decodeIfPresent(Bool.self, forKey: .resumed)
         parked = try container.decodeIfPresent(Bool.self, forKey: .parked)
         disconnectedAt = EpochMillis.decodeIfPresent(container, forKey: .disconnectedAt)
+        menu = JSONBool.decodeIfPresent(container, forKey: .menu)
+        state = JSONBool.stringIfPresent(container, forKey: .state)
     }
 }
 
@@ -98,9 +106,13 @@ struct SinceResponse: Decodable {
     /// True when a restarted server restored the session but it is not attached yet.
     /// Later polls omit it. A real close leaves it out.
     let resumed: Bool?
+    /// Present on every since. True while the welcome menu is up.
+    let menu: Bool?
+    /// `menu` or `playing` when the server sends it beside `menu`.
+    let state: String?
 
     private enum CodingKeys: String, CodingKey {
-        case closed, lines, disconnectedAt, resumed
+        case closed, lines, disconnectedAt, resumed, menu, state
     }
 
     init(from decoder: Decoder) throws {
@@ -109,6 +121,42 @@ struct SinceResponse: Decodable {
         lines = try container.decode([LineDTO].self, forKey: .lines)
         disconnectedAt = EpochMillis.decodeIfPresent(container, forKey: .disconnectedAt)
         resumed = try container.decodeIfPresent(Bool.self, forKey: .resumed)
+        menu = JSONBool.decodeIfPresent(container, forKey: .menu)
+        state = JSONBool.stringIfPresent(container, forKey: .state)
+    }
+}
+
+/// `menu` is a JSON boolean. A 0/1 or "true"/"false" is accepted so one odd
+/// value does not fail the whole login or since body.
+enum JSONBool {
+    static func decodeIfPresent<K: CodingKey>(
+        _ container: KeyedDecodingContainer<K>,
+        forKey key: K
+    ) -> Bool? {
+        guard container.contains(key) else { return nil }
+        if (try? container.decodeNil(forKey: key)) == true { return nil }
+        if let value = try? container.decode(Bool.self, forKey: key) { return value }
+        if let value = try? container.decode(Int.self, forKey: key) {
+            if value == 1 { return true }
+            if value == 0 { return false }
+        }
+        if let raw = try? container.decode(String.self, forKey: key) {
+            switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "yes", "1": return true
+            case "false", "no", "0": return false
+            default: return nil
+            }
+        }
+        return nil
+    }
+
+    static func stringIfPresent<K: CodingKey>(
+        _ container: KeyedDecodingContainer<K>,
+        forKey key: K
+    ) -> String? {
+        guard container.contains(key) else { return nil }
+        if (try? container.decodeNil(forKey: key)) == true { return nil }
+        return try? container.decode(String.self, forKey: key)
     }
 }
 
