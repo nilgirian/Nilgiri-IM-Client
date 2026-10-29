@@ -779,21 +779,20 @@ struct TranscriptView: View {
                     .font(.system(.body, design: .monospaced))
                     .foregroundStyle(ink)
                     .padding(.trailing, 8)
-                TextField("command", text: $session.command)
-                    .font(.system(.body, design: .monospaced))
-                    .foregroundStyle(ink)
-                    .textFieldStyle(.plain)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.asciiCapable)
-                    .submitLabel(.send)
-                    .focused($commandFocused)
-                    .onSubmit { Task { await sendCommand() } }
-                    .padding(.trailing, 16)
+                AsciiCommandField(
+                    text: $session.command,
+                    isFocused: Binding(
+                        get: { commandFocused },
+                        set: { commandFocused = $0 }
+                    ),
+                    onSubmit: { Task { await sendCommand() } }
+                )
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .padding(.trailing, 16)
                 commandIcon("bubble.left.fill", label: "Say") {
                     Task { await sendSay() }
                 }
-                commandIcon("arrow.up.circle.fill", label: "Send") {
+                commandIcon("paperplane.fill", label: "Send") {
                     Task { await sendCommand() }
                 }
             }
@@ -1217,6 +1216,136 @@ struct TranscriptView: View {
         .accessibilityLabel(label)
     }
 
+}
+
+/// Command field. The keyboard is ASCII-only: the getter and setter both
+/// force `.asciiCapable`, and the emoji input mode is never returned, so
+/// nothing can put the emoji key back.
+private struct AsciiCommandField: UIViewRepresentable {
+    @Binding var text: String
+    var isFocused: Binding<Bool>
+    var onSubmit: () -> Void
+
+    func makeUIView(context: Context) -> CommandTextField {
+        let field = CommandTextField()
+        field.delegate = context.coordinator
+        field.lockASCII(reload: false)
+        field.font = UIFont.monospacedSystemFont(
+            ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize,
+            weight: .regular
+        )
+        field.textColor = UIColor(white: 0.78, alpha: 1)
+        field.tintColor = field.textColor
+        field.backgroundColor = .clear
+        field.borderStyle = .none
+        field.returnKeyType = .send
+        field.keyboardAppearance = .dark
+        field.attributedPlaceholder = NSAttributedString(
+            string: "command",
+            attributes: [.foregroundColor: UIColor(white: 0.78, alpha: 0.45)]
+        )
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
+        return field
+    }
+
+    func updateUIView(_ field: CommandTextField, context: Context) {
+        context.coordinator.onSubmit = onSubmit
+        context.coordinator.textChanged = { text = $0 }
+        context.coordinator.focusChanged = { isFocused.wrappedValue = $0 }
+        field.lockASCII(reload: false)
+        if field.text != text {
+            field.text = text
+        }
+        let focused = isFocused.wrappedValue
+        guard focused != field.isFirstResponder, context.coordinator.pendingFocus != focused else { return }
+        context.coordinator.pendingFocus = focused
+        DispatchQueue.main.async {
+            context.coordinator.pendingFocus = nil
+            field.lockASCII(reload: focused)
+            if focused {
+                field.becomeFirstResponder()
+            } else {
+                field.resignFirstResponder()
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var onSubmit: () -> Void = {}
+        var textChanged: (String) -> Void = { _ in }
+        var focusChanged: (Bool) -> Void = { _ in }
+        var pendingFocus: Bool?
+
+        @objc func editingChanged(_ field: UITextField) {
+            textChanged(field.text ?? "")
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            (textField as? CommandTextField)?.lockASCII(reload: true)
+            focusChanged(true)
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            focusChanged(false)
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            onSubmit()
+            return true
+        }
+    }
+}
+
+private final class CommandTextField: UITextField {
+    private var lockingKeyboard = false
+
+    override var keyboardType: UIKeyboardType {
+        get { .asciiCapable }
+        set {
+            guard lockingKeyboard == false else { return }
+            lockingKeyboard = true
+            super.keyboardType = .asciiCapable
+            if isFirstResponder {
+                reloadInputViews()
+            }
+            lockingKeyboard = false
+        }
+    }
+
+    /// A switch onto the emoji keyboard would put the emoji key back.
+    override var textInputMode: UITextInputMode? {
+        if let mode = super.textInputMode, mode.primaryLanguage != "emoji" {
+            return mode
+        }
+        return UITextInputMode.activeInputModes.first { $0.primaryLanguage != "emoji" }
+    }
+
+    func lockASCII(reload: Bool) {
+        super.keyboardType = .asciiCapable
+        autocorrectionType = .no
+        spellCheckingType = .no
+        autocapitalizationType = .none
+        smartQuotesType = .no
+        smartDashesType = .no
+        smartInsertDeleteType = .no
+        textContentType = nil
+        inputAssistantItem.leadingBarButtonGroups = []
+        inputAssistantItem.trailingBarButtonGroups = []
+        if reload, isFirstResponder {
+            reloadInputViews()
+        }
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        lockASCII(reload: false)
+        let accepted = super.becomeFirstResponder()
+        lockASCII(reload: true)
+        return accepted
+    }
 }
 
 /// Welcome menu, in the input bar's place. Enter sends `1`. Quit sends `0`
