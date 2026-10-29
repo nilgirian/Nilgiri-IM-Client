@@ -1,37 +1,65 @@
 import Foundation
 import SwiftUI
+import UIKit
 
 enum Ansi {
     /// Terminal ink. Also the colour after ESC[0m / ESC[m.
     private static let ink = Color(white: 0.78)
     /// Light blue so a link stays readable on the black transcript.
     private static let linkInk = Color(red: 0.55, green: 0.82, blue: 1)
+    private static let linkUI = UIColor(red: 0.55, green: 0.82, blue: 1, alpha: 1)
 
     /// Colour and bold carried from one line to the next, the way a terminal
     /// keeps SGR state. The line text itself is never changed.
     struct State: Equatable {
         var color: Color
+        var uiColor: UIColor
         var bold: Bool
 
-        static let initial = State(color: Color(white: 0.78), bold: false)
+        static let initial = State(
+            color: Color(white: 0.78),
+            uiColor: UIColor(white: 0.78, alpha: 1),
+            bold: false
+        )
     }
 
     /// `initial` defaults to a reset terminal, so `text(_:fontSize:columns:)` is unchanged.
     static func text(_ raw: String, fontSize: CGFloat, columns: Int, initial: State = .initial) -> Text {
-        let laid = layout(raw, columns: columns)
-        let spans = linkSpans(in: raw)
-        return render(
-            laid.text,
-            fontSize: fontSize,
-            initial: initial,
-            wrapBreaks: laid.wrapBreaks,
-            spans: spans
-        )
+        swiftText(runs(raw, columns: columns, initial: initial), fontSize: fontSize)
+    }
+
+    /// The same characters, colours, and links as `text`, for the selectable transcript.
+    /// Wrap newlines are in the string because they are on screen; they are not part of a URL.
+    static func attributed(
+        _ raw: String,
+        fontSize: CGFloat,
+        columns: Int,
+        initial: State = .initial
+    ) -> NSAttributedString {
+        let pieces = runs(raw, columns: columns, initial: initial)
+        let result = NSMutableAttributedString()
+        for piece in pieces {
+            var attributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.monospacedSystemFont(
+                    ofSize: fontSize,
+                    weight: piece.bold ? .bold : .regular
+                ),
+                .foregroundColor: piece.link == nil ? piece.uiColor : linkUI
+            ]
+            if let link = piece.link {
+                attributes[.link] = link
+                attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                attributes[.underlineColor] = linkUI
+            }
+            result.append(NSAttributedString(string: piece.text, attributes: attributes))
+        }
+        return result
     }
 
     /// End state after parsing one raw line. Wrap newlines are not part of the parse.
     static func endingState(parsing raw: String, starting: State = .initial) -> State {
         var color = starting.color
+        var uiColor = starting.uiColor
         var bold = starting.bold
         var index = raw.startIndex
         while index < raw.endIndex {
@@ -40,22 +68,30 @@ enum Ansi {
                 index = raw.index(after: index)
             case .sequence(let sgr):
                 if let sgr {
-                    applySGR(sgr, color: &color, bold: &bold)
+                    applySGR(sgr, color: &color, uiColor: &uiColor, bold: &bold)
                 }
             }
         }
-        return State(color: color, bold: bold)
+        return State(color: color, uiColor: uiColor, bold: bold)
     }
 
-    private static func render(
-        _ wrapped: String,
-        fontSize: CGFloat,
-        initial: State,
-        wrapBreaks: Set<Int>,
-        spans: [LinkSpan]
-    ) -> Text {
-        var result = Text("")
+    private struct Run {
+        var text: String
+        var color: Color
+        var uiColor: UIColor
+        var bold: Bool
+        var link: URL?
+    }
+
+    /// Display runs for one raw line. Characters match `layout`: ANSI is not shown,
+    /// and a column-cap newline is in the run but not in the link.
+    private static func runs(_ raw: String, columns: Int, initial: State) -> [Run] {
+        let laid = layout(raw, columns: columns)
+        let spans = linkSpans(in: raw)
+        let wrapped = laid.text
+        var produced: [Run] = []
         var color = initial.color
+        var uiColor = initial.uiColor
         var bold = initial.bold
         var index = wrapped.startIndex
         var offset = 0
@@ -63,31 +99,19 @@ enum Ansi {
         var spanCursor = 0
         var chunk = ""
         var chunkColor = color
+        var chunkUI = uiColor
         var chunkBold = bold
         var chunkLink: URL?
 
         func flush() {
             guard chunk.isEmpty == false else { return }
-            if let chunkLink {
-                var attr = AttributedString(chunk)
-                attr.font = .system(
-                    size: fontSize,
-                    weight: chunkBold ? .bold : .regular,
-                    design: .monospaced
-                )
-                attr.foregroundColor = linkInk
-                attr.underlineStyle = .single
-                attr.link = chunkLink
-                result = result + Text(attr)
-            } else {
-                var piece = Text(chunk)
-                    .font(.system(size: fontSize, design: .monospaced))
-                    .foregroundColor(chunkColor)
-                if chunkBold {
-                    piece = piece.bold()
-                }
-                result = result + piece
-            }
+            produced.append(Run(
+                text: chunk,
+                color: chunkColor,
+                uiColor: chunkUI,
+                bold: chunkBold,
+                link: chunkLink
+            ))
             chunk = ""
         }
 
@@ -102,6 +126,7 @@ enum Ansi {
             }
             if chunk.isEmpty {
                 chunkColor = color
+                chunkUI = uiColor
                 chunkBold = bold
                 chunkLink = link
             }
@@ -114,16 +139,15 @@ enum Ansi {
                 offset += wrapped.distance(from: start, to: index)
                 if let sgr {
                     flush()
-                    applySGR(sgr, color: &color, bold: &bold)
+                    applySGR(sgr, color: &color, uiColor: &uiColor, bold: &bold)
                 }
                 continue
             }
             let character = wrapped[index]
             if character == "\n" {
-                let inserted = wrapBreaks.contains(offset)
-                // Never part of the link target. A column-cap break is not a
-                // character of the unwrapped line, so it does not advance the
-                // visible index the detector used.
+                let inserted = laid.wrapBreaks.contains(offset)
+                // A column-cap break is not a character of the unwrapped line,
+                // and it stays out of the URL.
                 appendPiece("\n", link: nil)
                 if inserted == false {
                     visibleIndex += 1
@@ -137,6 +161,33 @@ enum Ansi {
             index = wrapped.index(after: index)
         }
         flush()
+        return produced
+    }
+
+    private static func swiftText(_ pieces: [Run], fontSize: CGFloat) -> Text {
+        var result = Text("")
+        for piece in pieces {
+            if let link = piece.link {
+                var attr = AttributedString(piece.text)
+                attr.font = .system(
+                    size: fontSize,
+                    weight: piece.bold ? .bold : .regular,
+                    design: .monospaced
+                )
+                attr.foregroundColor = linkInk
+                attr.underlineStyle = .single
+                attr.link = link
+                result = result + Text(attr)
+            } else {
+                var text = Text(piece.text)
+                    .font(.system(size: fontSize, design: .monospaced))
+                    .foregroundColor(piece.color)
+                if piece.bold {
+                    text = text.bold()
+                }
+                result = result + text
+            }
+        }
         return result
     }
 
@@ -247,9 +298,18 @@ enum Ansi {
         try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
     }()
 
-    private static func applySGR(_ params: String, color: inout Color, bold: inout Bool) {
+    private static func applySGR(
+        _ params: String,
+        color: inout Color,
+        uiColor: inout UIColor,
+        bold: inout Bool
+    ) {
+        func take(_ next: Color, _ ui: UIColor) {
+            color = next
+            uiColor = ui
+        }
         if params.isEmpty || params == "0" {
-            color = ink
+            take(ink, UIColor(white: 0.78, alpha: 1))
             bold = false
             return
         }
@@ -257,7 +317,7 @@ enum Ansi {
         for part in params.split(separator: ";") {
             switch String(part) {
             case "0":
-                color = ink
+                take(ink, UIColor(white: 0.78, alpha: 1))
                 bold = false
                 bright = false
             case "1":
@@ -266,16 +326,57 @@ enum Ansi {
             case "22":
                 bold = false
                 bright = false
-            case "30": color = Color(white: bright ? 0.45 : 0.35)
-            case "31": color = bright ? Color(red: 1, green: 0.35, blue: 0.35) : Color(red: 0.85, green: 0.22, blue: 0.18)
-            case "32": color = bright ? Color(red: 0.45, green: 1, blue: 0.4) : Color(red: 0.25, green: 0.75, blue: 0.28)
-            case "33": color = bright ? Color(red: 1, green: 1, blue: 0.4) : Color(red: 0.85, green: 0.7, blue: 0.15)
-            case "34": color = bright ? Color(red: 0.5, green: 0.7, blue: 1) : Color(red: 0.3, green: 0.45, blue: 0.95)
-            case "35": color = bright ? Color(red: 1, green: 0.5, blue: 1) : Color(red: 0.8, green: 0.3, blue: 0.8)
-            case "36": color = bright ? Color(red: 0.4, green: 1, blue: 1) : Color(red: 0.25, green: 0.75, blue: 0.8)
-            case "37": color = bright ? Color.white : ink
-            case "39": color = ink
-            default: break
+            case "30":
+                take(
+                    Color(white: bright ? 0.45 : 0.35),
+                    UIColor(white: bright ? 0.45 : 0.35, alpha: 1)
+                )
+            case "31":
+                if bright {
+                    take(Color(red: 1, green: 0.35, blue: 0.35), UIColor(red: 1, green: 0.35, blue: 0.35, alpha: 1))
+                } else {
+                    take(Color(red: 0.85, green: 0.22, blue: 0.18), UIColor(red: 0.85, green: 0.22, blue: 0.18, alpha: 1))
+                }
+            case "32":
+                if bright {
+                    take(Color(red: 0.45, green: 1, blue: 0.4), UIColor(red: 0.45, green: 1, blue: 0.4, alpha: 1))
+                } else {
+                    take(Color(red: 0.25, green: 0.75, blue: 0.28), UIColor(red: 0.25, green: 0.75, blue: 0.28, alpha: 1))
+                }
+            case "33":
+                if bright {
+                    take(Color(red: 1, green: 1, blue: 0.4), UIColor(red: 1, green: 1, blue: 0.4, alpha: 1))
+                } else {
+                    take(Color(red: 0.85, green: 0.7, blue: 0.15), UIColor(red: 0.85, green: 0.7, blue: 0.15, alpha: 1))
+                }
+            case "34":
+                if bright {
+                    take(Color(red: 0.5, green: 0.7, blue: 1), UIColor(red: 0.5, green: 0.7, blue: 1, alpha: 1))
+                } else {
+                    take(Color(red: 0.3, green: 0.45, blue: 0.95), UIColor(red: 0.3, green: 0.45, blue: 0.95, alpha: 1))
+                }
+            case "35":
+                if bright {
+                    take(Color(red: 1, green: 0.5, blue: 1), UIColor(red: 1, green: 0.5, blue: 1, alpha: 1))
+                } else {
+                    take(Color(red: 0.8, green: 0.3, blue: 0.8), UIColor(red: 0.8, green: 0.3, blue: 0.8, alpha: 1))
+                }
+            case "36":
+                if bright {
+                    take(Color(red: 0.4, green: 1, blue: 1), UIColor(red: 0.4, green: 1, blue: 1, alpha: 1))
+                } else {
+                    take(Color(red: 0.25, green: 0.75, blue: 0.8), UIColor(red: 0.25, green: 0.75, blue: 0.8, alpha: 1))
+                }
+            case "37":
+                if bright {
+                    take(Color.white, UIColor.white)
+                } else {
+                    take(ink, UIColor(white: 0.78, alpha: 1))
+                }
+            case "39":
+                take(ink, UIColor(white: 0.78, alpha: 1))
+            default:
+                break
             }
         }
     }

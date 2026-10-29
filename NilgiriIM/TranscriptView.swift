@@ -132,6 +132,363 @@ private final class ColourCarryCache {
     }
 }
 
+private struct DocMarker: Equatable {
+    var id: String
+    var location: Int
+    var contentLength: Int
+    var separator: Bool
+}
+
+/// Scroll target for one transcript row, in the text view's coordinates.
+private struct LineAnchor: Identifiable, Equatable {
+    var id: String
+    var y: CGFloat
+    var height: CGFloat
+    var separatorMinX: CGFloat?
+    var separatorWidth: CGFloat?
+    var separatorMidY: CGFloat?
+}
+
+/// One attributed transcript. A scroll frame that does not change the lines
+/// or the font does not rebuild it. Appending lines keeps the prefix.
+private final class TranscriptDocumentStore {
+    private(set) var generation = 0
+    private(set) var attributed = NSAttributedString()
+    private(set) var markers: [DocMarker] = []
+
+    private var fontSize: CGFloat = -1
+    private var ids: [String] = []
+    private var sigs: [Int] = []
+    private var working = NSMutableAttributedString()
+    private var held: [LineDTO] = []
+    private var needsJoiner = false
+    private var lastWasSeparator = false
+
+    private let mudParagraph: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.firstLineHeadIndent = 8
+        style.headIndent = 8
+        style.tailIndent = -8
+        style.lineBreakMode = .byClipping
+        style.alignment = .left
+        return style
+    }()
+
+    private let separatorParagraph: NSParagraphStyle = {
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        style.paragraphSpacingBefore = 8
+        style.paragraphSpacing = 8
+        style.lineBreakMode = .byClipping
+        return style
+    }()
+
+    func update(lines: [LineDTO], fontSize: CGFloat, carry: ColourCarryCache) {
+        carry.prepare(lines)
+        if sameStorage(lines, held), abs(self.fontSize - fontSize) < 0.01 {
+            return
+        }
+        let fontChanged = abs(self.fontSize - fontSize) >= 0.01
+        let signatures = lines.map(signature)
+        let lineIDs = lines.map(\.id)
+        var index = 0
+        if fontChanged == false {
+            let prefix = min(ids.count, lines.count)
+            while index < prefix, ids[index] == lineIDs[index], sigs[index] == signatures[index] {
+                index += 1
+            }
+            if index == lines.count, index == ids.count {
+                held = lines
+                return
+            }
+        }
+        rebuild(
+            lines,
+            from: index,
+            fontSize: fontSize,
+            carry: carry,
+            signatures: signatures,
+            lineIDs: lineIDs
+        )
+        held = lines
+    }
+
+    private func signature(_ line: LineDTO) -> Int {
+        var hasher = Hasher()
+        hasher.combine(line.isSeparator)
+        hasher.combine(line.text)
+        return hasher.finalize()
+    }
+
+    private func sameStorage(_ lhs: [LineDTO], _ rhs: [LineDTO]) -> Bool {
+        lhs.withUnsafeBufferPointer { left in
+            rhs.withUnsafeBufferPointer { right in
+                left.count == right.count && left.baseAddress == right.baseAddress
+            }
+        }
+    }
+
+    private func rebuild(
+        _ lines: [LineDTO],
+        from index: Int,
+        fontSize: CGFloat,
+        carry: ColourCarryCache,
+        signatures: [Int],
+        lineIDs: [String]
+    ) {
+        self.fontSize = fontSize
+        if index == 0 {
+            working = NSMutableAttributedString()
+            markers = []
+            ids = []
+            sigs = []
+            needsJoiner = false
+            lastWasSeparator = false
+        } else if index < markers.count {
+            let cut = markers[index].location
+            if cut < working.length {
+                working.deleteCharacters(in: NSRange(location: cut, length: working.length - cut))
+            }
+            markers.removeSubrange(index...)
+            ids.removeSubrange(index...)
+            sigs.removeSubrange(index...)
+            // The newline that ended the previous row is still in the buffer.
+            needsJoiner = false
+            lastWasSeparator = index > 0 && markers[index - 1].separator
+        }
+        if index < lines.count {
+            for cursor in index..<lines.count {
+                append(lines[cursor], fontSize: fontSize, carry: carry)
+                ids.append(lineIDs[cursor])
+                sigs.append(signatures[cursor])
+            }
+        }
+        attributed = NSAttributedString(attributedString: working)
+        generation &+= 1
+    }
+
+    private func append(_ line: LineDTO, fontSize: CGFloat, carry: ColourCarryCache) {
+        if needsJoiner {
+            working.append(joiner(separator: lastWasSeparator, fontSize: fontSize))
+        }
+        let start = working.length
+        if line.isSeparator {
+            let stamp = line.disconnectAt.map { DisconnectSeparator.stamp(at: $0) } ?? line.text
+            working.append(NSAttributedString(string: stamp, attributes: [
+                .font: UIFont.preferredFont(forTextStyle: .caption1),
+                .foregroundColor: UIColor.secondaryLabel,
+                .paragraphStyle: separatorParagraph
+            ]))
+        } else {
+            let piece = NSMutableAttributedString(attributedString: Ansi.attributed(
+                line.text,
+                fontSize: fontSize,
+                columns: terminalColumns,
+                initial: carry.startState(for: line.id)
+            ))
+            if piece.length > 0 {
+                piece.addAttribute(
+                    .paragraphStyle,
+                    value: mudParagraph,
+                    range: NSRange(location: 0, length: piece.length)
+                )
+            }
+            working.append(piece)
+        }
+        markers.append(DocMarker(
+            id: line.id,
+            location: start,
+            contentLength: working.length - start,
+            separator: line.isSeparator
+        ))
+        lastWasSeparator = line.isSeparator
+        needsJoiner = true
+    }
+
+    private func joiner(separator: Bool, fontSize: CGFloat) -> NSAttributedString {
+        let font: UIFont = separator
+            ? .preferredFont(forTextStyle: .caption1)
+            : .monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        let color: UIColor = separator ? .secondaryLabel : UIColor(white: 0.78, alpha: 1)
+        return NSAttributedString(string: "\n", attributes: [
+            .font: font,
+            .foregroundColor: color,
+            .paragraphStyle: separator ? separatorParagraph : mudParagraph
+        ])
+    }
+}
+
+/// Read-only transcript. Scrolling belongs to the SwiftUI scroll view; a long
+/// press selects across lines. The pan is off so a drag still scrolls.
+private final class TranscriptTextView: UITextView {
+    override init(frame: CGRect, textContainer: NSTextContainer?) {
+        let storage = NSTextStorage()
+        let manager = NSLayoutManager()
+        storage.addLayoutManager(manager)
+        let container = NSTextContainer(size: CGSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
+        container.widthTracksTextView = false
+        container.lineFragmentPadding = 0
+        container.lineBreakMode = .byClipping
+        manager.addTextContainer(container)
+        super.init(frame: frame, textContainer: container)
+        isEditable = false
+        isSelectable = true
+        isScrollEnabled = false
+        backgroundColor = .clear
+        textContainerInset = .zero
+        dataDetectorTypes = []
+        showsVerticalScrollIndicator = false
+        showsHorizontalScrollIndicator = false
+        contentInsetAdjustmentBehavior = .never
+        automaticallyAdjustsScrollIndicatorInsets = false
+        insetsLayoutMarginsFromSafeArea = false
+        clipsToBounds = false
+        tintColor = UIColor(white: 0.78, alpha: 1)
+        overrideUserInterfaceStyle = .dark
+        let link = UIColor(red: 0.55, green: 0.82, blue: 1, alpha: 1)
+        linkTextAttributes = [
+            .foregroundColor: link,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .underlineColor: link
+        ]
+        layoutManager.allowsNonContiguousLayout = false
+        textDragInteraction?.isEnabled = false
+        panGestureRecognizer.isEnabled = false
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if panGestureRecognizer.isEnabled {
+            panGestureRecognizer.isEnabled = false
+        }
+    }
+}
+
+private struct TranscriptText: UIViewRepresentable {
+    var attributed: NSAttributedString
+    var generation: Int
+    var width: CGFloat
+    var markers: [DocMarker]
+    var onMetrics: (CGFloat, [LineAnchor]) -> Void
+
+    func makeUIView(context: Context) -> TranscriptTextView {
+        let view = TranscriptTextView(frame: .zero, textContainer: nil)
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.required, for: .vertical)
+        return view
+    }
+
+    func updateUIView(_ textView: TranscriptTextView, context: Context) {
+        guard width > 1 else { return }
+        let coordinator = context.coordinator
+        let same = coordinator.generation == generation && abs(coordinator.width - width) < 0.5
+        guard same == false else { return }
+        textView.delegate = coordinator
+        if coordinator.generation != generation {
+            let previous = textView.attributedText?.string ?? ""
+            let next = attributed.string
+            let shared = previous.commonPrefix(with: next).utf16.count
+            let range = textView.selectedRange
+            textView.attributedText = attributed
+            if range.length > 0, range.location + range.length <= shared {
+                textView.selectedRange = range
+            }
+            coordinator.generation = generation
+        }
+        textView.isScrollEnabled = false
+        textView.panGestureRecognizer.isEnabled = false
+        coordinator.width = width
+        let metrics = Self.measure(textView, markers: markers, width: width)
+        let report = onMetrics
+        DispatchQueue.main.async {
+            report(metrics.height, metrics.anchors)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var generation = -1
+        var width: CGFloat = -1
+
+        func textView(
+            _ textView: UITextView,
+            shouldInteractWith URL: URL,
+            in characterRange: NSRange,
+            interaction: UITextItemInteraction
+        ) -> Bool {
+            if interaction == .invokeDefaultAction {
+                UIApplication.shared.open(URL)
+                return false
+            }
+            return true
+        }
+    }
+
+    private static func measure(
+        _ textView: UITextView,
+        markers: [DocMarker],
+        width: CGFloat
+    ) -> (height: CGFloat, anchors: [LineAnchor]) {
+        let container = textView.textContainer
+        container.widthTracksTextView = false
+        container.size = CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+        let manager = textView.layoutManager
+        manager.ensureLayout(for: container)
+        let fit = textView.sizeThatFits(CGSize(width: width, height: CGFloat.greatestFiniteMagnitude))
+        let height = max(fit.height, 1)
+        let total = textView.attributedText?.length ?? 0
+        var rects: [CGRect] = []
+        rects.reserveCapacity(markers.count)
+        for marker in markers {
+            rects.append(rect(marker, total: total, manager: manager, container: container))
+        }
+        var anchors: [LineAnchor] = []
+        anchors.reserveCapacity(markers.count)
+        for index in markers.indices {
+            let rect = rects[index]
+            let nextY = index + 1 < rects.count ? rects[index + 1].minY : height
+            let rowHeight = max(1, nextY - rect.minY)
+            var anchor = LineAnchor(id: markers[index].id, y: rect.minY, height: rowHeight)
+            if markers[index].separator, rect.width > 0, rect.height > 0 {
+                anchor.separatorMinX = rect.minX
+                anchor.separatorWidth = rect.width
+                anchor.separatorMidY = rect.midY
+            }
+            anchors.append(anchor)
+        }
+        return (height, anchors)
+    }
+
+    private static func rect(
+        _ marker: DocMarker,
+        total: Int,
+        manager: NSLayoutManager,
+        container: NSTextContainer
+    ) -> CGRect {
+        guard marker.location < total else {
+            return .zero
+        }
+        let length = min(max(marker.contentLength, 0), total - marker.location)
+        guard length > 0 else {
+            let glyphs = manager.glyphRange(
+                forCharacterRange: NSRange(location: marker.location, length: 0),
+                actualCharacterRange: nil
+            )
+            return manager.boundingRect(forGlyphRange: glyphs, in: container)
+        }
+        let glyphs = manager.glyphRange(
+            forCharacterRange: NSRange(location: marker.location, length: length),
+            actualCharacterRange: nil
+        )
+        return manager.boundingRect(forGlyphRange: glyphs, in: container)
+    }
+}
+
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
@@ -170,6 +527,12 @@ struct TranscriptView: View {
     @State private var actionPanelShown = false
     /// Colour entering each line. A class so scrolling does not copy it.
     @State private var colourCarry = ColourCarryCache()
+    /// Attributed transcript shared by the selectable text view.
+    @State private var documentStore = TranscriptDocumentStore()
+    /// Laid-out height of that text, before the scroll view's minimum.
+    @State private var transcriptContentHeight: CGFloat = 1
+    /// One scroll target per row, measured from the text layout.
+    @State private var lineAnchors: [LineAnchor] = []
 
     /// Count and the newest line, so a capped buffer and an insert both register
     /// without observing the whole transcript array.
@@ -185,7 +548,7 @@ struct TranscriptView: View {
                 let transcriptHeight = max(0, geo.size.height - headerBarHeight - inputBarHeight)
                 ScrollViewReader { proxy in
                     ScrollView {
-                        lineStack(fontSize: fontSize)
+                        lineStack(fontSize: fontSize, width: geo.size.width)
                             .padding(.vertical, 8)
                             .frame(minWidth: geo.size.width, minHeight: transcriptHeight, alignment: .topLeading)
                             .frame(width: geo.size.width)
@@ -195,6 +558,17 @@ struct TranscriptView: View {
                     .onAppear { considerReveal(proxy, reason: "appear") }
                     .onChange(of: linesScrollSignal) { _, _ in
                         considerReveal(proxy, reason: "lines")
+                    }
+                    .onChange(of: transcriptContentHeight) { _, _ in
+                        guard nearBottom, session.pendingResumeReveal == false else { return }
+                        scrollToBottom(proxy)
+                    }
+                    .onChange(of: lineAnchors.count) { _, _ in
+                        guard session.pendingResumeReveal, easeStarted == false,
+                              let separatorID = session.resumeSeparatorID else { return }
+                        guard lineAnchors.contains(where: { $0.id == separatorID }) else { return }
+                        separatorBecameVisible(separatorID)
+                        jumpToSeparator(proxy, id: separatorID)
                     }
                     .onChange(of: session.pendingResumeReveal) { _, _ in
                         considerReveal(proxy, reason: "pending")
@@ -678,21 +1052,124 @@ struct TranscriptView: View {
         }
     }
 
-    @ViewBuilder
-    private func lineStack(fontSize: CGFloat) -> some View {
-        if session.lines.count > modestTranscriptCount {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                lineRows(fontSize: fontSize)
+    private struct PlacedAnchor: Identifiable {
+        var id: String
+        var gap: CGFloat
+        var height: CGFloat
+        var separator: Bool
+    }
+
+    /// One text view so a selection can cross lines. Invisible rows keep the
+    /// existing scroll-to-id reveal; they do not take touches.
+    private func lineStack(fontSize: CGFloat, width: CGFloat) -> some View {
+        documentStore.update(lines: session.lines, fontSize: fontSize, carry: colourCarry)
+        let placed = placedAnchors
+        let trailing = max(0, transcriptContentHeight - anchorCursor)
+        return ZStack(alignment: .topLeading) {
+            VStack(spacing: 0) {
+                ForEach(placed) { anchor in
+                    Color.clear
+                        .frame(height: anchor.gap)
+                    Color.clear
+                        .frame(height: anchor.height)
+                        .id(anchor.id)
+                        .onAppear {
+                            if anchor.separator {
+                                separatorBecameVisible(anchor.id)
+                            }
+                        }
+                }
+                Color.clear.frame(height: trailing)
                 bottomMarker
             }
             .scrollTargetLayout()
-        } else {
-            VStack(alignment: .leading, spacing: 0) {
-                lineRows(fontSize: fontSize)
-                bottomMarker
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+
+            TranscriptText(
+                attributed: documentStore.attributed,
+                generation: documentStore.generation,
+                width: width,
+                markers: documentStore.markers,
+                onMetrics: { height, anchors in
+                    if abs(transcriptContentHeight - height) > 0.5 {
+                        transcriptContentHeight = height
+                    }
+                    if anchors != lineAnchors {
+                        lineAnchors = anchors
+                    }
+                }
+            )
+            .frame(width: width, height: max(transcriptContentHeight, 1), alignment: .top)
+
+            hairlines(width: width)
+                .allowsHitTesting(false)
+
+            if #available(iOS 18.0, *) {
+                Color.clear.frame(width: 0, height: 0)
+            } else {
+                TranscriptOffsetSpy(
+                    holdBottomUntil: holdBottomUntil,
+                    revealPending: session.pendingResumeReveal,
+                    onNearBottom: { near in
+                        if nearBottom != near {
+                            nearBottom = near
+                        }
+                    }
+                )
+                .frame(width: 0, height: 0)
             }
-            .scrollTargetLayout()
         }
+    }
+
+    private var placedAnchors: [PlacedAnchor] {
+        var placed: [PlacedAnchor] = []
+        var cursor: CGFloat = 0
+        for anchor in lineAnchors {
+            let gap = max(0, anchor.y - cursor)
+            let height = max(anchor.height, 1)
+            placed.append(PlacedAnchor(
+                id: anchor.id,
+                gap: gap,
+                height: height,
+                separator: anchor.separatorMinX != nil
+            ))
+            cursor = anchor.y + height
+        }
+        return placed
+    }
+
+    private var anchorCursor: CGFloat {
+        guard let last = lineAnchors.last else { return 0 }
+        return last.y + max(last.height, 1)
+    }
+
+    /// Hairlines beside the disconnect stamp. The stamp itself is in the text
+    /// view, so a selection can pass through it and the copy includes it.
+    private func hairlines(width: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            ForEach(lineAnchors.filter { $0.separatorMinX != nil }) { anchor in
+                if let minX = anchor.separatorMinX,
+                   let stampWidth = anchor.separatorWidth,
+                   let midY = anchor.separatorMidY {
+                    let left = max(0, minX - 8)
+                    let rightStart = minX + stampWidth + 8
+                    let right = max(0, width - rightStart)
+                    ZStack(alignment: .topLeading) {
+                        Rectangle()
+                            .fill(Color.secondary)
+                            .frame(width: left, height: 1)
+                            .offset(y: midY)
+                        Rectangle()
+                            .fill(Color.secondary)
+                            .frame(width: right, height: 1)
+                            .offset(x: rightStart, y: midY)
+                    }
+                }
+            }
+        }
+        .frame(width: width, height: max(transcriptContentHeight, 1), alignment: .topLeading)
+        .accessibilityHidden(true)
     }
 
     @ViewBuilder
@@ -722,32 +1199,6 @@ struct TranscriptView: View {
         }
     }
 
-    @ViewBuilder
-    private func lineRows(fontSize: CGFloat) -> some View {
-        ForEach(session.lines) { line in
-            transcriptLine(line, fontSize: fontSize)
-                .id(line.id)
-        }
-    }
-
-    @ViewBuilder
-    private func transcriptLine(_ line: LineDTO, fontSize: CGFloat) -> some View {
-        if line.isSeparator {
-            separatorRow(line)
-                .onAppear { separatorBecameVisible(line.id) }
-        } else {
-            Ansi.text(
-                line.text,
-                fontSize: fontSize,
-                columns: terminalColumns,
-                initial: colourCarry.startState(for: line.id)
-            )
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 8)
-        }
-    }
-
     /// 44×44 hit target. The label is the accessibility name (Say or Send).
     private func commandIcon(
         _ symbol: String,
@@ -764,32 +1215,6 @@ struct TranscriptView: View {
         .foregroundStyle(ink)
         .disabled(commandIsBlank)
         .accessibilityLabel(label)
-    }
-
-    /// Full-width hairline with the disconnect time centered on it. The row has no
-    /// horizontal padding, so the line meets both edges of the transcript.
-    /// The stamp is formatted here, in the device's current zone, not from a server clock.
-    private func separatorRow(_ line: LineDTO) -> some View {
-        let stamp = line.disconnectAt.map { DisconnectSeparator.stamp(at: $0) } ?? line.text
-        return HStack(spacing: 8) {
-            Rectangle()
-                .fill(Color.secondary)
-                .frame(height: 1)
-                .frame(maxWidth: .infinity)
-            Text(stamp)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-            Rectangle()
-                .fill(Color.secondary)
-                .frame(height: 1)
-                .frame(maxWidth: .infinity)
-        }
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Disconnected \(stamp)")
     }
 
 }
@@ -1016,6 +1441,96 @@ private struct InputBarHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
+    }
+}
+
+/// iOS 17 has no scroll geometry. Watches the enclosing scroll view so new
+/// output still follows the bottom only while the reader is already there.
+private struct TranscriptOffsetSpy: UIViewRepresentable {
+    var holdBottomUntil: Date
+    var revealPending: Bool
+    var onNearBottom: (Bool) -> Void
+
+    func makeUIView(context: Context) -> SpyView {
+        let view = SpyView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        return view
+    }
+
+    func updateUIView(_ view: SpyView, context: Context) {
+        view.holdBottomUntil = holdBottomUntil
+        view.revealPending = revealPending
+        view.onNearBottom = onNearBottom
+    }
+
+    final class SpyView: UIView {
+        var holdBottomUntil = Date.distantPast
+        var revealPending = false
+        var onNearBottom: ((Bool) -> Void)?
+        private var offsetObservation: NSKeyValueObservation?
+        private var sizeObservation: NSKeyValueObservation?
+        private var wasNear = true
+        private var lastReported: Bool?
+        private var lastOffset: CGFloat = 0
+        private var lastContent: CGFloat = -1
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            attach()
+        }
+
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            attach()
+        }
+
+        private func attach() {
+            guard offsetObservation == nil, let scroll = enclosingScroll() else { return }
+            offsetObservation = scroll.observe(\.contentOffset, options: [.new]) { [weak self] scroll, _ in
+                self?.report(scroll)
+            }
+            sizeObservation = scroll.observe(\.contentSize, options: [.new]) { [weak self] scroll, _ in
+                self?.report(scroll)
+            }
+        }
+
+        private func enclosingScroll() -> UIScrollView? {
+            var view = superview
+            while let current = view {
+                if let scroll = current as? UIScrollView, (scroll is TranscriptTextView) == false {
+                    return scroll
+                }
+                view = current.superview
+            }
+            return nil
+        }
+
+        private func report(_ scroll: UIScrollView) {
+            guard revealPending == false else { return }
+            let inset = scroll.adjustedContentInset
+            let visibleMax = scroll.contentOffset.y + scroll.bounds.height - inset.bottom
+            let distance = scroll.contentSize.height - visibleMax
+            let grew = scroll.contentSize.height > lastContent + 0.5
+            let stayed = abs(scroll.contentOffset.y - lastOffset) < 1
+            lastOffset = scroll.contentOffset.y
+            lastContent = scroll.contentSize.height
+            let near: Bool
+            if Date() < holdBottomUntil {
+                near = true
+            } else if grew, stayed, wasNear {
+                near = true
+            } else {
+                near = distance <= nearBottomSlack
+            }
+            wasNear = near
+            guard near != lastReported else { return }
+            lastReported = near
+            let callback = onNearBottom
+            DispatchQueue.main.async {
+                callback?(near)
+            }
+        }
     }
 }
 
