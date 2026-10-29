@@ -16,6 +16,122 @@ private final class BottomSnapGate {
     var queued = false
 }
 
+/// SGR colour carried across transcript rows. Keyed by line id so a 4000-line
+/// buffer is not reparsed on scroll: only a changed suffix is scanned, and a
+/// separator passes the previous colour through. Surviving ids keep the end
+/// state they were shown with, so trimming the cap does not recolour them.
+private final class ColourCarryCache {
+    private struct Entry {
+        var id: String
+        var signature: Int
+        var start: Ansi.State
+        var end: Ansi.State
+    }
+
+    private var entries: [Entry] = []
+    private var startByID: [String: Ansi.State] = [:]
+    /// Retained so this buffer's storage address cannot be reused until `lines`
+    /// is replaced. A scroll frame then matches and does no work.
+    private var held: [LineDTO] = []
+
+    func prepare(_ lines: [LineDTO]) {
+        if sameStorage(lines, held) { return }
+        rebuild(lines)
+        held = lines
+    }
+
+    func startState(for id: String) -> Ansi.State {
+        startByID[id] ?? .initial
+    }
+
+    private func sameStorage(_ lhs: [LineDTO], _ rhs: [LineDTO]) -> Bool {
+        lhs.withUnsafeBufferPointer { left in
+            rhs.withUnsafeBufferPointer { right in
+                left.count == right.count && left.baseAddress == right.baseAddress
+            }
+        }
+    }
+
+    private func signature(_ line: LineDTO) -> Int {
+        line.isSeparator ? 0 : line.text.hashValue
+    }
+
+    private func rebuild(_ lines: [LineDTO]) {
+        let old = entries
+        var indexByID: [String: Int] = [:]
+        indexByID.reserveCapacity(old.count)
+        for (offset, entry) in old.enumerated() {
+            indexByID[entry.id] = offset
+        }
+
+        var result: [Entry] = []
+        result.reserveCapacity(lines.count)
+        var index = 0
+        let prefix = min(old.count, lines.count)
+        while index < prefix,
+              old[index].id == lines[index].id,
+              old[index].signature == signature(lines[index]) {
+            result.append(old[index])
+            index += 1
+        }
+
+        // A deleted prefix (the 4000-line cap) leaves a suffix whose ids are
+        // already cached. Keep those end states; they already include the
+        // colour of the lines that fell off.
+        if index < lines.count,
+           let pos = indexByID[lines[index].id], pos >= index,
+           old[pos].signature == signature(lines[index]) {
+            var oldCursor = pos
+            while index < lines.count, oldCursor < old.count,
+                  lines[index].id == old[oldCursor].id,
+                  old[oldCursor].signature == signature(lines[index]) {
+                result.append(old[oldCursor])
+                oldCursor += 1
+                index += 1
+            }
+        }
+
+        var state = result.last?.end ?? Ansi.State.initial
+        while index < lines.count {
+            if let pos = indexByID[lines[index].id],
+               old[pos].signature == signature(lines[index]),
+               old[pos].start == state {
+                var oldCursor = pos
+                while index < lines.count, oldCursor < old.count,
+                      lines[index].id == old[oldCursor].id,
+                      old[oldCursor].signature == signature(lines[index]),
+                      old[oldCursor].start == state {
+                    result.append(old[oldCursor])
+                    state = old[oldCursor].end
+                    oldCursor += 1
+                    index += 1
+                }
+                continue
+            }
+            let entry = makeEntry(lines[index], start: state)
+            result.append(entry)
+            state = entry.end
+            index += 1
+        }
+
+        entries = result
+        var starts: [String: Ansi.State] = [:]
+        starts.reserveCapacity(result.count)
+        for entry in result {
+            starts[entry.id] = entry.start
+        }
+        startByID = starts
+    }
+
+    private func makeEntry(_ line: LineDTO, start: Ansi.State) -> Entry {
+        if line.isSeparator {
+            return Entry(id: line.id, signature: 0, start: start, end: start)
+        }
+        let end = Ansi.endingState(parsing: line.text, starting: start)
+        return Entry(id: line.id, signature: line.text.hashValue, start: start, end: end)
+    }
+}
+
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
@@ -52,6 +168,8 @@ struct TranscriptView: View {
     @State private var showNewLines = false
     /// Upward swipe on the input bar. One row of compass commands.
     @State private var actionPanelShown = false
+    /// Colour entering each line. A class so scrolling does not copy it.
+    @State private var colourCarry = ColourCarryCache()
 
     /// Count and the newest line, so a capped buffer and an insert both register
     /// without observing the whole transcript array.
@@ -60,6 +178,7 @@ struct TranscriptView: View {
     }
 
     var body: some View {
+        let _ = colourCarry.prepare(session.lines)
         NavigationStack {
             GeometryReader { geo in
                 let fontSize = max(8, (geo.size.width - 16) / CGFloat(terminalColumns) / 0.62)
@@ -211,6 +330,35 @@ struct TranscriptView: View {
         commandFocused = false
     }
 
+    /// Posts `say` plus the field. Text that already starts with `say` is sent
+    /// as typed. `send()` clears the field before the request returns, and it
+    /// reports failure only by changing `status`, so the draft comes back only then.
+    private func sendSay() async {
+        let draft = session.command
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else { return }
+        if alreadySay(trimmed) == false {
+            session.command = "say " + trimmed
+        }
+        let statusBefore = session.status
+        await session.send()
+        guard session.command.isEmpty else { return }
+        if session.status != statusBefore {
+            session.command = draft
+            return
+        }
+        commandFocused = false
+    }
+
+    private func alreadySay(_ text: String) -> Bool {
+        let folded = text.lowercased()
+        return folded == "say" || folded.hasPrefix("say ")
+    }
+
+    private var commandIsBlank: Bool {
+        session.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// Same path as a typed command: `session.send()` posts `session.command`.
     /// A direction tap must not wipe text the reader is still composing.
     private func sendDirection(_ text: String) async {
@@ -252,22 +400,32 @@ struct TranscriptView: View {
                     .fill(Color.white.opacity(0.12))
                     .frame(height: 1)
             }
-            HStack {
+            HStack(spacing: 0) {
                 Text(">")
                     .font(.system(.body, design: .monospaced))
                     .foregroundStyle(ink)
+                    .padding(.trailing, 8)
                 TextField("command", text: $session.command)
                     .font(.system(.body, design: .monospaced))
                     .foregroundStyle(ink)
                     .textFieldStyle(.plain)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                    .keyboardType(.asciiCapable)
+                    .submitLabel(.send)
                     .focused($commandFocused)
                     .onSubmit { Task { await sendCommand() } }
-                Button("Send") { Task { await sendCommand() } }
-                    .foregroundStyle(ink)
+                    .padding(.trailing, 16)
+                commandIcon("bubble.left.fill", label: "Say") {
+                    Task { await sendSay() }
+                }
+                commandIcon("arrow.up.circle.fill", label: "Send") {
+                    Task { await sendCommand() }
+                }
             }
-            .padding(12)
+            .padding(.leading, 12)
+            .padding(.trailing, 4)
+            .padding(.vertical, 4)
         }
         .background {
             GeometryReader { proxy in
@@ -578,10 +736,34 @@ struct TranscriptView: View {
             separatorRow(line)
                 .onAppear { separatorBecameVisible(line.id) }
         } else {
-            Ansi.text(line.text, fontSize: fontSize, columns: terminalColumns)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 8)
+            Ansi.text(
+                line.text,
+                fontSize: fontSize,
+                columns: terminalColumns,
+                initial: colourCarry.startState(for: line.id)
+            )
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8)
         }
+    }
+
+    /// 44×44 hit target. The label is the accessibility name (Say or Send).
+    private func commandIcon(
+        _ symbol: String,
+        label: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 20))
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(ink)
+        .disabled(commandIsBlank)
+        .accessibilityLabel(label)
     }
 
     /// Full-width hairline with the disconnect time centered on it. The row has no
@@ -797,8 +979,8 @@ private struct ActionPanel: View {
     private static let directions = [
         Direction(label: "N", command: "north"),
         Direction(label: "S", command: "south"),
-        Direction(label: "E", command: "east"),
         Direction(label: "W", command: "west"),
+        Direction(label: "E", command: "east"),
         Direction(label: "U", command: "up"),
         Direction(label: "D", command: "down"),
     ]
