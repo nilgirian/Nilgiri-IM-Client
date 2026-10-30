@@ -11,6 +11,16 @@ private func transcriptFontSize(for width: CGFloat) -> CGFloat {
     max(8, (width - 16) / CGFloat(terminalColumns) / 0.62)
 }
 
+/// How many monospaced columns of `fontSize` fit the transcript slot.
+/// The base font is chosen so this is 80. A larger face fits fewer, and the
+/// paragraph clips, so the wrap has to come from this count.
+private func transcriptColumns(forFontSize fontSize: CGFloat, width: CGFloat) -> Int {
+    let usable = width - 16
+    guard fontSize > 0, usable > 0 else { return terminalColumns }
+    let columns = Int((usable / (fontSize * 0.62)).rounded(.down))
+    return max(1, min(terminalColumns, columns))
+}
+
 /// Portrait when the window is taller than it is wide. A phone size class
 /// is the fallback before that window has a size. The text view's height is
 /// left out of this, because the keyboard shortens the log without a rotation.
@@ -243,6 +253,10 @@ private final class TranscriptDocumentStore {
 
     private var fontSize: CGFloat = -1
     private var enlargeCommunication = false
+    /// Columns used when a portrait communication line is drawn larger.
+    /// Normal lines stay at 80. A scroll frame does not change this.
+    private var communicationColumns = terminalColumns
+    private var slotWidth: CGFloat = 0
     private var ids: [String] = []
     private var sigs: [Int] = []
     private var working = NSMutableAttributedString()
@@ -275,17 +289,23 @@ private final class TranscriptDocumentStore {
     func update(
         lines: [LineDTO],
         fontSize: CGFloat,
+        width: CGFloat,
         enlargeCommunication: Bool,
         carry: ColourCarryCache
     ) -> TranscriptEdit? {
         carry.prepare(lines)
+        let columns = enlargeCommunication
+            ? transcriptColumns(forFontSize: fontSize + CommunicationLine.portraitBoost, width: width)
+            : terminalColumns
         if sameStorage(lines, held),
            abs(self.fontSize - fontSize) < 0.01,
-           self.enlargeCommunication == enlargeCommunication {
+           self.enlargeCommunication == enlargeCommunication,
+           self.communicationColumns == columns {
             return nil
         }
         let styleChanged = abs(self.fontSize - fontSize) >= 0.01
             || self.enlargeCommunication != enlargeCommunication
+            || self.communicationColumns != columns
         let signatures = lines.map(signature)
         let lineIDs = lines.map(\.id)
         var index = 0
@@ -311,6 +331,8 @@ private final class TranscriptDocumentStore {
             lines,
             from: index,
             fontSize: fontSize,
+            width: width,
+            communicationColumns: columns,
             enlargeCommunication: enlargeCommunication,
             carry: carry,
             signatures: signatures,
@@ -345,12 +367,16 @@ private final class TranscriptDocumentStore {
         _ lines: [LineDTO],
         from index: Int,
         fontSize: CGFloat,
+        width: CGFloat,
+        communicationColumns: Int,
         enlargeCommunication: Bool,
         carry: ColourCarryCache,
         signatures: [Int],
         lineIDs: [String]
     ) {
         self.fontSize = fontSize
+        self.slotWidth = width
+        self.communicationColumns = communicationColumns
         self.enlargeCommunication = enlargeCommunication
         if index == 0 {
             working = NSMutableAttributedString()
@@ -401,7 +427,7 @@ private final class TranscriptDocumentStore {
             let piece = NSMutableAttributedString(attributedString: Ansi.attributed(
                 line.text,
                 fontSize: size,
-                columns: terminalColumns,
+                columns: columns(forDisplaySize: size, base: fontSize),
                 initial: carry.startState(for: line.id)
             ))
             if piece.length > 0 {
@@ -429,6 +455,17 @@ private final class TranscriptDocumentStore {
     private func displayFontSize(_ line: LineDTO, base: CGFloat) -> CGFloat {
         guard enlargeCommunication, CommunicationLine.isCommunication(line) else { return base }
         return base + CommunicationLine.portraitBoost
+    }
+
+    /// Normal lines stay on the 80-column wrap. A larger portrait line wraps
+    /// at the fewer columns that fit the same slot, still as display breaks
+    /// only. The stored MUD text is not edited.
+    private func columns(forDisplaySize size: CGFloat, base: CGFloat) -> Int {
+        guard size > base + 0.01 else { return terminalColumns }
+        if communicationColumns > 0 {
+            return communicationColumns
+        }
+        return transcriptColumns(forFontSize: size, width: slotWidth)
     }
 
     private func joiner(separator: Bool, fontSize: CGFloat) -> NSAttributedString {
@@ -826,6 +863,7 @@ private struct TranscriptLog: UIViewRepresentable {
             guard let edit = store.update(
                 lines: lines,
                 fontSize: font,
+                width: textView.bounds.width,
                 enlargeCommunication: portrait,
                 carry: carry
             ) else { return }
