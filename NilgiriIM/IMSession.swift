@@ -1722,7 +1722,13 @@ final class IMSession: ObservableObject {
     }
 
     /// Every decoded step, including a reroll whose kind, label, and options match.
+    /// A step `error` that is an IM server code is replaced for the red label.
+    /// `info` is still copied unchanged.
     private func publishCreateStep(_ step: CreateStep) {
+        var step = step
+        if let error = step.error {
+            step.error = creationErrorCopy(error)
+        }
         createStep = step
         createStepSerial += 1
         appendCreateLog(step)
@@ -1783,7 +1789,7 @@ final class IMSession: ObservableObject {
         let closed = status == "closed" || object["closed"] as? Bool == true
         guard aborted || closed else { return nil }
         if let error = object["error"] as? String, error.isEmpty == false {
-            return error
+            return creationErrorCopy(error)
         }
         if status == "aborted" || status == "closed" {
             return raw
@@ -1820,12 +1826,23 @@ final class IMSession: ObservableObject {
         if let object = jsonObject(data),
            let error = object["error"] as? String,
            error.isEmpty == false {
-            return error
+            return creationErrorCopy(error)
         }
         if (200...299).contains(status) {
             return "Character creation returned an unexpected response."
         }
         return "Creation failed (\(status))"
+    }
+
+    /// IM server creation codes shown on the form. `exists` means the name is taken.
+    /// Any other string, including a MUD sentence, is returned unchanged.
+    /// Greetings, step info, and transcript lines are not passed through here.
+    private func creationErrorCopy(_ error: String) -> String {
+        let code = error.trimmingCharacters(in: .whitespacesAndNewlines)
+        if code.compare("exists", options: .caseInsensitive) == .orderedSame {
+            return "That name has already been taken"
+        }
+        return error
     }
 
     private func stringField(_ object: [String: Any], _ key: String) -> String? {
