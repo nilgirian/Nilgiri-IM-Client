@@ -33,7 +33,7 @@ private func transcriptIsPortrait(_ view: UIView) -> Bool {
 /// channel, or when the visible sentence is one of those channel lines.
 /// The test reads a copy with ANSI removed. The stored line is not edited.
 private enum CommunicationLine {
-    static let portraitBoost: CGFloat = 4
+    static let portraitBoost: CGFloat = 6
 
     private static let kinds: Set<String> = [
         "say", "says",
@@ -423,7 +423,7 @@ private final class TranscriptDocumentStore {
         needsJoiner = true
     }
 
-    /// Portrait communication is four points above the normal transcript size.
+    /// Portrait communication is six points above the normal transcript size.
     /// Landscape passes the normal size through. Characters, colours, and
     /// links come from `Ansi` unchanged.
     private func displayFontSize(_ line: LineDTO, base: CGFloat) -> CGFloat {
