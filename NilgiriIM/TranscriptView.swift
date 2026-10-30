@@ -369,8 +369,12 @@ private final class TranscriptLayoutManager: NSLayoutManager {
 /// around it was rewriting state on every frame.
 private final class TranscriptTextView: UITextView {
     var onStructuralLayout: (() -> Void)?
+    /// Height-only. The menu and the input bar change the slot; a keyboard
+    /// frame must not publish SwiftUI state from here.
+    var onViewportHeightChange: (() -> Void)?
     private var laidWidth: CGFloat = -1
     private var laidContentHeight: CGFloat = -1
+    private var laidBoundsHeight: CGFloat = -1
 
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         let storage = NSTextStorage()
@@ -441,6 +445,8 @@ private final class TranscriptTextView: UITextView {
         super.layoutSubviews()
         // Keyboard animation changes the height every frame. That is not a
         // reason to measure or publish. Width and the text's own height are.
+        // A single settled height change (the menu taking the input bar's
+        // place, or giving it back) is forwarded so the bottom can pin once.
         var structural = false
         let width = bounds.width
         let contentHeight = contentSize.height
@@ -454,8 +460,16 @@ private final class TranscriptTextView: UITextView {
             laidContentHeight = contentHeight
             structural = true
         }
+        let height = bounds.height
+        let previousHeight = laidBoundsHeight
+        let heightChanged = height > 1 && abs(height - previousHeight) >= 0.5
+        if heightChanged {
+            laidBoundsHeight = height
+        }
         if structural {
             onStructuralLayout?()
+        } else if heightChanged, previousHeight > 1 {
+            onViewportHeightChange?()
         }
     }
 }
@@ -468,6 +482,14 @@ private final class TranscriptHost: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
+        clipsToBounds = true
+        // Yield to the menu and the input bar. Default resistance keeps
+        // the fitting size, which was the slot above the shorter bar, so
+        // the taller menu was drawn across the last lines.
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        setContentHuggingPriority(.defaultLow, for: .vertical)
         textView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(textView)
         NSLayoutConstraint.activate([
@@ -482,12 +504,23 @@ private final class TranscriptHost: UIView {
         return nil
     }
 
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: UIView.noIntrinsicMetric)
+    }
+
+    /// The slot that was offered. The previous column height is not an
+    /// ideal size; reporting it keeps the menu from shortening the log.
     override func sizeThatFits(_ size: CGSize) -> CGSize {
-        if size.width > 1, size.height > 1,
-           size.width < .greatestFiniteMagnitude, size.height < .greatestFiniteMagnitude {
-            return size
+        let width: CGFloat
+        if size.width > 1, size.width < .greatestFiniteMagnitude {
+            width = size.width
+        } else {
+            width = 0
         }
-        return bounds.size
+        if size.height > 1, size.height < .greatestFiniteMagnitude {
+            return CGSize(width: width, height: size.height)
+        }
+        return CGSize(width: width, height: 0)
     }
 }
 
@@ -507,26 +540,31 @@ private struct TranscriptLog: UIViewRepresentable {
         view.onStructuralLayout = { [weak coordinator = context.coordinator] in
             coordinator?.noteLayout()
         }
+        view.onViewportHeightChange = { [weak coordinator = context.coordinator] in
+            coordinator?.viewportResized()
+        }
         return host
     }
 
     /// Width and height are the slot SwiftUI offered. Measuring the text here
-    /// is what made a scroll frame lay out every glyph.
+    /// is what made a scroll frame lay out every glyph. An unspecified height
+    /// is not the current column: that size is the slot above the input bar,
+    /// and reporting it lays the taller menu across the last lines.
     func sizeThatFits(
         _ proposal: ProposedViewSize,
         uiView: TranscriptHost,
         context: Context
     ) -> CGSize? {
-        guard let width = proposal.width, let height = proposal.height,
-              width > 1, height > 1,
-              width < .greatestFiniteMagnitude, height < .greatestFiniteMagnitude else {
-            let fallback = uiView.bounds.size
-            if fallback.width > 1, fallback.height > 1 {
-                return fallback
-            }
-            return CGSize(width: 0, height: 0)
+        let width: CGFloat
+        if let proposed = proposal.width, proposed > 1, proposed < .greatestFiniteMagnitude {
+            width = proposed
+        } else {
+            width = 0
         }
-        return CGSize(width: width, height: height)
+        if let height = proposal.height, height > 1, height < .greatestFiniteMagnitude {
+            return CGSize(width: width, height: height)
+        }
+        return CGSize(width: width, height: 0)
     }
 
     func updateUIView(_ host: TranscriptHost, context: Context) {
@@ -584,6 +622,9 @@ private struct TranscriptLog: UIViewRepresentable {
         var publishGeneration = 0
         var stickQueued = false
         var lastOffsetY: CGFloat = 0
+        /// While the keyboard frame is animating, height changes are not a
+        /// second pin. The notification below scrolls once when it ends.
+        private var keyboardAnimationUntil = Date.distantPast
         private var keyboardObserver: NSObjectProtocol?
 
         override init() {
@@ -608,8 +649,9 @@ private struct TranscriptLog: UIViewRepresentable {
         /// moves with the keyboard safe area, so the text view does not also
         /// track `contentInset` during the animation.
         private func keyboardWillChange(_ note: Notification) {
-            guard stickToBottom, revealing == false, revealPending == false else { return }
             let duration = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
+            keyboardAnimationUntil = Date().addingTimeInterval(duration)
+            guard stickToBottom, revealing == false, revealPending == false else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
                 guard let coordinator = self else { return }
                 guard coordinator.stickToBottom, coordinator.revealing == false,
@@ -624,6 +666,13 @@ private struct TranscriptLog: UIViewRepresentable {
             defer { inLayout = false }
             applyIfPossible()
             syncReveal()
+            stickIfNeeded()
+        }
+
+        /// The log's height changed because the menu or the input bar did.
+        /// One pin, after this layout, and not once per keyboard frame.
+        func viewportResized() {
+            guard Date() >= keyboardAnimationUntil else { return }
             stickIfNeeded()
         }
 
@@ -932,6 +981,7 @@ struct TranscriptView: View {
                             .padding(.bottom, 8)
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(alignment: .topTrailing) {
                     if session.atMenu == false {
                         unlinkButton
@@ -939,11 +989,17 @@ struct TranscriptView: View {
                             .padding(.trailing, 12)
                     }
                 }
-                if session.atMenu {
-                    GameMenuPanel()
-                } else {
-                    inputBar
+                // The menu is taller than the input bar. It stays under the
+                // log in this column and keeps its own height, so the log
+                // shortens instead of leaving the last lines under the buttons.
+                Group {
+                    if session.atMenu {
+                        GameMenuPanel()
+                    } else {
+                        inputBar
+                    }
                 }
+                .layoutPriority(1)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(screen)
