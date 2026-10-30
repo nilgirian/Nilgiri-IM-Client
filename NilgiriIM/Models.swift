@@ -463,6 +463,14 @@ enum HMVPrompt {
     }
 }
 
+/// One creation step's info block. `lines` is the plain `info`, unchanged.
+/// `ansiLines` is `infoAnsi` when the server sent it. The view draws the
+/// rule between sections; nothing here is written into the line text.
+struct CreateLogSection: Equatable {
+    let lines: [String]
+    let ansiLines: [String]?
+}
+
 /// One screen in `POST /v1/create`. `info` is either a string of lines or an
 /// array of lines. `options` are strings or `{value, label}` objects.
 /// A confirm step with no options is answered with yes/no.
@@ -470,12 +478,14 @@ struct CreateStep: Decodable {
     let kind: String
     let label: String
     let info: [String]
+    /// Raw ANSI for `info`, split the same way. Older servers omit it.
+    let infoAnsi: [String]?
     let options: [CreateOption]
     var error: String?
     let email: String?
 
     private enum CodingKeys: String, CodingKey {
-        case kind, label, info, options, error, email
+        case kind, label, info, infoAnsi, options, error, email
     }
 
     var normalizedKind: String {
@@ -526,6 +536,7 @@ struct CreateStep: Decodable {
         self.kind = kind
         label = try container.decodeIfPresent(String.self, forKey: .label) ?? ""
         info = Self.decodeInfo(container)
+        infoAnsi = Self.decodeInfoAnsi(container)
         options = Self.decodeOptions(container)
         error = try container.decodeIfPresent(String.self, forKey: .error)
         email = try container.decodeIfPresent(String.self, forKey: .email)
@@ -545,6 +556,14 @@ struct CreateStep: Decodable {
             return splitLines(text)
         }
         return []
+    }
+
+    /// `decodeIfPresent` for `[String]`. Missing, null, or any other shape is
+    /// nil, so a step without the field still decodes and the log stays plain.
+    private static func decodeInfoAnsi(_ container: KeyedDecodingContainer<CodingKeys>) -> [String]? {
+        guard container.contains(.infoAnsi) else { return nil }
+        if (try? container.decodeNil(forKey: .infoAnsi)) == true { return nil }
+        return try? container.decode([String].self, forKey: .infoAnsi)
     }
 
     private static func decodeOptions(_ container: KeyedDecodingContainer<CodingKeys>) -> [CreateOption] {

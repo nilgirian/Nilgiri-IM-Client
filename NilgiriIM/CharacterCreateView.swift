@@ -59,9 +59,10 @@ struct CharacterCreateView: View {
     private var detailsForm: some View {
         Form {
             Section("Character") {
-                TextField("Name", text: $session.createName)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
+                ClearableTextField(title: "Name", text: $session.createName) {
+                    session.createName = ""
+                    session.createEmail = ""
+                }
                 TextField("Email", text: $session.createEmail)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -120,15 +121,7 @@ struct CharacterCreateView: View {
                             Ansi.text(session.createGreeting ?? "", fontSize: fontSize, columns: creationColumns)
                                 .frame(maxWidth: .infinity, alignment: .topLeading)
                                 .padding(8)
-                            ForEach(Array(session.createLog.enumerated()), id: \.offset) { index, line in
-                                Text(verbatim: line.isEmpty ? " " : line)
-                                    .font(.system(size: fontSize, design: .monospaced))
-                                    .foregroundStyle(creationInk)
-                                    .multilineTextAlignment(.leading)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.horizontal, 8)
-                                    .id(createLogLineID(index))
-                            }
+                            creationSections(fontSize: fontSize)
                             Color.clear
                                 .frame(height: panelHeight + 12)
                                 .accessibilityHidden(true)
@@ -246,6 +239,48 @@ struct CharacterCreateView: View {
         }
     }
 
+    /// One block per creation step. The rule is chrome, drawn above the block.
+    /// The strings underneath are the server's lines, unchanged. `infoAnsi` is
+    /// one `Ansi.text` so colour carries across the lines of that section.
+    /// Without it, each line stays plain text, as before.
+    private func creationSections(fontSize: CGFloat) -> some View {
+        ForEach(Array(session.createLog.enumerated()), id: \.offset) { index, section in
+            VStack(alignment: .leading, spacing: 0) {
+                creationSectionRule
+                if let ansiLines = section.ansiLines, ansiLines.isEmpty == false {
+                    Ansi.text(
+                        ansiLines.joined(separator: "\n"),
+                        fontSize: fontSize,
+                        columns: creationColumns
+                    )
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, 8)
+                } else {
+                    ForEach(Array(section.lines.enumerated()), id: \.offset) { _, line in
+                        Text(verbatim: line.isEmpty ? " " : line)
+                            .font(.system(size: fontSize, design: .monospaced))
+                            .foregroundStyle(creationInk)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 8)
+                    }
+                }
+            }
+            .id(createLogLineID(index))
+        }
+    }
+
+    /// Divider-style rule on the black creation screen. Not part of the log text.
+    private var creationSectionRule: some View {
+        Divider()
+            .frame(maxWidth: .infinity, minHeight: 1, maxHeight: 1)
+            .background(Color(white: 0.45))
+            .padding(.horizontal, 8)
+            .padding(.top, 10)
+            .padding(.bottom, 6)
+            .accessibilityHidden(true)
+    }
+
     private func createLogLineID(_ index: Int) -> String {
         "create-log-\(index)"
     }
@@ -264,14 +299,18 @@ struct CharacterCreateView: View {
             Text(step.passwordPrompt(fallbackEmail: session.createEmail))
                 .font(.headline)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            SecureField("Password", text: $passwordAnswer)
-                .focused($passwordFocused)
-                .textFieldStyle(.plain)
-                .padding(10)
-                .background(Color.black.opacity(0.35))
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .submitLabel(.next)
-                .onSubmit { submit(passwordAnswer) }
+            RevealableSecureField(
+                "Password",
+                text: $passwordAnswer,
+                textContentType: nil,
+                submitLabel: .next,
+                submitAction: { submit(passwordAnswer) },
+                focus: $passwordFocused
+            )
+            .textFieldStyle(.plain)
+            .padding(10)
+            .background(Color.black.opacity(0.35))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             if let error = step.error, error.isEmpty == false {
                 Text(error)
                     .foregroundStyle(.red)
