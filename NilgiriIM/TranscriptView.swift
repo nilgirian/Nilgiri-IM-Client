@@ -1255,8 +1255,11 @@ struct TranscriptView: View {
 }
 
 /// Command field. The keyboard is ASCII-only: the getter and setter both
-/// force `.asciiCapable`, and the emoji input mode is never returned, so
-/// nothing can put the emoji key back.
+/// force `.asciiCapable`, and an emoji input mode is never returned, so
+/// nothing can put the emoji key back. Traits are applied before the field
+/// becomes first responder. Reloading the input views, or substituting an
+/// input mode while UIKit's is still nil, cancels that presentation: the
+/// caret blinks and the software keyboard never appears.
 private struct AsciiCommandField: UIViewRepresentable {
     @Binding var text: String
     var isFocused: Binding<Bool>
@@ -1265,7 +1268,7 @@ private struct AsciiCommandField: UIViewRepresentable {
     func makeUIView(context: Context) -> CommandTextField {
         let field = CommandTextField()
         field.delegate = context.coordinator
-        field.lockASCII(reload: false)
+        field.lockASCII()
         field.font = UIFont.monospacedSystemFont(
             ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize,
             weight: .regular
@@ -1310,7 +1313,7 @@ private struct AsciiCommandField: UIViewRepresentable {
         context.coordinator.onSubmit = onSubmit
         context.coordinator.textChanged = { text = $0 }
         context.coordinator.focusChanged = { isFocused.wrappedValue = $0 }
-        field.lockASCII(reload: false)
+        field.lockASCII()
         if field.text != text {
             field.text = text
         }
@@ -1319,7 +1322,7 @@ private struct AsciiCommandField: UIViewRepresentable {
         context.coordinator.pendingFocus = focused
         DispatchQueue.main.async {
             context.coordinator.pendingFocus = nil
-            field.lockASCII(reload: focused)
+            field.lockASCII()
             if focused {
                 field.becomeFirstResponder()
             } else {
@@ -1341,7 +1344,7 @@ private struct AsciiCommandField: UIViewRepresentable {
         }
 
         func textFieldDidBeginEditing(_ textField: UITextField) {
-            (textField as? CommandTextField)?.lockASCII(reload: true)
+            (textField as? CommandTextField)?.lockASCII()
             focusChanged(true)
         }
 
@@ -1365,22 +1368,21 @@ private final class CommandTextField: UITextField {
             guard lockingKeyboard == false else { return }
             lockingKeyboard = true
             super.keyboardType = .asciiCapable
-            if isFirstResponder {
-                reloadInputViews()
-            }
             lockingKeyboard = false
         }
     }
 
-    /// A switch onto the emoji keyboard would put the emoji key back.
+    /// Refuse emoji only after UIKit has chosen a mode. Returning some other
+    /// mode while `super` is nil — which it is until the keyboard is up —
+    /// makes UIKit drop the keyboard. The field is still first responder,
+    /// so the caret blinks and the keyboard never appears.
     override var textInputMode: UITextInputMode? {
-        if let mode = super.textInputMode, mode.primaryLanguage != "emoji" {
-            return mode
-        }
+        guard let mode = super.textInputMode else { return nil }
+        guard mode.primaryLanguage == "emoji" else { return mode }
         return UITextInputMode.activeInputModes.first { $0.primaryLanguage != "emoji" }
     }
 
-    func lockASCII(reload: Bool) {
+    func lockASCII() {
         super.keyboardType = .asciiCapable
         autocorrectionType = .no
         spellCheckingType = .no
@@ -1391,16 +1393,11 @@ private final class CommandTextField: UITextField {
         textContentType = nil
         inputAssistantItem.leadingBarButtonGroups = []
         inputAssistantItem.trailingBarButtonGroups = []
-        if reload, isFirstResponder {
-            reloadInputViews()
-        }
     }
 
     override func becomeFirstResponder() -> Bool {
-        lockASCII(reload: false)
-        let accepted = super.becomeFirstResponder()
-        lockASCII(reload: true)
-        return accepted
+        lockASCII()
+        return super.becomeFirstResponder()
     }
 }
 
