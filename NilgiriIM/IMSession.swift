@@ -216,7 +216,7 @@ final class IMSession: ObservableObject {
             // since already inserted the divider. Login reattaches; it must not clear it.
             await autoPasswordLogin()
         case .rejected:
-            await handleRejectedSession(thenLogin: true)
+            _ = await handleRejectedSession(thenLogin: true)
         }
     }
 
@@ -627,7 +627,7 @@ final class IMSession: ObservableObject {
             await autoPasswordLogin()
         case .rejected:
             stopLive()
-            await handleRejectedSession(thenLogin: true)
+            _ = await handleRejectedSession(thenLogin: true)
         }
     }
 

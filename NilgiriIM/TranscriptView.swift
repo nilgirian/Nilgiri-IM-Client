@@ -400,31 +400,57 @@ private struct TranscriptText: UIViewRepresentable {
 
     /// The slot SwiftUI offered. Returning the text's own width here is what
     /// let the log grow past the screen; the measured height is only used when
-    /// the parent has not already fixed one.
+    /// the parent has not already fixed one. A scroll frame already has that
+    /// height, and measuring again lays out every glyph.
     func sizeThatFits(
         _ proposal: ProposedViewSize,
         uiView: TranscriptTextView,
         context: Context
     ) -> CGSize? {
-        guard let width = proposal.width, width > 1, width < .greatestFiniteMagnitude else {
+        guard let proposedWidth = proposal.width, proposedWidth > 1,
+              proposedWidth < .greatestFiniteMagnitude else {
             return CGSize(width: 0, height: 1)
         }
-        if let height = proposal.height, height > 0, height < .greatestFiniteMagnitude {
-            return CGSize(width: width, height: height)
+        if let proposedHeight = proposal.height, proposedHeight > 0,
+           proposedHeight < .greatestFiniteMagnitude {
+            return CGSize(width: proposedWidth, height: proposedHeight)
+        }
+        let coordinator = context.coordinator
+        if coordinator.measuredGeneration == generation,
+           abs(coordinator.measuredWidth - proposedWidth) < 0.5 {
+            return CGSize(width: proposedWidth, height: coordinator.measuredHeight)
+        }
+        // The text for this generation is not in the view yet, or `updateUIView`
+        // is already measuring. Another `sizeThatFits` here would nest.
+        guard coordinator.measuring == false, coordinator.generation == generation else {
+            return CGSize(width: proposedWidth, height: max(coordinator.measuredHeight, 1))
         }
         let fitted = uiView.sizeThatFits(
-            CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+            CGSize(width: proposedWidth, height: CGFloat.greatestFiniteMagnitude)
         )
-        return CGSize(width: width, height: max(fitted.height, 1))
+        let height = max(fitted.height, 1)
+        coordinator.measuredGeneration = generation
+        coordinator.measuredWidth = proposedWidth
+        coordinator.measuredHeight = height
+        return CGSize(width: proposedWidth, height: height)
     }
 
     func updateUIView(_ textView: TranscriptTextView, context: Context) {
         guard width > 1 else { return }
         let coordinator = context.coordinator
-        let same = coordinator.generation == generation && abs(coordinator.width - width) < 0.5
-        guard same == false else { return }
         textView.delegate = coordinator
-        if coordinator.generation != generation {
+        // Document generation is the version. The text view copies on assign,
+        // so compare the source object, not `textView.attributedText`. An empty
+        // view with a live document is a recycled text view and still needs it.
+        let missingText = attributed.length > 0 && (textView.attributedText?.length ?? 0) == 0
+        let contentChanged = coordinator.generation != generation
+            || coordinator.source !== attributed
+            || missingText
+        let widthChanged = abs(coordinator.width - width) >= 0.5
+        guard contentChanged || widthChanged else { return }
+        coordinator.measuring = true
+        defer { coordinator.measuring = false }
+        if contentChanged {
             let previous = textView.attributedText?.string ?? ""
             let next = attributed.string
             let shared = previous.commonPrefix(with: next).utf16.count
@@ -433,12 +459,16 @@ private struct TranscriptText: UIViewRepresentable {
             if range.length > 0, range.location + range.length <= shared {
                 textView.selectedRange = range
             }
+            coordinator.source = attributed
             coordinator.generation = generation
         }
         textView.isScrollEnabled = false
         textView.panGestureRecognizer.isEnabled = false
         coordinator.width = width
         let metrics = Self.measure(textView, markers: markers, width: width)
+        coordinator.measuredGeneration = generation
+        coordinator.measuredWidth = width
+        coordinator.measuredHeight = metrics.height
         let report = onMetrics
         DispatchQueue.main.async {
             report(metrics.height, metrics.anchors)
@@ -450,18 +480,43 @@ private struct TranscriptText: UIViewRepresentable {
     final class Coordinator: NSObject, UITextViewDelegate {
         var generation = -1
         var width: CGFloat = -1
+        /// Source string last assigned. Not the copy `UITextView` stores.
+        var source: NSAttributedString?
+        var measuredGeneration = Int.min
+        var measuredWidth: CGFloat = -1
+        var measuredHeight: CGFloat = 1
+        /// Set while `updateUIView` is assigning text or measuring, so
+        /// `sizeThatFits` does not start a second layout.
+        var measuring = false
 
+        /// Tap on a link. The deployment target is iOS 17, so this replaces
+        /// `textView(_:shouldInteractWith:in:interaction:)`. A target below 17
+        /// would open the URL for `.invokeDefaultAction` and return true so
+        /// the preview and action menu still appear.
         func textView(
-            _ textView: UITextView,
-            shouldInteractWith URL: URL,
-            in characterRange: NSRange,
-            interaction: UITextItemInteraction
-        ) -> Bool {
-            if interaction == .invokeDefaultAction {
-                UIApplication.shared.open(URL)
-                return false
+            _: UITextView,
+            primaryActionFor textItem: UITextItem,
+            defaultAction: UIAction
+        ) -> UIAction? {
+            guard case .link(let url) = textItem.content else {
+                return defaultAction
             }
-            return true
+            return UIAction(title: defaultAction.title) { _ in
+                UIApplication.shared.open(url)
+            }
+        }
+
+        /// Long-press menu for a link. The system menu is kept, so Open,
+        /// Copy, and Share stay, and a selection across lines is untouched.
+        func textView(
+            _: UITextView,
+            menuConfigurationFor _: UITextItem,
+            defaultMenu: UIMenu
+        ) -> UITextItem.MenuConfiguration? {
+            UITextItem.MenuConfiguration(
+                preview: UITextItem.MenuConfiguration.Preview.`default`,
+                menu: defaultMenu
+            )
         }
     }
 
@@ -1629,64 +1684,108 @@ private struct TranscriptBottomAnchor: ViewModifier {
     }
 }
 
-/// Container size and the bottom content inset, plus how far the viewport sits
-/// above the end of the text. The inset is only a change signal. The correction
-/// scroll runs later, against the settled layout, and never reuses this inset.
-private struct TranscriptScrollSample: Equatable {
-    var width: CGFloat
-    var height: CGFloat
-    var bottomInset: CGFloat
-    var distanceFromBottom: CGFloat
-    var contentHeight: CGFloat
-    var visibleMinY: CGFloat
+/// Point-sized container. The scroll offset is not in here: publishing it
+/// made `onScrollGeometryChange` fire on every frame.
+private struct TranscriptContainerTick: Equatable {
+    var width: Int
+    var height: Int
+    var bottomInset: Int
+}
+
+/// Previous geometry for the at-bottom Bool. A class so remembering it does
+/// not publish a view update. The transform can run twice for one geometry;
+/// the last inputs are replayed instead of applying a growth twice.
+private final class BottomFollowMemory {
+    private var primed = false
+    private var contentHeight: CGFloat = 0
+    private var visibleMinY: CGFloat = 0
+    private var atBottom = true
+    private var seenContent: CGFloat = 0
+    private var seenVisible: CGFloat = 0
+    private var seenDistance: CGFloat = 0
+    private var seenHolding = false
+
+    func derive(
+        contentHeight: CGFloat,
+        visibleMinY: CGFloat,
+        distance: CGFloat,
+        holding: Bool
+    ) -> Bool {
+        if primed,
+           contentHeight == seenContent,
+           visibleMinY == seenVisible,
+           distance == seenDistance,
+           holding == seenHolding {
+            return atBottom
+        }
+        let grew = primed && contentHeight > self.contentHeight + 0.5
+        let stayed = primed && abs(visibleMinY - self.visibleMinY) < 1
+        let next: Bool
+        if holding || (grew && stayed && atBottom) {
+            next = true
+        } else {
+            next = distance <= nearBottomSlack
+        }
+        primed = true
+        self.contentHeight = contentHeight
+        self.visibleMinY = visibleMinY
+        self.atBottom = next
+        seenContent = contentHeight
+        seenVisible = visibleMinY
+        seenDistance = distance
+        seenHolding = holding
+        return next
+    }
 }
 
 /// iOS 18: remember whether the reader was near the bottom, and re-anchor when
-/// the scroll container or its bottom inset changes. iOS 17 uses the container
-/// size and the bottom marker instead.
+/// the scroll container or its bottom inset changes. The at-bottom value is a
+/// Bool, so a drag that stays on the same side of the slack does not write
+/// state or rebuild the text view. iOS 17 uses the container size and the
+/// bottom marker instead.
 private struct TranscriptResizeStick: ViewModifier {
     @Binding var nearBottom: Bool
     var revealPending: Bool
     var holdBottomUntil: Date
     var reanchor: () -> Void
+    @State private var follow = BottomFollowMemory()
 
     func body(content: Content) -> some View {
         if #available(iOS 18.0, *) {
-            content.onScrollGeometryChange(for: TranscriptScrollSample.self) { geo in
-                TranscriptScrollSample(
-                    width: geo.containerSize.width,
-                    height: geo.containerSize.height,
-                    bottomInset: geo.contentInsets.bottom,
-                    distanceFromBottom: geo.contentSize.height - geo.visibleRect.maxY,
-                    contentHeight: geo.contentSize.height,
-                    visibleMinY: geo.visibleRect.minY
-                )
-            } action: { old, new in
-                guard revealPending == false else { return }
-                let containerChanged = abs(old.width - new.width) > 0.5
-                    || abs(old.height - new.height) > 0.5
-                    || abs(old.bottomInset - new.bottomInset) > 0.5
-                if containerChanged {
-                    let wasNear = old.distanceFromBottom <= nearBottomSlack || nearBottom
-                    guard wasNear else { return }
-                    nearBottom = true
-                    reanchor()
-                } else if Date() >= holdBottomUntil {
-                    // A burst of lines grows the content under a reader who has
-                    // not moved. That is still the bottom, so the next line can
-                    // follow. A real scroll changes the visible origin.
-                    let contentGrew = new.contentHeight > old.contentHeight + 0.5
-                    let stayedPut = abs(new.visibleMinY - old.visibleMinY) < 1
-                    let wasAtBottom = nearBottom || old.distanceFromBottom <= nearBottomSlack
-                    if contentGrew, stayedPut, wasAtBottom {
-                        nearBottom = true
-                    } else {
-                        nearBottom = new.distanceFromBottom <= nearBottomSlack
-                    }
-                }
-            }
+            followScroll(content)
         } else {
             content
         }
+    }
+
+    @available(iOS 18.0, *)
+    private func followScroll(_ content: Content) -> some View {
+        content
+            .onScrollGeometryChange(for: Bool.self) { geo in
+                follow.derive(
+                    contentHeight: geo.contentSize.height,
+                    visibleMinY: geo.visibleRect.minY,
+                    distance: geo.contentSize.height - geo.visibleRect.maxY,
+                    holding: Date() < holdBottomUntil
+                )
+            } action: { _, atBottom in
+                guard revealPending == false else { return }
+                if nearBottom != atBottom {
+                    nearBottom = atBottom
+                }
+            }
+            .onScrollGeometryChange(for: TranscriptContainerTick.self) { geo in
+                TranscriptContainerTick(
+                    width: Int(geo.containerSize.width.rounded()),
+                    height: Int(geo.containerSize.height.rounded()),
+                    bottomInset: Int(geo.contentInsets.bottom.rounded())
+                )
+            } action: { old, new in
+                guard revealPending == false else { return }
+                guard old.width > 1, old.height > 1 else { return }
+                guard new.width > 1, new.height > 1 else { return }
+                guard nearBottom else { return }
+                reanchor()
+            }
     }
 }
