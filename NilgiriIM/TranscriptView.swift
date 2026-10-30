@@ -815,16 +815,23 @@ struct TranscriptView: View {
                     .font(.system(.body, design: .monospaced))
                     .foregroundStyle(ink)
                     .padding(.trailing, 8)
-                AsciiCommandField(
-                    text: $session.command,
-                    isFocused: Binding(
-                        get: { commandFocused },
-                        set: { commandFocused = $0 }
-                    ),
-                    onSubmit: { Task { await sendCommand() } }
-                )
-                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                .padding(.trailing, 16)
+                // Stock field. The UIKit subclass overrode textInputMode and
+                // called becomeFirstResponder from updateUIView; the caret
+                // blinked, but the keyboard session never attached. One line
+                // tall, same as the Say/Send targets, so the bar does not
+                // take the height proposed to this safe-area inset.
+                TextField("command", text: $session.command)
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(ink)
+                    .textFieldStyle(.plain)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.asciiCapable)
+                    .submitLabel(.send)
+                    .focused($commandFocused)
+                    .onSubmit { Task { await sendCommand() } }
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .padding(.trailing, 16)
                 commandIcon("bubble.left.fill", label: "Say") {
                     Task { await sendSay() }
                 }
@@ -1252,153 +1259,6 @@ struct TranscriptView: View {
         .accessibilityLabel(label)
     }
 
-}
-
-/// Command field. The keyboard is ASCII-only: the getter and setter both
-/// force `.asciiCapable`, and an emoji input mode is never returned, so
-/// nothing can put the emoji key back. Traits are applied before the field
-/// becomes first responder. Reloading the input views, or substituting an
-/// input mode while UIKit's is still nil, cancels that presentation: the
-/// caret blinks and the software keyboard never appears.
-private struct AsciiCommandField: UIViewRepresentable {
-    @Binding var text: String
-    var isFocused: Binding<Bool>
-    var onSubmit: () -> Void
-
-    func makeUIView(context: Context) -> CommandTextField {
-        let field = CommandTextField()
-        field.delegate = context.coordinator
-        field.lockASCII()
-        field.font = UIFont.monospacedSystemFont(
-            ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize,
-            weight: .regular
-        )
-        field.textColor = UIColor(white: 0.78, alpha: 1)
-        field.tintColor = field.textColor
-        field.backgroundColor = .clear
-        field.borderStyle = .none
-        field.returnKeyType = .send
-        field.keyboardAppearance = .dark
-        field.attributedPlaceholder = NSAttributedString(
-            string: "command",
-            attributes: [.foregroundColor: UIColor(white: 0.78, alpha: 0.45)]
-        )
-        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        field.setContentHuggingPriority(.required, for: .vertical)
-        field.setContentCompressionResistancePriority(.required, for: .vertical)
-        field.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
-        return field
-    }
-
-    /// One line tall. A proposed height is the whole screen (the bar sits in a
-    /// safe-area inset); taking it centres the prompt in a full-height bar.
-    func sizeThatFits(
-        _ proposal: ProposedViewSize,
-        uiView: CommandTextField,
-        context: Context
-    ) -> CGSize? {
-        let intrinsicHeight = uiView.intrinsicContentSize.height
-        let line = (intrinsicHeight > 1 && intrinsicHeight < 120) ? intrinsicHeight : 44
-        let width: CGFloat
-        if let proposed = proposal.width, proposed > 0, proposed < .greatestFiniteMagnitude {
-            width = proposed
-        } else {
-            width = 0
-        }
-        return CGSize(width: width, height: line)
-    }
-
-    func updateUIView(_ field: CommandTextField, context: Context) {
-        context.coordinator.onSubmit = onSubmit
-        context.coordinator.textChanged = { text = $0 }
-        context.coordinator.focusChanged = { isFocused.wrappedValue = $0 }
-        field.lockASCII()
-        if field.text != text {
-            field.text = text
-        }
-        let focused = isFocused.wrappedValue
-        guard focused != field.isFirstResponder, context.coordinator.pendingFocus != focused else { return }
-        context.coordinator.pendingFocus = focused
-        DispatchQueue.main.async {
-            context.coordinator.pendingFocus = nil
-            field.lockASCII()
-            if focused {
-                field.becomeFirstResponder()
-            } else {
-                field.resignFirstResponder()
-            }
-        }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    final class Coordinator: NSObject, UITextFieldDelegate {
-        var onSubmit: () -> Void = {}
-        var textChanged: (String) -> Void = { _ in }
-        var focusChanged: (Bool) -> Void = { _ in }
-        var pendingFocus: Bool?
-
-        @objc func editingChanged(_ field: UITextField) {
-            textChanged(field.text ?? "")
-        }
-
-        func textFieldDidBeginEditing(_ textField: UITextField) {
-            (textField as? CommandTextField)?.lockASCII()
-            focusChanged(true)
-        }
-
-        func textFieldDidEndEditing(_ textField: UITextField) {
-            focusChanged(false)
-        }
-
-        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
-            onSubmit()
-            return true
-        }
-    }
-}
-
-private final class CommandTextField: UITextField {
-    private var lockingKeyboard = false
-
-    override var keyboardType: UIKeyboardType {
-        get { .asciiCapable }
-        set {
-            guard lockingKeyboard == false else { return }
-            lockingKeyboard = true
-            super.keyboardType = .asciiCapable
-            lockingKeyboard = false
-        }
-    }
-
-    /// Refuse emoji only after UIKit has chosen a mode. Returning some other
-    /// mode while `super` is nil — which it is until the keyboard is up —
-    /// makes UIKit drop the keyboard. The field is still first responder,
-    /// so the caret blinks and the keyboard never appears.
-    override var textInputMode: UITextInputMode? {
-        guard let mode = super.textInputMode else { return nil }
-        guard mode.primaryLanguage == "emoji" else { return mode }
-        return UITextInputMode.activeInputModes.first { $0.primaryLanguage != "emoji" }
-    }
-
-    func lockASCII() {
-        super.keyboardType = .asciiCapable
-        autocorrectionType = .no
-        spellCheckingType = .no
-        autocapitalizationType = .none
-        smartQuotesType = .no
-        smartDashesType = .no
-        smartInsertDeleteType = .no
-        textContentType = nil
-        inputAssistantItem.leadingBarButtonGroups = []
-        inputAssistantItem.trailingBarButtonGroups = []
-    }
-
-    override func becomeFirstResponder() -> Bool {
-        lockASCII()
-        return super.becomeFirstResponder()
-    }
 }
 
 /// Welcome menu, in the input bar's place. Enter sends `1`. Quit sends `0`
