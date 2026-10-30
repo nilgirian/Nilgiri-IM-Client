@@ -1359,11 +1359,9 @@ private struct GameMenuPanel: View {
     @State private var confirmPassword = ""
     @State private var passwordError: String?
     @State private var passwordBusy = false
-    @FocusState private var passwordField: PasswordField?
-
-    private enum PasswordField: Hashable {
-        case current, new, confirm
-    }
+    @FocusState private var currentPasswordFocused: Bool
+    @FocusState private var newPasswordFocused: Bool
+    @FocusState private var confirmPasswordFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1387,7 +1385,7 @@ private struct GameMenuPanel: View {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button("Done") {
-                        passwordField = nil
+                        resignPasswordFocus()
                     }
                 }
             }
@@ -1425,20 +1423,39 @@ private struct GameMenuPanel: View {
         .disabled(session.menuBusy)
     }
 
-    /// Current, new, and confirm. The server sentence is shown unchanged.
+    /// Current, new, and confirm. Each row reuses `RevealableSecureField`
+    /// (eye / eye.slash). The server sentence is shown unchanged.
     /// 400, 409, 502, and 504 are short messages from the session.
     private var passwordDialog: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Change password")
                 .font(.headline)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            secureLine("Current password", text: $currentPassword, field: .current, contentType: .password) {
-                passwordField = .new
+            secureLine(
+                "Current password",
+                text: $currentPassword,
+                contentType: .password,
+                submitLabel: .next,
+                focus: $currentPasswordFocused
+            ) {
+                newPasswordFocused = true
             }
-            secureLine("New password", text: $newPassword, field: .new, contentType: .newPassword) {
-                passwordField = .confirm
+            secureLine(
+                "New password",
+                text: $newPassword,
+                contentType: .newPassword,
+                submitLabel: .next,
+                focus: $newPasswordFocused
+            ) {
+                confirmPasswordFocused = true
             }
-            secureLine("Confirm new password", text: $confirmPassword, field: .confirm, contentType: .newPassword) {
+            secureLine(
+                "Confirm new password",
+                text: $confirmPassword,
+                contentType: .newPassword,
+                submitLabel: .done,
+                focus: $confirmPasswordFocused
+            ) {
                 Task { await submitPassword() }
             }
             if let passwordError, passwordError.isEmpty == false {
@@ -1472,20 +1489,29 @@ private struct GameMenuPanel: View {
     private func secureLine(
         _ title: String,
         text: Binding<String>,
-        field: PasswordField,
         contentType: UITextContentType,
+        submitLabel: SubmitLabel,
+        focus: FocusState<Bool>.Binding,
         onSubmit: @escaping () -> Void
     ) -> some View {
-        SecureField(title, text: text)
-            .focused($passwordField, equals: field)
-            .textContentType(contentType)
-            .textFieldStyle(.plain)
-            .privacySensitive()
-            .padding(10)
-            .background(Color.black.opacity(0.35))
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .submitLabel(field == .confirm ? .done : .next)
-            .onSubmit(onSubmit)
+        RevealableSecureField(
+            title,
+            text: text,
+            textContentType: contentType,
+            submitLabel: submitLabel,
+            submitAction: onSubmit,
+            focus: focus
+        )
+        .textFieldStyle(.plain)
+        .padding(10)
+        .background(Color.black.opacity(0.35))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func resignPasswordFocus() {
+        currentPasswordFocused = false
+        newPasswordFocused = false
+        confirmPasswordFocused = false
     }
 
     private func submitPassword() async {
@@ -1515,7 +1541,7 @@ private struct GameMenuPanel: View {
         newPassword = ""
         confirmPassword = ""
         passwordError = nil
-        passwordField = nil
+        resignPasswordFocus()
     }
 }
 
