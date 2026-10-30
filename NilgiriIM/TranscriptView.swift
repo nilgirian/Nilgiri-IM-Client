@@ -354,13 +354,32 @@ private final class TranscriptTextView: UITextView {
         layoutManager.allowsNonContiguousLayout = false
         textDragInteraction?.isEnabled = false
         panGestureRecognizer.isEnabled = false
+        // Scrolling is off so this view publishes an intrinsic size. The width
+        // half of that is the unwrapped line, which is wider than the phone
+        // and pulls the whole log out of alignment. Width comes from SwiftUI.
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        setContentHuggingPriority(.defaultHigh, for: .vertical)
     }
 
     required init?(coder: NSCoder) {
         return nil
     }
 
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: UIView.noIntrinsicMetric)
+    }
+
     override func layoutSubviews() {
+        // A zero-width container does not follow the screen. Seed it from the
+        // bounds once; `measure` owns the width after that, and a bounds read
+        // here can still be the previous pass.
+        let width = bounds.width
+        if width > 1, textContainer.size.width < 1 {
+            textContainer.widthTracksTextView = false
+            textContainer.size = CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+        }
         super.layoutSubviews()
         if panGestureRecognizer.isEnabled {
             panGestureRecognizer.isEnabled = false
@@ -376,10 +395,27 @@ private struct TranscriptText: UIViewRepresentable {
     var onMetrics: (CGFloat, [LineAnchor]) -> Void
 
     func makeUIView(context: Context) -> TranscriptTextView {
-        let view = TranscriptTextView(frame: .zero, textContainer: nil)
-        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        view.setContentHuggingPriority(.required, for: .vertical)
-        return view
+        TranscriptTextView(frame: .zero, textContainer: nil)
+    }
+
+    /// The slot SwiftUI offered. Returning the text's own width here is what
+    /// let the log grow past the screen; the measured height is only used when
+    /// the parent has not already fixed one.
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: TranscriptTextView,
+        context: Context
+    ) -> CGSize? {
+        guard let width = proposal.width, width > 1, width < .greatestFiniteMagnitude else {
+            return CGSize(width: 0, height: 1)
+        }
+        if let height = proposal.height, height > 0, height < .greatestFiniteMagnitude {
+            return CGSize(width: width, height: height)
+        }
+        let fitted = uiView.sizeThatFits(
+            CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+        )
+        return CGSize(width: width, height: max(fitted.height, 1))
     }
 
     func updateUIView(_ textView: TranscriptTextView, context: Context) {
@@ -1246,8 +1282,28 @@ private struct AsciiCommandField: UIViewRepresentable {
         )
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentHuggingPriority(.required, for: .vertical)
+        field.setContentCompressionResistancePriority(.required, for: .vertical)
         field.addTarget(context.coordinator, action: #selector(Coordinator.editingChanged(_:)), for: .editingChanged)
         return field
+    }
+
+    /// One line tall. A proposed height is the whole screen (the bar sits in a
+    /// safe-area inset); taking it centres the prompt in a full-height bar.
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: CommandTextField,
+        context: Context
+    ) -> CGSize? {
+        let intrinsicHeight = uiView.intrinsicContentSize.height
+        let line = (intrinsicHeight > 1 && intrinsicHeight < 120) ? intrinsicHeight : 44
+        let width: CGFloat
+        if let proposed = proposal.width, proposed > 0, proposed < .greatestFiniteMagnitude {
+            width = proposed
+        } else {
+            width = 0
+        }
+        return CGSize(width: width, height: line)
     }
 
     func updateUIView(_ field: CommandTextField, context: Context) {
