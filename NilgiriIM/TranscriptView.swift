@@ -4,16 +4,11 @@ import UIKit
 private let terminalColumns = 80
 private let ink = Color(white: 0.78)
 private let screen = Color.black
-private let transcriptBottomID = "transcript-bottom"
-/// Above this, the transcript stays lazy and the ease walks in short hops.
-private let modestTranscriptCount = 600
 /// Still at the bottom if the latest text is within this distance of the viewport.
 private let nearBottomSlack: CGFloat = 80
 
-/// One bottom snap per runloop turn. The flag lives on a class so arming it
-/// does not publish another view update.
-private final class BottomSnapGate {
-    var queued = false
+private func transcriptFontSize(for width: CGFloat) -> CGFloat {
+    max(8, (width - 16) / CGFloat(terminalColumns) / 0.62)
 }
 
 /// SGR colour carried across transcript rows. Keyed by line id so a 4000-line
@@ -139,20 +134,17 @@ private struct DocMarker: Equatable {
     var separator: Bool
 }
 
-/// Scroll target for one transcript row, in the text view's coordinates.
-private struct LineAnchor: Identifiable, Equatable {
-    var id: String
-    var y: CGFloat
-    var height: CGFloat
-    var separatorMinX: CGFloat?
-    var separatorWidth: CGFloat?
-    var separatorMidY: CGFloat?
+/// How to update the text view's storage. `replaceFrom` is the first character
+/// that changed; everything before it is kept so an append does not replace
+/// the whole log.
+private struct TranscriptEdit {
+    var replaceFrom: Int
+    var text: NSAttributedString
 }
 
 /// One attributed transcript. A scroll frame that does not change the lines
 /// or the font does not rebuild it. Appending lines keeps the prefix.
 private final class TranscriptDocumentStore {
-    private(set) var generation = 0
     private(set) var attributed = NSAttributedString()
     private(set) var markers: [DocMarker] = []
 
@@ -183,10 +175,10 @@ private final class TranscriptDocumentStore {
         return style
     }()
 
-    func update(lines: [LineDTO], fontSize: CGFloat, carry: ColourCarryCache) {
+    func update(lines: [LineDTO], fontSize: CGFloat, carry: ColourCarryCache) -> TranscriptEdit? {
         carry.prepare(lines)
         if sameStorage(lines, held), abs(self.fontSize - fontSize) < 0.01 {
-            return
+            return nil
         }
         let fontChanged = abs(self.fontSize - fontSize) >= 0.01
         let signatures = lines.map(signature)
@@ -199,8 +191,16 @@ private final class TranscriptDocumentStore {
             }
             if index == lines.count, index == ids.count {
                 held = lines
-                return
+                return nil
             }
+        }
+        let cut: Int
+        if index == 0 || markers.isEmpty {
+            cut = 0
+        } else if index < markers.count {
+            cut = markers[index].location
+        } else {
+            cut = working.length
         }
         rebuild(
             lines,
@@ -211,6 +211,13 @@ private final class TranscriptDocumentStore {
             lineIDs: lineIDs
         )
         held = lines
+        let text: NSAttributedString
+        if cut <= 0 || cut >= working.length {
+            text = cut <= 0 ? attributed : NSAttributedString()
+        } else {
+            text = working.attributedSubstring(from: NSRange(location: cut, length: working.length - cut))
+        }
+        return TranscriptEdit(replaceFrom: max(0, cut), text: text)
     }
 
     private func signature(_ line: LineDTO) -> Int {
@@ -264,7 +271,6 @@ private final class TranscriptDocumentStore {
             }
         }
         attributed = NSAttributedString(attributedString: working)
-        generation &+= 1
     }
 
     private func append(_ line: LineDTO, fontSize: CGFloat, carry: ColourCarryCache) {
@@ -318,31 +324,82 @@ private final class TranscriptDocumentStore {
     }
 }
 
-/// Read-only transcript. Scrolling belongs to the SwiftUI scroll view; a long
-/// press selects across lines. The pan is off so a drag still scrolls.
+/// Rules beside a disconnect stamp. Drawn with the glyphs, so they scroll with
+/// the text and are not a second SwiftUI layout pass.
+private final class TranscriptLayoutManager: NSLayoutManager {
+    var separatorRanges: [NSRange] = []
+    private var drawingRules = false
+
+    override func drawGlyphs(forGlyphRange glyphsToShow: NSRange, at origin: CGPoint) {
+        super.drawGlyphs(forGlyphRange: glyphsToShow, at: origin)
+        guard drawingRules == false, separatorRanges.isEmpty == false else { return }
+        guard let container = textContainers.first, container.size.width > 1 else { return }
+        drawingRules = true
+        defer { drawingRules = false }
+        let width = container.size.width
+        let path = UIBezierPath()
+        for range in separatorRanges where range.length > 0 {
+            let glyphs = glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+            guard NSIntersectionRange(glyphs, glyphsToShow).length > 0 else { continue }
+            let rect = boundingRect(forGlyphRange: glyphs, in: container)
+            guard rect.width > 0, rect.height > 0 else { continue }
+            let y = origin.y + rect.midY
+            let minX = origin.x + rect.minX
+            let maxX = origin.x + rect.maxX
+            let leftEnd = minX - 8
+            if leftEnd > origin.x {
+                path.move(to: CGPoint(x: origin.x, y: y))
+                path.addLine(to: CGPoint(x: leftEnd, y: y))
+            }
+            let rightStart = maxX + 8
+            let rightEnd = origin.x + width
+            if rightEnd > rightStart {
+                path.move(to: CGPoint(x: rightStart, y: y))
+                path.addLine(to: CGPoint(x: rightEnd, y: y))
+            }
+        }
+        guard path.isEmpty == false else { return }
+        UIColor.secondaryLabel.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+}
+
+/// The transcript is this text view. It scrolls itself. A SwiftUI scroll view
+/// around it was rewriting state on every frame.
 private final class TranscriptTextView: UITextView {
+    var onStructuralLayout: (() -> Void)?
+    private var laidWidth: CGFloat = -1
+    private var laidContentHeight: CGFloat = -1
+
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         let storage = NSTextStorage()
-        let manager = NSLayoutManager()
+        let manager = TranscriptLayoutManager()
         storage.addLayoutManager(manager)
         let container = NSTextContainer(size: CGSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
-        container.widthTracksTextView = false
+        container.widthTracksTextView = true
+        container.heightTracksTextView = false
         container.lineFragmentPadding = 0
         container.lineBreakMode = .byClipping
         manager.addTextContainer(container)
+        manager.allowsNonContiguousLayout = true
         super.init(frame: frame, textContainer: container)
         isEditable = false
         isSelectable = true
-        isScrollEnabled = false
+        isScrollEnabled = true
+        alwaysBounceVertical = true
+        isDirectionalLockEnabled = true
         backgroundColor = .clear
-        textContainerInset = .zero
+        textContainerInset = UIEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
         dataDetectorTypes = []
-        showsVerticalScrollIndicator = false
+        showsVerticalScrollIndicator = true
         showsHorizontalScrollIndicator = false
+        // The column above the input bar already shortens when the keyboard
+        // shows. Tracking the keyboard inset as well changes it every frame.
         contentInsetAdjustmentBehavior = .never
         automaticallyAdjustsScrollIndicatorInsets = false
         insetsLayoutMarginsFromSafeArea = false
-        clipsToBounds = false
+        clipsToBounds = true
         tintColor = UIColor(white: 0.78, alpha: 1)
         overrideUserInterfaceStyle = .dark
         let link = UIColor(red: 0.55, green: 0.82, blue: 1, alpha: 1)
@@ -351,16 +408,12 @@ private final class TranscriptTextView: UITextView {
             .underlineStyle: NSUnderlineStyle.single.rawValue,
             .underlineColor: link
         ]
-        layoutManager.allowsNonContiguousLayout = false
         textDragInteraction?.isEnabled = false
-        panGestureRecognizer.isEnabled = false
-        // Scrolling is off so this view publishes an intrinsic size. The width
-        // half of that is the unwrapped line, which is wider than the phone
-        // and pulls the whole log out of alignment. Width comes from SwiftUI.
+        // #74: the unwrapped line must not become this view's width.
         setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         setContentHuggingPriority(.defaultLow, for: .horizontal)
-        setContentHuggingPriority(.defaultHigh, for: .vertical)
+        setContentHuggingPriority(.defaultLow, for: .vertical)
     }
 
     required init?(coder: NSCoder) {
@@ -371,128 +424,443 @@ private final class TranscriptTextView: UITextView {
         CGSize(width: UIView.noIntrinsicMetric, height: UIView.noIntrinsicMetric)
     }
 
-    override func layoutSubviews() {
-        // A zero-width container does not follow the screen. Seed it from the
-        // bounds once; `measure` owns the width after that, and a bounds read
-        // here can still be the previous pass.
-        let width = bounds.width
-        if width > 1, textContainer.size.width < 1 {
-            textContainer.widthTracksTextView = false
-            textContainer.size = CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+    /// The slot that was offered. The text's own size is the unwrapped line.
+    override func sizeThatFits(_ size: CGSize) -> CGSize {
+        if size.width > 1, size.height > 1,
+           size.width < .greatestFiniteMagnitude, size.height < .greatestFiniteMagnitude {
+            return size
         }
+        return bounds.size
+    }
+
+    var rules: TranscriptLayoutManager? {
+        layoutManager as? TranscriptLayoutManager
+    }
+
+    override func layoutSubviews() {
         super.layoutSubviews()
-        if panGestureRecognizer.isEnabled {
-            panGestureRecognizer.isEnabled = false
+        // Keyboard animation changes the height every frame. That is not a
+        // reason to measure or publish. Width and the text's own height are.
+        var structural = false
+        let width = bounds.width
+        let contentHeight = contentSize.height
+        if width > 1, abs(width - laidWidth) >= 0.5 {
+            laidWidth = width
+            // #74: the container is the slot, not the unwrapped line.
+            textContainer.size = CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+            structural = true
+        }
+        if abs(contentHeight - laidContentHeight) >= 0.5 {
+            laidContentHeight = contentHeight
+            structural = true
+        }
+        if structural {
+            onStructuralLayout?()
         }
     }
 }
 
-private struct TranscriptText: UIViewRepresentable {
-    var attributed: NSAttributedString
-    var generation: Int
-    var width: CGFloat
-    var markers: [DocMarker]
-    var onMetrics: (CGFloat, [LineAnchor]) -> Void
+/// SwiftUI sizes this host. The text view is pinned to its edges so a body
+/// refresh does not rebuild the scroller or throw away `contentOffset`.
+private final class TranscriptHost: UIView {
+    let textView = TranscriptTextView(frame: .zero, textContainer: nil)
 
-    func makeUIView(context: Context) -> TranscriptTextView {
-        TranscriptTextView(frame: .zero, textContainer: nil)
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        textView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(textView)
+        NSLayoutConstraint.activate([
+            textView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            textView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            textView.topAnchor.constraint(equalTo: topAnchor),
+            textView.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
     }
 
-    /// The slot SwiftUI offered. Returning the text's own width here is what
-    /// let the log grow past the screen; the measured height is only used when
-    /// the parent has not already fixed one. A scroll frame already has that
-    /// height, and measuring again lays out every glyph.
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    override func sizeThatFits(_ size: CGSize) -> CGSize {
+        if size.width > 1, size.height > 1,
+           size.width < .greatestFiniteMagnitude, size.height < .greatestFiniteMagnitude {
+            return size
+        }
+        return bounds.size
+    }
+}
+
+private struct TranscriptLog: UIViewRepresentable {
+    var lines: [LineDTO]
+    var scrollToken: Int
+    var revealPending: Bool
+    var resumeSeparatorID: String?
+    var onNearBottom: (Bool) -> Void
+    var onRevealFinished: (String) -> Void
+
+    func makeUIView(context: Context) -> TranscriptHost {
+        let host = TranscriptHost(frame: .zero)
+        let view = host.textView
+        view.delegate = context.coordinator
+        context.coordinator.textView = view
+        view.onStructuralLayout = { [weak coordinator = context.coordinator] in
+            coordinator?.noteLayout()
+        }
+        return host
+    }
+
+    /// Width and height are the slot SwiftUI offered. Measuring the text here
+    /// is what made a scroll frame lay out every glyph.
     func sizeThatFits(
         _ proposal: ProposedViewSize,
-        uiView: TranscriptTextView,
+        uiView: TranscriptHost,
         context: Context
     ) -> CGSize? {
-        guard let proposedWidth = proposal.width, proposedWidth > 1,
-              proposedWidth < .greatestFiniteMagnitude else {
-            return CGSize(width: 0, height: 1)
+        guard let width = proposal.width, let height = proposal.height,
+              width > 1, height > 1,
+              width < .greatestFiniteMagnitude, height < .greatestFiniteMagnitude else {
+            let fallback = uiView.bounds.size
+            if fallback.width > 1, fallback.height > 1 {
+                return fallback
+            }
+            return CGSize(width: 0, height: 0)
         }
-        if let proposedHeight = proposal.height, proposedHeight > 0,
-           proposedHeight < .greatestFiniteMagnitude {
-            return CGSize(width: proposedWidth, height: proposedHeight)
-        }
-        let coordinator = context.coordinator
-        if coordinator.measuredGeneration == generation,
-           abs(coordinator.measuredWidth - proposedWidth) < 0.5 {
-            return CGSize(width: proposedWidth, height: coordinator.measuredHeight)
-        }
-        // The text for this generation is not in the view yet, or `updateUIView`
-        // is already measuring. Another `sizeThatFits` here would nest.
-        guard coordinator.measuring == false, coordinator.generation == generation else {
-            return CGSize(width: proposedWidth, height: max(coordinator.measuredHeight, 1))
-        }
-        let fitted = uiView.sizeThatFits(
-            CGSize(width: proposedWidth, height: CGFloat.greatestFiniteMagnitude)
-        )
-        let height = max(fitted.height, 1)
-        coordinator.measuredGeneration = generation
-        coordinator.measuredWidth = proposedWidth
-        coordinator.measuredHeight = height
-        return CGSize(width: proposedWidth, height: height)
+        return CGSize(width: width, height: height)
     }
 
-    func updateUIView(_ textView: TranscriptTextView, context: Context) {
-        guard width > 1 else { return }
+    func updateUIView(_ host: TranscriptHost, context: Context) {
+        let textView = host.textView
         let coordinator = context.coordinator
-        textView.delegate = coordinator
-        // Document generation is the version. The text view copies on assign,
-        // so compare the source object, not `textView.attributedText`. An empty
-        // view with a live document is a recycled text view and still needs it.
-        let missingText = attributed.length > 0 && (textView.attributedText?.length ?? 0) == 0
-        let contentChanged = coordinator.generation != generation
-            || coordinator.source !== attributed
-            || missingText
-        let widthChanged = abs(coordinator.width - width) >= 0.5
-        guard contentChanged || widthChanged else { return }
-        coordinator.measuring = true
-        defer { coordinator.measuring = false }
-        if contentChanged {
-            let previous = textView.attributedText?.string ?? ""
-            let next = attributed.string
-            let shared = previous.commonPrefix(with: next).utf16.count
-            let range = textView.selectedRange
-            textView.attributedText = attributed
-            if range.length > 0, range.location + range.length <= shared {
-                textView.selectedRange = range
-            }
-            coordinator.source = attributed
-            coordinator.generation = generation
+        let offset = textView.contentOffset
+        coordinator.textView = textView
+        coordinator.onNearBottom = onNearBottom
+        coordinator.onRevealFinished = onRevealFinished
+        coordinator.revealPending = revealPending
+        coordinator.resumeSeparatorID = resumeSeparatorID
+        coordinator.lines = lines
+        let requestedScroll = coordinator.scrollToken != scrollToken
+        if requestedScroll {
+            coordinator.scrollToken = scrollToken
+            coordinator.nearBottom = true
+            coordinator.stickToBottom = true
+            coordinator.holdUntil = Date().addingTimeInterval(0.25)
+            coordinator.scrollToBottom(animated: false)
         }
-        textView.isScrollEnabled = false
-        textView.panGestureRecognizer.isEnabled = false
-        coordinator.width = width
-        let metrics = Self.measure(textView, markers: markers, width: width)
-        coordinator.measuredGeneration = generation
-        coordinator.measuredWidth = width
-        coordinator.measuredHeight = metrics.height
-        let report = onMetrics
-        DispatchQueue.main.async {
-            report(metrics.height, metrics.anchors)
+        coordinator.applyIfPossible()
+        coordinator.syncReveal()
+        if requestedScroll == false, coordinator.stickToBottom == false, coordinator.revealing == false {
+            let deltaY = abs(textView.contentOffset.y - offset.y)
+            let deltaX = abs(textView.contentOffset.x - offset.x)
+            if deltaY > 1 || deltaX > 1 {
+                textView.setContentOffset(offset, animated: false)
+            }
         }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator: NSObject, UITextViewDelegate {
-        var generation = -1
-        var width: CGFloat = -1
-        /// Source string last assigned. Not the copy `UITextView` stores.
-        var source: NSAttributedString?
-        var measuredGeneration = Int.min
-        var measuredWidth: CGFloat = -1
-        var measuredHeight: CGFloat = 1
-        /// Set while `updateUIView` is assigning text or measuring, so
-        /// `sizeThatFits` does not start a second layout.
-        var measuring = false
+        weak var textView: TranscriptTextView?
+        let store = TranscriptDocumentStore()
+        let carry = ColourCarryCache()
+        var lines: [LineDTO] = []
+        var onNearBottom: (Bool) -> Void = { _ in }
+        var onRevealFinished: (String) -> Void = { _ in }
+        var revealPending = false
+        var resumeSeparatorID: String?
+        var nearBottom = true
+        var stickToBottom = true
+        var holdUntil = Date.distantPast
+        var scrollToken = 0
+        var programmatic = 0
+        var applying = false
+        var inLayout = false
+        var revealing = false
+        var startedRevealID: String?
+        var finishedRevealID: String?
+        var revealToken = 0
+        var deferredBottom = false
+        var publishGeneration = 0
+        var stickQueued = false
+        var lastOffsetY: CGFloat = 0
+        private var keyboardObserver: NSObjectProtocol?
 
-        /// Tap on a link. The deployment target is iOS 17, so this replaces
-        /// `textView(_:shouldInteractWith:in:interaction:)`. A target below 17
-        /// would open the URL for `.invokeDefaultAction` and return true so
-        /// the preview and action menu still appear.
+        override init() {
+            super.init()
+            keyboardObserver = NotificationCenter.default.addObserver(
+                forName: UIResponder.keyboardWillChangeFrameNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] note in
+                self?.keyboardWillChange(note)
+            }
+        }
+
+        deinit {
+            if let keyboardObserver {
+                NotificationCenter.default.removeObserver(keyboardObserver)
+            }
+        }
+
+        /// One follow-up after the keyboard animation, not one per frame.
+        /// The text view's height is the space above the input bar; the bar
+        /// moves with the keyboard safe area, so the text view does not also
+        /// track `contentInset` during the animation.
+        private func keyboardWillChange(_ note: Notification) {
+            guard stickToBottom, revealing == false, revealPending == false else { return }
+            let duration = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+                guard let coordinator = self else { return }
+                guard coordinator.stickToBottom, coordinator.revealing == false,
+                      coordinator.revealPending == false else { return }
+                coordinator.scrollToBottom(animated: false)
+            }
+        }
+
+        func noteLayout() {
+            guard inLayout == false, applying == false else { return }
+            inLayout = true
+            defer { inLayout = false }
+            applyIfPossible()
+            syncReveal()
+            stickIfNeeded()
+        }
+
+        func applyIfPossible() {
+            guard let textView, textView.bounds.width > 1 else { return }
+            guard applying == false else { return }
+            applying = true
+            defer { applying = false }
+            let font = transcriptFontSize(for: textView.bounds.width)
+            guard let edit = store.update(lines: lines, fontSize: font, carry: carry) else { return }
+            apply(edit, to: textView)
+            if revealing {
+                deferredBottom = true
+            } else if revealPending == false, nearBottom {
+                stickToBottom = true
+                let follow = self
+                DispatchQueue.main.async {
+                    follow.scrollToBottom(animated: false)
+                }
+            }
+        }
+
+        func syncReveal() {
+            guard revealPending, let id = resumeSeparatorID, id.isEmpty == false else { return }
+            guard startedRevealID != id else { return }
+            guard textView?.bounds.width ?? 0 > 1 else { return }
+            startedRevealID = id
+            beginReveal(id)
+        }
+
+        private func apply(_ edit: TranscriptEdit, to textView: TranscriptTextView) {
+            let storage = textView.textStorage
+            let previous = storage.string
+            let selected = textView.selectedRange
+            let cut = edit.replaceFrom
+            storage.beginEditing()
+            if cut <= 0 {
+                storage.setAttributedString(edit.text)
+            } else if cut > storage.length {
+                storage.setAttributedString(store.attributed)
+            } else {
+                let tail = NSRange(location: cut, length: storage.length - cut)
+                storage.replaceCharacters(in: tail, with: edit.text)
+            }
+            storage.endEditing()
+            let keep: Int
+            if cut > 0, cut <= (previous as NSString).length {
+                keep = cut
+            } else {
+                keep = previous.commonPrefix(with: storage.string).utf16.count
+            }
+            if selected.length > 0,
+               selected.location + selected.length <= keep,
+               selected.location + selected.length <= storage.length {
+                textView.selectedRange = selected
+            }
+            textView.rules?.separatorRanges = store.markers.compactMap { marker in
+                guard marker.separator, marker.contentLength > 0 else { return nil }
+                return NSRange(location: marker.location, length: marker.contentLength)
+            }
+            textView.setNeedsDisplay()
+        }
+
+        func scrollToBottom(animated: Bool) {
+            guard let textView else { return }
+            let y = maxOffset(of: textView)
+            stickToBottom = true
+            holdUntil = Date().addingTimeInterval(0.25)
+            guard abs(textView.contentOffset.y - y) > 0.5 else { return }
+            programmatic += 1
+            if animated {
+                UIView.animate(withDuration: 0.2, animations: {
+                    textView.contentOffset = CGPoint(x: 0, y: y)
+                }, completion: { _ in
+                    self.programmatic = max(0, self.programmatic - 1)
+                })
+            } else {
+                textView.setContentOffset(CGPoint(x: 0, y: y), animated: false)
+                programmatic = max(0, self.programmatic - 1)
+            }
+        }
+
+        func stickIfNeeded() {
+            guard stickToBottom, revealing == false, revealPending == false else { return }
+            guard stickQueued == false else { return }
+            guard let textView, textView.isDragging == false, textView.isDecelerating == false else { return }
+            stickQueued = true
+            DispatchQueue.main.async {
+                self.stickQueued = false
+                guard self.stickToBottom, self.revealing == false, self.revealPending == false else { return }
+                guard let textView = self.textView,
+                      textView.isDragging == false, textView.isDecelerating == false else { return }
+                self.scrollToBottom(animated: false)
+            }
+        }
+
+        private func beginReveal(_ id: String) {
+            revealToken += 1
+            let token = revealToken
+            revealing = true
+            deferredBottom = false
+            finishedRevealID = nil
+            DispatchQueue.main.async {
+                guard token == self.revealToken else { return }
+                self.jumpToSeparator(id)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                guard token == self.revealToken, self.revealing else { return }
+                self.jumpToSeparator(id)
+                self.easeToBottom(token: token, id: id)
+            }
+        }
+
+        private func jumpToSeparator(_ id: String) {
+            guard let textView, let marker = store.markers.first(where: { $0.id == id && $0.separator }) else {
+                return
+            }
+            guard let rect = rect(of: marker, in: textView), rect.height > 0 else { return }
+            let visible = textView.bounds.height
+                - textView.adjustedContentInset.top
+                - textView.adjustedContentInset.bottom
+            var y = rect.maxY - visible
+            y = min(max(y, -textView.adjustedContentInset.top), maxOffset(of: textView))
+            programmatic += 1
+            textView.setContentOffset(CGPoint(x: 0, y: y), animated: false)
+            programmatic = max(0, self.programmatic - 1)
+        }
+
+        private func easeToBottom(token: Int, id: String) {
+            guard let textView else {
+                completeReveal(id)
+                return
+            }
+            let y = maxOffset(of: textView)
+            programmatic += 1
+            UIView.animate(
+                withDuration: 1.0,
+                delay: 0,
+                options: [.curveEaseInOut, .allowUserInteraction, .beginFromCurrentState]
+            ) {
+                textView.contentOffset = CGPoint(x: 0, y: y)
+            } completion: { _ in
+                self.programmatic = max(0, self.programmatic - 1)
+                guard token == self.revealToken else { return }
+                self.completeReveal(id)
+            }
+        }
+
+        private func completeReveal(_ id: String?, pinBottom: Bool = true) {
+            guard let id, finishedRevealID != id else {
+                revealing = false
+                return
+            }
+            finishedRevealID = id
+            revealing = false
+            let deferred = deferredBottom
+            deferredBottom = false
+            let callback = onRevealFinished
+            DispatchQueue.main.async {
+                callback(id)
+            }
+            guard pinBottom else { return }
+            stickToBottom = true
+            holdUntil = Date().addingTimeInterval(0.25)
+            emitNear(true)
+            if deferred {
+                scrollToBottom(animated: false)
+            }
+        }
+
+        private func rect(of marker: DocMarker, in textView: TranscriptTextView) -> CGRect? {
+            let total = textView.textStorage.length
+            guard marker.location < total else { return nil }
+            let length = min(max(marker.contentLength, 1), total - marker.location)
+            let characters = NSRange(location: marker.location, length: length)
+            textView.layoutManager.ensureLayout(forCharacterRange: characters)
+            let glyphs = textView.layoutManager.glyphRange(
+                forCharacterRange: characters,
+                actualCharacterRange: nil
+            )
+            guard glyphs.length > 0 else { return nil }
+            var rect = textView.layoutManager.boundingRect(forGlyphRange: glyphs, in: textView.textContainer)
+            rect.origin.x += textView.textContainerInset.left
+            rect.origin.y += textView.textContainerInset.top
+            return rect
+        }
+
+        private func maxOffset(of textView: UITextView) -> CGFloat {
+            let inset = textView.adjustedContentInset
+            return max(-inset.top, textView.contentSize.height + inset.bottom - textView.bounds.height)
+        }
+
+        private func distanceFromBottom(of textView: UITextView) -> CGFloat {
+            let inset = textView.adjustedContentInset
+            let visibleMax = textView.contentOffset.y + textView.bounds.height - inset.bottom
+            return textView.contentSize.height - visibleMax
+        }
+
+        private func emitNear(_ near: Bool) {
+            guard near != nearBottom else { return }
+            nearBottom = near
+            stickToBottom = near
+            publishGeneration += 1
+            let generation = publishGeneration
+            let callback = onNearBottom
+            DispatchQueue.main.async {
+                guard generation == self.publishGeneration else { return }
+                callback(near)
+            }
+        }
+
+        func scrollViewWillBeginDragging(_: UIScrollView) {
+            holdUntil = .distantPast
+            if revealing {
+                revealToken += 1
+                deferredBottom = false
+                completeReveal(startedRevealID, pinBottom: false)
+            }
+        }
+
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            guard let textView = scrollView as? UITextView else { return }
+            let offsetY = textView.contentOffset.y
+            let moved = abs(offsetY - lastOffsetY) > 0.5
+            lastOffsetY = offsetY
+            // Bounds and content-size changes call this too. Only a real offset
+            // change is the reader moving; a keyboard frame must not flip the flag.
+            guard programmatic == 0, moved else { return }
+            let near: Bool
+            if Date() < holdUntil {
+                near = true
+            } else {
+                near = distanceFromBottom(of: textView) <= nearBottomSlack
+            }
+            emitNear(near)
+        }
+
         func textView(
             _: UITextView,
             primaryActionFor textItem: UITextItem,
@@ -506,8 +874,6 @@ private struct TranscriptText: UIViewRepresentable {
             }
         }
 
-        /// Long-press menu for a link. The system menu is kept, so Open,
-        /// Copy, and Share stay, and a selection across lines is untouched.
         func textView(
             _: UITextView,
             menuConfigurationFor _: UITextItem,
@@ -519,111 +885,21 @@ private struct TranscriptText: UIViewRepresentable {
             )
         }
     }
-
-    private static func measure(
-        _ textView: UITextView,
-        markers: [DocMarker],
-        width: CGFloat
-    ) -> (height: CGFloat, anchors: [LineAnchor]) {
-        let container = textView.textContainer
-        container.widthTracksTextView = false
-        container.size = CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
-        let manager = textView.layoutManager
-        manager.ensureLayout(for: container)
-        let fit = textView.sizeThatFits(CGSize(width: width, height: CGFloat.greatestFiniteMagnitude))
-        let height = max(fit.height, 1)
-        let total = textView.attributedText?.length ?? 0
-        var rects: [CGRect] = []
-        rects.reserveCapacity(markers.count)
-        for marker in markers {
-            rects.append(rect(marker, total: total, manager: manager, container: container))
-        }
-        var anchors: [LineAnchor] = []
-        anchors.reserveCapacity(markers.count)
-        for index in markers.indices {
-            let rect = rects[index]
-            let nextY = index + 1 < rects.count ? rects[index + 1].minY : height
-            let rowHeight = max(1, nextY - rect.minY)
-            var anchor = LineAnchor(id: markers[index].id, y: rect.minY, height: rowHeight)
-            if markers[index].separator, rect.width > 0, rect.height > 0 {
-                anchor.separatorMinX = rect.minX
-                anchor.separatorWidth = rect.width
-                anchor.separatorMidY = rect.midY
-            }
-            anchors.append(anchor)
-        }
-        return (height, anchors)
-    }
-
-    private static func rect(
-        _ marker: DocMarker,
-        total: Int,
-        manager: NSLayoutManager,
-        container: NSTextContainer
-    ) -> CGRect {
-        guard marker.location < total else {
-            return .zero
-        }
-        let length = min(max(marker.contentLength, 0), total - marker.location)
-        guard length > 0 else {
-            let glyphs = manager.glyphRange(
-                forCharacterRange: NSRange(location: marker.location, length: 0),
-                actualCharacterRange: nil
-            )
-            return manager.boundingRect(forGlyphRange: glyphs, in: container)
-        }
-        let glyphs = manager.glyphRange(
-            forCharacterRange: NSRange(location: marker.location, length: length),
-            actualCharacterRange: nil
-        )
-        return manager.boundingRect(forGlyphRange: glyphs, in: container)
-    }
 }
 
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
     @FocusState private var commandFocused: Bool
-    /// Programmatic scroll target. Nil leaves the scroll view alone.
-    @State private var positionedID: String?
-    /// Where `positionedID` sits in the visible region. Resume parks the separator
-    /// on `.bottom`, just above the input bar; the ease to the latest line uses
-    /// `.bottom` as well.
-    @State private var positionAnchor: UnitPoint = .bottom
-    /// A live line arrived during the reveal and should jump to the bottom once it ends.
-    @State private var bottomScrollDeferred = false
-    /// Invalidates a bottom scroll still waiting on the layout delay.
-    @State private var bottomScrollGeneration = 0
-    /// Invalidates an older reveal when a newer backlog arrives.
-    @State private var revealGeneration = 0
-    @State private var revealStarted: Date?
-    @State private var runningSeparatorID: String?
-    @State private var separatorVisibleID: String?
-    @State private var easeStarted = false
-    /// Height of the input bar overlaid on the transcript. The scroll content's
-    /// minimum height stays above it, so a short log still fills the visible area.
-    @State private var inputBarHeight: CGFloat = 0
-    /// Height of the name and HMV bar. Short logs stay below it, as they stay
-    /// above the input bar.
-    @State private var headerBarHeight: CGFloat = 0
-    @State private var bottomSnapGate = BottomSnapGate()
-    /// True when the latest text was at or near the bottom before the last size change.
+    /// True when the latest text is within `nearBottomSlack` of the viewport.
+    /// Written only when that flips.
     @State private var nearBottom = true
-    /// Distance updates in this window are the layout catching up to a bottom snap,
-    /// not the reader scrolling away.
-    @State private var holdBottomUntil = Date.distantPast
     /// New lines arrived while the reader was up in the backlog.
     @State private var showNewLines = false
     /// Upward swipe on the input bar. One row of compass commands.
     @State private var actionPanelShown = false
-    /// Colour entering each line. A class so scrolling does not copy it.
-    @State private var colourCarry = ColourCarryCache()
-    /// Attributed transcript shared by the selectable text view.
-    @State private var documentStore = TranscriptDocumentStore()
-    /// Laid-out height of that text, before the scroll view's minimum.
-    @State private var transcriptContentHeight: CGFloat = 1
-    /// One scroll target per row, measured from the text layout.
-    @State private var lineAnchors: [LineAnchor] = []
+    /// Bumps when "New lines" asks the text view to jump to the bottom.
+    @State private var scrollToken = 0
 
     /// Count and the newest line, so a capped buffer and an insert both register
     /// without observing the whole transcript array.
@@ -632,97 +908,56 @@ struct TranscriptView: View {
     }
 
     var body: some View {
-        let _ = colourCarry.prepare(session.lines)
         NavigationStack {
-            GeometryReader { geo in
-                let fontSize = max(8, (geo.size.width - 16) / CGFloat(terminalColumns) / 0.62)
-                let transcriptHeight = max(0, geo.size.height - headerBarHeight - inputBarHeight)
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        lineStack(fontSize: fontSize, width: geo.size.width)
-                            .padding(.vertical, 8)
-                            .frame(minWidth: geo.size.width, minHeight: transcriptHeight, alignment: .topLeading)
-                            .frame(width: geo.size.width)
-                    }
-                    .scrollPosition(id: $positionedID, anchor: positionAnchor)
-                    .modifier(TranscriptBottomAnchor(enabled: session.pendingResumeReveal == false))
-                    .onAppear { considerReveal(proxy, reason: "appear") }
-                    .onChange(of: linesScrollSignal) { _, _ in
-                        considerReveal(proxy, reason: "lines")
-                    }
-                    .onChange(of: transcriptContentHeight) { _, _ in
-                        guard nearBottom, session.pendingResumeReveal == false else { return }
-                        scrollToBottom(proxy)
-                    }
-                    .onChange(of: lineAnchors.count) { _, _ in
-                        guard session.pendingResumeReveal, easeStarted == false,
-                              let separatorID = session.resumeSeparatorID else { return }
-                        guard lineAnchors.contains(where: { $0.id == separatorID }) else { return }
-                        separatorBecameVisible(separatorID)
-                        jumpToSeparator(proxy, id: separatorID)
-                    }
-                    .onChange(of: session.pendingResumeReveal) { _, _ in
-                        considerReveal(proxy, reason: "pending")
-                    }
-                    .onChange(of: scenePhase) { _, _ in
-                        considerReveal(proxy, reason: "phase")
-                    }
-                    .onChange(of: geo.size) { _, newSize in
-                        guard newSize.width > 1, newSize.height > 1 else { return }
-                        reanchorAfterGeometryChange(proxy, wasNearBottom: nearBottom)
-                    }
-                    .onChange(of: geo.safeAreaInsets.bottom) { _, _ in
-                        reanchorAfterGeometryChange(proxy, wasNearBottom: nearBottom)
-                    }
-                    .onChange(of: inputBarHeight) { _, newHeight in
-                        guard newHeight > 1 else { return }
-                        reanchorAfterGeometryChange(proxy, wasNearBottom: nearBottom)
-                    }
-                    .onChange(of: headerBarHeight) { _, newHeight in
-                        guard newHeight > 1 else { return }
-                        reanchorAfterGeometryChange(proxy, wasNearBottom: nearBottom)
-                    }
-                    .modifier(TranscriptResizeStick(
-                        nearBottom: $nearBottom,
+            VStack(spacing: 0) {
+                topBar
+                ZStack(alignment: .bottom) {
+                    TranscriptLog(
+                        lines: session.lines,
+                        scrollToken: scrollToken,
                         revealPending: session.pendingResumeReveal,
-                        holdBottomUntil: holdBottomUntil,
-                        reanchor: { reanchorAfterGeometryChange(proxy, wasNearBottom: true) }
-                    ))
-                    .onChange(of: nearBottom) { _, atBottom in
-                        if atBottom {
-                            showNewLines = false
+                        resumeSeparatorID: session.resumeSeparatorID,
+                        onNearBottom: { near in
+                            if nearBottom != near {
+                                nearBottom = near
+                            }
+                        },
+                        onRevealFinished: { id in
+                            session.finishResumeReveal(separatorID: id)
                         }
-                    }
-                    .overlay(alignment: .bottom) {
-                        if showNewLines, nearBottom == false, session.pendingResumeReveal == false {
-                            newLinesButton(proxy)
-                                .padding(.bottom, 8)
-                        }
-                    }
-                    .safeAreaInset(edge: .top, spacing: 0) {
-                        topBar
-                    }
-                    .safeAreaInset(edge: .bottom, spacing: 0) {
-                        if session.atMenu {
-                            GameMenuPanel()
-                        } else {
-                            inputBar
-                        }
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if showNewLines, nearBottom == false, session.pendingResumeReveal == false {
+                        newLinesButton
+                            .padding(.bottom, 8)
                     }
                 }
                 .overlay(alignment: .topTrailing) {
-                    if headerBarHeight > 1, session.atMenu == false {
+                    if session.atMenu == false {
                         unlinkButton
-                            .padding(.top, headerBarHeight + 8)
+                            .padding(.top, 8)
                             .padding(.trailing, 12)
                     }
                 }
+                if session.atMenu {
+                    GameMenuPanel()
+                } else {
+                    inputBar
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(screen)
-            .onPreferenceChange(InputBarHeightKey.self) { inputBarHeight = $0 }
-            .onPreferenceChange(HeaderBarHeightKey.self) { headerBarHeight = $0 }
             .preferredColorScheme(.dark)
             .toolbar(.hidden, for: .navigationBar)
+            .onChange(of: linesScrollSignal) { _, _ in
+                guard session.pendingResumeReveal == false, nearBottom == false else { return }
+                showNewLines = true
+            }
+            .onChange(of: nearBottom) { _, atBottom in
+                if atBottom {
+                    showNewLines = false
+                }
+            }
             .onChange(of: scenePhase) { _, phase in
                 Task {
                     if phase == .background {
@@ -768,11 +1003,6 @@ struct TranscriptView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .frame(maxWidth: .infinity)
-            .background {
-                GeometryReader { proxy in
-                    Color.clear.preference(key: HeaderBarHeightKey.self, value: proxy.size.height)
-                }
-            }
             .background(Chrome.barBackground, ignoresSafeAreaEdges: .top)
     }
 
@@ -835,10 +1065,11 @@ struct TranscriptView: View {
         }
     }
 
-    private func newLinesButton(_ proxy: ScrollViewProxy) -> some View {
+    private var newLinesButton: some View {
         Button {
             showNewLines = false
-            scrollToBottom(proxy)
+            nearBottom = true
+            scrollToken += 1
         } label: {
             Text("↓ New lines")
                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
@@ -851,10 +1082,10 @@ struct TranscriptView: View {
         .accessibilityLabel("New lines")
     }
 
-    /// Sits in the scroll view's bottom safe area, so lines travel under the blur
-    /// and the bottom anchor still rests above the bar. Half-strength frost lets
-    /// the log show through; the prompt stays the light terminal ink on dark.
-    /// An upward swipe opens one row of direction commands on that same frost.
+    /// Sits under the log, so lines stay above the blur and the keyboard lifts
+    /// this bar with the safe area instead of resizing the text on every frame.
+    /// Half-strength frost lets the log show through; the prompt stays the light
+    /// terminal ink on dark. An upward swipe opens one row of direction commands.
     private var inputBar: some View {
         VStack(spacing: 0) {
             if actionPanelShown {
@@ -898,11 +1129,6 @@ struct TranscriptView: View {
             .padding(.trailing, 4)
             .padding(.vertical, 4)
         }
-        .background {
-            GeometryReader { proxy in
-                Color.clear.preference(key: InputBarHeightKey.self, value: proxy.size.height)
-            }
-        }
         .background(Chrome.barBackground, ignoresSafeAreaEdges: .bottom)
         .simultaneousGesture(
             DragGesture(minimumDistance: 15)
@@ -916,384 +1142,6 @@ struct TranscriptView: View {
                     }
                 }
         )
-    }
-
-    /// Bottom snaps stay off for the whole time a resume reveal is pending, including
-    /// before the scene is active. Appear still opens at the bottom. Later lines
-    /// follow only while the reader is already there; a backlog stays put.
-    private func considerReveal(_ proxy: ScrollViewProxy, reason: String) {
-        guard session.pendingResumeReveal, let separatorID = session.resumeSeparatorID else {
-            guard reason == "appear" || reason == "lines" else { return }
-            if reason == "lines", nearBottom == false {
-                showNewLines = true
-                return
-            }
-            scrollToBottom(proxy)
-            return
-        }
-        guard scenePhase == .active else { return }
-        if runningSeparatorID == separatorID, revealStarted != nil {
-            if reason == "lines" {
-                bottomScrollDeferred = true
-            }
-            return
-        }
-        startReveal(proxy, separatorID: separatorID)
-    }
-
-    /// Jump to the separator only after the scene is active, then ease once a real
-    /// layout pass has produced the row.
-    private func startReveal(_ proxy: ScrollViewProxy, separatorID: String) {
-        revealGeneration += 1
-        bottomScrollGeneration += 1
-        let generation = revealGeneration
-        revealStarted = Date()
-        runningSeparatorID = separatorID
-        easeStarted = false
-        bottomScrollDeferred = false
-        if separatorVisibleID != separatorID {
-            separatorVisibleID = nil
-        }
-        DispatchQueue.main.async {
-            guard generation == self.revealGeneration else { return }
-            self.jumpToSeparator(proxy, id: separatorID)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            guard generation == self.revealGeneration, self.easeStarted == false else { return }
-            guard self.separatorVisibleID != separatorID else { return }
-            self.jumpToSeparator(proxy, id: separatorID)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            self.maybeEase(generation: generation, separatorID: separatorID, reason: "0.4s")
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-            self.maybeEase(generation: generation, separatorID: separatorID, reason: "fallback")
-        }
-    }
-
-    /// Park the separator on the visible bottom, just above the input bar, then
-    /// the ease walks to the latest line. The bar is a bottom safe-area inset of
-    /// `inputBarHeight` (the viewport is `geo.size.height - inputBarHeight`), so
-    /// `anchor: .bottom` is that edge rather than the top of the transcript.
-    private func jumpToSeparator(_ proxy: ScrollViewProxy, id: String) {
-        guard easeStarted == false else { return }
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            positionAnchor = .bottom
-            positionedID = id
-            proxy.scrollTo(id, anchor: .bottom)
-        }
-    }
-
-    private func separatorBecameVisible(_ id: String) {
-        guard session.pendingResumeReveal, id == session.resumeSeparatorID else { return }
-        guard separatorVisibleID != id else { return }
-        separatorVisibleID = id
-        guard let separatorID = runningSeparatorID, revealStarted != nil else { return }
-        maybeEase(generation: revealGeneration, separatorID: separatorID, reason: "separator onAppear")
-    }
-
-    /// Ease only after the separator row has appeared and at least 0.4s has passed
-    /// since the reveal started. The 0.8s fallback eases even if the row never appeared.
-    private func maybeEase(generation: Int, separatorID: String, reason: String) {
-        guard generation == revealGeneration, easeStarted == false else { return }
-        let elapsed = revealStarted.map { Date().timeIntervalSince($0) } ?? 0
-        let visible = separatorVisibleID == separatorID
-        let ready = elapsed >= 0.4 && (visible || reason == "fallback")
-        guard ready else { return }
-        easeToBottom(generation: generation, separatorID: separatorID)
-    }
-
-    private func easeToBottom(generation: Int, separatorID: String) {
-        easeStarted = true
-        let hops = easeHops(from: separatorID)
-        let count = hops.count
-        if count <= 1 {
-            withAnimation(.easeInOut(duration: 1.0)) {
-                positionAnchor = .bottom
-                positionedID = transcriptBottomID
-            }
-            scheduleEaseFinish(generation: generation, separatorID: separatorID, after: 1.05)
-            return
-        }
-        let slice = 1.0 / Double(count)
-        for (index, hop) in hops.enumerated() {
-            let delay = slice * Double(index)
-            let anchor: UnitPoint = index == count - 1 ? .bottom : .top
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                guard generation == self.revealGeneration else { return }
-                withAnimation(.easeInOut(duration: slice)) {
-                    self.positionAnchor = anchor
-                    self.positionedID = hop
-                }
-            }
-        }
-        scheduleEaseFinish(generation: generation, separatorID: separatorID, after: 1.05)
-    }
-
-    /// One hop when the transcript is small enough to lay out eagerly. A long lazy
-    /// list walks intermediate line ids so a single far scrollTo is not skipped.
-    private func easeHops(from separatorID: String) -> [String] {
-        if session.lines.count <= modestTranscriptCount {
-            return [transcriptBottomID]
-        }
-        guard let start = session.lines.firstIndex(where: { $0.id == separatorID }) else {
-            return [transcriptBottomID]
-        }
-        let distance = session.lines.count - start
-        if distance <= 40 {
-            return [transcriptBottomID]
-        }
-        let hopCount = min(8, max(2, distance / 40))
-        var ids: [String] = []
-        for step in 1...hopCount {
-            let offset = min(distance - 1, distance * step / hopCount)
-            ids.append(session.lines[start + offset].id)
-        }
-        if ids.last != transcriptBottomID {
-            ids.append(transcriptBottomID)
-        }
-        return ids
-    }
-
-    private func scheduleEaseFinish(generation: Int, separatorID: String, after delay: TimeInterval) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            guard generation == self.revealGeneration else { return }
-            self.finishEase(separatorID: separatorID)
-        }
-    }
-
-    private func finishEase(separatorID: String) {
-        revealStarted = nil
-        easeStarted = false
-        runningSeparatorID = nil
-        let deferred = bottomScrollDeferred
-        bottomScrollDeferred = false
-        // The ease ends on the latest line, so the next size change may stick.
-        holdBottom()
-        session.finishResumeReveal(separatorID: separatorID)
-        if deferred {
-            scrollToBottomNow()
-        }
-    }
-
-    /// Orientation, keyboard, split view, and Stage Manager all change the
-    /// container or the bottom inset before the text has reflowed. The scroll
-    /// view would otherwise pin with the old insets and land mid-transcript
-    /// or leave a gap under the last line. Wait until the next layout, then
-    /// once more after a short delay, and let a newer change cancel the older
-    /// one. A reconnect reveal owns the scroll until it finishes.
-    private func reanchorAfterGeometryChange(_ proxy: ScrollViewProxy, wasNearBottom: Bool) {
-        guard wasNearBottom else { return }
-        guard session.pendingResumeReveal == false else { return }
-        holdBottom()
-        bottomScrollGeneration += 1
-        let generation = bottomScrollGeneration
-        let scroll = {
-            guard generation == self.bottomScrollGeneration else { return }
-            guard self.session.pendingResumeReveal == false else { return }
-            self.scrollToBottomNow(proxy)
-        }
-        DispatchQueue.main.async(execute: scroll)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: scroll)
-    }
-
-    private func holdBottom() {
-        nearBottom = true
-        showNewLines = false
-        holdBottomUntil = Date().addingTimeInterval(0.25)
-    }
-
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        if session.pendingResumeReveal {
-            bottomScrollDeferred = true
-            return
-        }
-        // Several line updates can land in one turn. One snap still lands on the bottom.
-        guard bottomSnapGate.queued == false else { return }
-        bottomSnapGate.queued = true
-        bottomScrollGeneration += 1
-        let generation = bottomScrollGeneration
-        let scroll = {
-            guard generation == self.bottomScrollGeneration else { return }
-            guard self.session.pendingResumeReveal == false else { return }
-            self.scrollToBottomNow(proxy)
-        }
-        DispatchQueue.main.async {
-            self.bottomSnapGate.queued = false
-            scroll()
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: scroll)
-    }
-
-    private func scrollToBottomNow(_ proxy: ScrollViewProxy) {
-        holdBottom()
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            positionAnchor = .bottom
-            positionedID = transcriptBottomID
-            proxy.scrollTo(transcriptBottomID, anchor: .bottom)
-        }
-    }
-
-    /// Used when the ease ends and the proxy from the original call is not required.
-    private func scrollToBottomNow() {
-        holdBottom()
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            positionAnchor = .bottom
-            positionedID = transcriptBottomID
-        }
-    }
-
-    private struct PlacedAnchor: Identifiable {
-        var id: String
-        var gap: CGFloat
-        var height: CGFloat
-        var separator: Bool
-    }
-
-    /// One text view so a selection can cross lines. Invisible rows keep the
-    /// existing scroll-to-id reveal; they do not take touches.
-    private func lineStack(fontSize: CGFloat, width: CGFloat) -> some View {
-        documentStore.update(lines: session.lines, fontSize: fontSize, carry: colourCarry)
-        let placed = placedAnchors
-        let trailing = max(0, transcriptContentHeight - anchorCursor)
-        return ZStack(alignment: .topLeading) {
-            VStack(spacing: 0) {
-                ForEach(placed) { anchor in
-                    Color.clear
-                        .frame(height: anchor.gap)
-                    Color.clear
-                        .frame(height: anchor.height)
-                        .id(anchor.id)
-                        .onAppear {
-                            if anchor.separator {
-                                separatorBecameVisible(anchor.id)
-                            }
-                        }
-                }
-                Color.clear.frame(height: trailing)
-                bottomMarker
-            }
-            .scrollTargetLayout()
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-
-            TranscriptText(
-                attributed: documentStore.attributed,
-                generation: documentStore.generation,
-                width: width,
-                markers: documentStore.markers,
-                onMetrics: { height, anchors in
-                    if abs(transcriptContentHeight - height) > 0.5 {
-                        transcriptContentHeight = height
-                    }
-                    if anchors != lineAnchors {
-                        lineAnchors = anchors
-                    }
-                }
-            )
-            .frame(width: width, height: max(transcriptContentHeight, 1), alignment: .top)
-
-            hairlines(width: width)
-                .allowsHitTesting(false)
-
-            if #available(iOS 18.0, *) {
-                Color.clear.frame(width: 0, height: 0)
-            } else {
-                TranscriptOffsetSpy(
-                    holdBottomUntil: holdBottomUntil,
-                    revealPending: session.pendingResumeReveal,
-                    onNearBottom: { near in
-                        if nearBottom != near {
-                            nearBottom = near
-                        }
-                    }
-                )
-                .frame(width: 0, height: 0)
-            }
-        }
-    }
-
-    private var placedAnchors: [PlacedAnchor] {
-        var placed: [PlacedAnchor] = []
-        var cursor: CGFloat = 0
-        for anchor in lineAnchors {
-            let gap = max(0, anchor.y - cursor)
-            let height = max(anchor.height, 1)
-            placed.append(PlacedAnchor(
-                id: anchor.id,
-                gap: gap,
-                height: height,
-                separator: anchor.separatorMinX != nil
-            ))
-            cursor = anchor.y + height
-        }
-        return placed
-    }
-
-    private var anchorCursor: CGFloat {
-        guard let last = lineAnchors.last else { return 0 }
-        return last.y + max(last.height, 1)
-    }
-
-    /// Hairlines beside the disconnect stamp. The stamp itself is in the text
-    /// view, so a selection can pass through it and the copy includes it.
-    private func hairlines(width: CGFloat) -> some View {
-        ZStack(alignment: .topLeading) {
-            ForEach(lineAnchors.filter { $0.separatorMinX != nil }) { anchor in
-                if let minX = anchor.separatorMinX,
-                   let stampWidth = anchor.separatorWidth,
-                   let midY = anchor.separatorMidY {
-                    let left = max(0, minX - 8)
-                    let rightStart = minX + stampWidth + 8
-                    let right = max(0, width - rightStart)
-                    ZStack(alignment: .topLeading) {
-                        Rectangle()
-                            .fill(Color.secondary)
-                            .frame(width: left, height: 1)
-                            .offset(y: midY)
-                        Rectangle()
-                            .fill(Color.secondary)
-                            .frame(width: right, height: 1)
-                            .offset(x: rightStart, y: midY)
-                    }
-                }
-            }
-        }
-        .frame(width: width, height: max(transcriptContentHeight, 1), alignment: .topLeading)
-        .accessibilityHidden(true)
-    }
-
-    @ViewBuilder
-    private var bottomMarker: some View {
-        let marker = Color.clear
-            .frame(height: 1)
-            .allowsHitTesting(false)
-            .id(transcriptBottomID)
-        if #available(iOS 18.0, *) {
-            marker
-        } else {
-            marker
-                .onAppear { holdBottom() }
-                .onDisappear { noteLeftBottom() }
-        }
-    }
-
-    /// iOS 17 has no scroll geometry. The bottom marker leaving the screen is
-    /// the reader moving up, unless a size change already replaced that scroll.
-    private func noteLeftBottom() {
-        let generation = bottomScrollGeneration
-        DispatchQueue.main.async {
-            guard generation == self.bottomScrollGeneration else { return }
-            guard self.session.pendingResumeReveal == false else { return }
-            guard Date() >= self.holdBottomUntil else { return }
-            self.nearBottom = false
-        }
     }
 
     /// 44×44 hit target. The label is the accessibility name (Say or Send).
@@ -1313,8 +1161,8 @@ struct TranscriptView: View {
         .disabled(commandIsBlank)
         .accessibilityLabel(label)
     }
-
 }
+
 
 /// Welcome menu, in the input bar's place. Enter sends `1`. Quit sends `0`
 /// and unlinks. Change password is a dialog, not menu choice `2`.
@@ -1342,11 +1190,6 @@ private struct GameMenuPanel: View {
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .foregroundStyle(ink)
-        .background {
-            GeometryReader { proxy in
-                Color.clear.preference(key: InputBarHeightKey.self, value: proxy.size.height)
-            }
-        }
         .background(Chrome.barBackground, ignoresSafeAreaEdges: .bottom)
         .toolbar {
             if changingPassword {
@@ -1550,242 +1393,5 @@ private struct ActionPanel: View {
         }
         .padding(.horizontal, 4)
         .padding(.top, 4)
-    }
-}
-
-private struct HeaderBarHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-
-private struct InputBarHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-
-/// iOS 17 has no scroll geometry. Watches the enclosing scroll view so new
-/// output still follows the bottom only while the reader is already there.
-private struct TranscriptOffsetSpy: UIViewRepresentable {
-    var holdBottomUntil: Date
-    var revealPending: Bool
-    var onNearBottom: (Bool) -> Void
-
-    func makeUIView(context: Context) -> SpyView {
-        let view = SpyView()
-        view.isUserInteractionEnabled = false
-        view.backgroundColor = .clear
-        return view
-    }
-
-    func updateUIView(_ view: SpyView, context: Context) {
-        view.holdBottomUntil = holdBottomUntil
-        view.revealPending = revealPending
-        view.onNearBottom = onNearBottom
-    }
-
-    final class SpyView: UIView {
-        var holdBottomUntil = Date.distantPast
-        var revealPending = false
-        var onNearBottom: ((Bool) -> Void)?
-        private var offsetObservation: NSKeyValueObservation?
-        private var sizeObservation: NSKeyValueObservation?
-        private var wasNear = true
-        private var lastReported: Bool?
-        private var lastOffset: CGFloat = 0
-        private var lastContent: CGFloat = -1
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            attach()
-        }
-
-        override func didMoveToSuperview() {
-            super.didMoveToSuperview()
-            attach()
-        }
-
-        private func attach() {
-            guard offsetObservation == nil, let scroll = enclosingScroll() else { return }
-            offsetObservation = scroll.observe(\.contentOffset, options: [.new]) { [weak self] scroll, _ in
-                self?.report(scroll)
-            }
-            sizeObservation = scroll.observe(\.contentSize, options: [.new]) { [weak self] scroll, _ in
-                self?.report(scroll)
-            }
-        }
-
-        private func enclosingScroll() -> UIScrollView? {
-            var view = superview
-            while let current = view {
-                if let scroll = current as? UIScrollView, (scroll is TranscriptTextView) == false {
-                    return scroll
-                }
-                view = current.superview
-            }
-            return nil
-        }
-
-        private func report(_ scroll: UIScrollView) {
-            guard revealPending == false else { return }
-            let inset = scroll.adjustedContentInset
-            let visibleMax = scroll.contentOffset.y + scroll.bounds.height - inset.bottom
-            let distance = scroll.contentSize.height - visibleMax
-            let grew = scroll.contentSize.height > lastContent + 0.5
-            let stayed = abs(scroll.contentOffset.y - lastOffset) < 1
-            lastOffset = scroll.contentOffset.y
-            lastContent = scroll.contentSize.height
-            let near: Bool
-            if Date() < holdBottomUntil {
-                near = true
-            } else if grew, stayed, wasNear {
-                near = true
-            } else {
-                near = distance <= nearBottomSlack
-            }
-            wasNear = near
-            guard near != lastReported else { return }
-            lastReported = near
-            let callback = onNearBottom
-            DispatchQueue.main.async {
-                callback?(near)
-            }
-        }
-    }
-}
-
-/// Initial placement pins to the bottom. It is off for the whole pending reveal
-/// so a resume does not snap to the end before the ease can move. On iOS 18 the
-/// modifier stays in the tree and the anchor becomes nil. On iOS 17 it is removed.
-/// Size changes are not pinned here: that anchor runs before the reflow and the
-/// new insets exist, and it would also pull a reader who had scrolled up.
-private struct TranscriptBottomAnchor: ViewModifier {
-    var enabled: Bool
-
-    func body(content: Content) -> some View {
-        if #available(iOS 18.0, *) {
-            anchored(content)
-        } else if enabled {
-            content.defaultScrollAnchor(.bottom)
-        } else {
-            content
-        }
-    }
-
-    @available(iOS 18.0, *)
-    private func anchored(_ content: Content) -> some View {
-        let anchor: UnitPoint? = enabled ? .bottom : nil
-        return content
-            .defaultScrollAnchor(anchor, for: .initialOffset)
-            .defaultScrollAnchor(nil, for: .sizeChanges)
-    }
-}
-
-/// Point-sized container. The scroll offset is not in here: publishing it
-/// made `onScrollGeometryChange` fire on every frame.
-private struct TranscriptContainerTick: Equatable {
-    var width: Int
-    var height: Int
-    var bottomInset: Int
-}
-
-/// Previous geometry for the at-bottom Bool. A class so remembering it does
-/// not publish a view update. The transform can run twice for one geometry;
-/// the last inputs are replayed instead of applying a growth twice.
-private final class BottomFollowMemory {
-    private var primed = false
-    private var contentHeight: CGFloat = 0
-    private var visibleMinY: CGFloat = 0
-    private var atBottom = true
-    private var seenContent: CGFloat = 0
-    private var seenVisible: CGFloat = 0
-    private var seenDistance: CGFloat = 0
-    private var seenHolding = false
-
-    func derive(
-        contentHeight: CGFloat,
-        visibleMinY: CGFloat,
-        distance: CGFloat,
-        holding: Bool
-    ) -> Bool {
-        if primed,
-           contentHeight == seenContent,
-           visibleMinY == seenVisible,
-           distance == seenDistance,
-           holding == seenHolding {
-            return atBottom
-        }
-        let grew = primed && contentHeight > self.contentHeight + 0.5
-        let stayed = primed && abs(visibleMinY - self.visibleMinY) < 1
-        let next: Bool
-        if holding || (grew && stayed && atBottom) {
-            next = true
-        } else {
-            next = distance <= nearBottomSlack
-        }
-        primed = true
-        self.contentHeight = contentHeight
-        self.visibleMinY = visibleMinY
-        self.atBottom = next
-        seenContent = contentHeight
-        seenVisible = visibleMinY
-        seenDistance = distance
-        seenHolding = holding
-        return next
-    }
-}
-
-/// iOS 18: remember whether the reader was near the bottom, and re-anchor when
-/// the scroll container or its bottom inset changes. The at-bottom value is a
-/// Bool, so a drag that stays on the same side of the slack does not write
-/// state or rebuild the text view. iOS 17 uses the container size and the
-/// bottom marker instead.
-private struct TranscriptResizeStick: ViewModifier {
-    @Binding var nearBottom: Bool
-    var revealPending: Bool
-    var holdBottomUntil: Date
-    var reanchor: () -> Void
-    @State private var follow = BottomFollowMemory()
-
-    func body(content: Content) -> some View {
-        if #available(iOS 18.0, *) {
-            followScroll(content)
-        } else {
-            content
-        }
-    }
-
-    @available(iOS 18.0, *)
-    private func followScroll(_ content: Content) -> some View {
-        content
-            .onScrollGeometryChange(for: Bool.self) { geo in
-                follow.derive(
-                    contentHeight: geo.contentSize.height,
-                    visibleMinY: geo.visibleRect.minY,
-                    distance: geo.contentSize.height - geo.visibleRect.maxY,
-                    holding: Date() < holdBottomUntil
-                )
-            } action: { _, atBottom in
-                guard revealPending == false else { return }
-                if nearBottom != atBottom {
-                    nearBottom = atBottom
-                }
-            }
-            .onScrollGeometryChange(for: TranscriptContainerTick.self) { geo in
-                TranscriptContainerTick(
-                    width: Int(geo.containerSize.width.rounded()),
-                    height: Int(geo.containerSize.height.rounded()),
-                    bottomInset: Int(geo.contentInsets.bottom.rounded())
-                )
-            } action: { old, new in
-                guard revealPending == false else { return }
-                guard old.width > 1, old.height > 1 else { return }
-                guard new.width > 1, new.height > 1 else { return }
-                guard nearBottom else { return }
-                reanchor()
-            }
     }
 }
