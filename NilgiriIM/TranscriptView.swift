@@ -534,10 +534,14 @@ private final class TranscriptTextView: UITextView {
     var onChromeLayout: (() -> Void)?
     /// The live bottom inset was cleared and written back. Pin if still stuck.
     var onChromeRepaired: (() -> Void)?
+    /// A layout finished. Pin again when the reader is holding the bottom,
+    /// after glyphs and insets are settled.
+    var onPinnedLayout: (() -> Void)?
     /// Clearance for the name bar and the command bar or menu. Enforced after
     /// every layout so a scroll-view pass cannot leave the bottom at zero.
     var chromeInsets: UIEdgeInsets = .zero
     private var enforcingChrome = false
+    private var settlingHeight = false
     private var laidWidth: CGFloat = -1
     private var laidContentHeight: CGFloat = -1
     private var laidBoundsHeight: CGFloat = -1
@@ -624,6 +628,29 @@ private final class TranscriptTextView: UITextView {
         layoutManager as? TranscriptLayoutManager
     }
 
+    /// TextKit 1 lays glyphs out on demand (`allowsNonContiguousLayout`).
+    /// `contentSize` is then only the estimate, short of a wrapped +6pt line,
+    /// and the next row (the disconnect stamp) is placed on top of that line.
+    /// Returns the height after the whole storage has actually been laid out.
+    func settledContentHeight() -> CGFloat {
+        if settlingHeight {
+            return contentSize.height
+        }
+        settlingHeight = true
+        defer { settlingHeight = false }
+        let length = textStorage.length
+        if length > 0 {
+            layoutManager.ensureLayout(forCharacterRange: NSRange(location: 0, length: length))
+        }
+        layoutManager.ensureLayout(for: textContainer)
+        let used = layoutManager.usedRect(for: textContainer)
+        let laid = ceil(used.height + textContainerInset.top + textContainerInset.bottom)
+        if laid > contentSize.height + 0.5 {
+            contentSize = CGSize(width: max(contentSize.width, bounds.width), height: laid)
+        }
+        return max(contentSize.height, laid)
+    }
+
     /// Put `chromeInsets` back if layout cleared them. Returns whether it wrote.
     @discardableResult
     func enforceChromeInsets() -> Bool {
@@ -680,6 +707,9 @@ private final class TranscriptTextView: UITextView {
             onStructuralLayout?()
         } else if heightChanged, previousHeight > 1 {
             onViewportHeightChange?()
+        }
+        if boundsChanged || repaired || structural {
+            onPinnedLayout?()
         }
     }
 
@@ -741,11 +771,16 @@ private final class TranscriptHost: UIView {
 private struct TranscriptLog: UIViewRepresentable {
     var lines: [LineDTO]
     var scrollToken: Int
-    /// Name bar height. The text view's top content inset.
+    /// Name bar height. Fallback top inset until the bar's frame is known.
     var topBarHeight: CGFloat
-    /// Command bar or encamp-menu height. The text view's bottom content inset,
-    /// plus any keyboard that still overlaps the log.
+    /// Command bar or encamp-menu height. Fallback bottom inset.
     var bottomBarHeight: CGFloat
+    /// Distance from the column top to the bottom of the name bar.
+    var topClearance: CGFloat
+    /// Distance from the top of the command bar or menu to the column bottom.
+    var bottomClearance: CGFloat
+    /// Height of the column the bars are measured in.
+    var columnHeight: CGFloat
     var revealPending: Bool
     var resumeSeparatorID: String?
     var onNearBottom: (Bool) -> Void
@@ -767,6 +802,9 @@ private struct TranscriptLog: UIViewRepresentable {
         }
         view.onChromeRepaired = { [weak coordinator = context.coordinator] in
             coordinator?.chromeRepaired()
+        }
+        view.onPinnedLayout = { [weak coordinator = context.coordinator] in
+            coordinator?.layoutWhilePinned()
         }
         return host
     }
@@ -804,8 +842,14 @@ private struct TranscriptLog: UIViewRepresentable {
         coordinator.lines = lines
         let heightsChanged = abs(coordinator.topBarHeight - topBarHeight) >= 0.5
             || abs(coordinator.bottomBarHeight - bottomBarHeight) >= 0.5
+            || abs(coordinator.topClearance - topClearance) >= 0.5
+            || abs(coordinator.bottomClearance - bottomClearance) >= 0.5
+            || abs(coordinator.columnHeight - columnHeight) >= 0.5
         coordinator.topBarHeight = topBarHeight
         coordinator.bottomBarHeight = bottomBarHeight
+        coordinator.topClearance = topClearance
+        coordinator.bottomClearance = bottomClearance
+        coordinator.columnHeight = columnHeight
         coordinator.refreshChromeInsets(pinIfStuck: heightsChanged)
         let requestedScroll = coordinator.scrollToken != scrollToken
         if requestedScroll {
@@ -857,6 +901,12 @@ private struct TranscriptLog: UIViewRepresentable {
         private var portraitEnlarged: Bool?
         var topBarHeight: CGFloat = 0
         var bottomBarHeight: CGFloat = 0
+        /// Top of the column to the bottom of the name bar, in column space.
+        var topClearance: CGFloat = 0
+        /// Column bottom minus the command bar or menu's top. The overlap.
+        var bottomClearance: CGFloat = 0
+        /// Height of the SwiftUI column the bars are laid out in.
+        var columnHeight: CGFloat = 0
         /// While the keyboard frame is animating, height changes are not a
         /// second pin. The notification below scrolls once when it ends.
         private var keyboardAnimationUntil = Date.distantPast
@@ -865,6 +915,7 @@ private struct TranscriptLog: UIViewRepresentable {
         private var keyboardOverlapLatch: CGFloat?
         private var keyboardToken = 0
         private var inChrome = false
+        private var pinning = false
         /// Keyboard frame from the last ended animation, in screen coordinates.
         /// Nil until a keyboard has been shown. Not the layout guide: that
         /// guide clears this text view's bottom content inset.
@@ -895,7 +946,7 @@ private struct TranscriptLog: UIViewRepresentable {
         private func keyboardWillChange(_ note: Notification) {
             let duration = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
             if let textView {
-                keyboardOverlapLatch = bottomClearance(for: textView, latched: false)
+                keyboardOverlapLatch = extraBelowBar(for: textView, latched: false)
             }
             keyboardAnimationUntil = Date().addingTimeInterval(duration)
             keyboardToken += 1
@@ -935,6 +986,16 @@ private struct TranscriptLog: UIViewRepresentable {
             scrollToBottom(animated: false)
         }
 
+        /// Layout changed the column, the glyphs, or the inset. If the reader
+        /// is holding the bottom, scroll again after TextKit has measured.
+        func layoutWhilePinned() {
+            guard pinning == false, inChrome == false else { return }
+            guard Date() >= keyboardAnimationUntil else { return }
+            guard stickToBottom, revealing == false, revealPending == false else { return }
+            guard let textView, textView.isDragging == false, textView.isDecelerating == false else { return }
+            scrollToBottom(animated: false)
+        }
+
         /// Layout put the bottom clearance back after clearing it. Pin once.
         func chromeRepaired() {
             guard Date() >= keyboardAnimationUntil else { return }
@@ -944,18 +1005,31 @@ private struct TranscriptLog: UIViewRepresentable {
         }
 
         private func makeChromeInsets(for textView: UITextView) -> UIEdgeInsets {
-            let top = max(0, topBarHeight) + unsafeTopOverlap(in: textView)
-            let bottom = max(0, bottomBarHeight) + bottomClearance(for: textView, latched: true)
+            // The frame overlap is the bar's top measured in the column. The
+            // background GeometryReader height can come back short. Either one
+            // alone left the last line under the bar; the larger one is used.
+            let topBase = max(topClearance, max(0, topBarHeight))
+            let bottomBase = max(bottomClearance, max(0, bottomBarHeight))
+            let top = topBase + unsafeTopOverlap(in: textView)
+            let bottom = bottomBase + extraBelowBar(for: textView, latched: true)
             return UIEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
         }
 
-        /// Keyboard overlap while an animation is running, otherwise the
-        /// greater of the keyboard intersection and the home-indicator strip.
-        private func bottomClearance(for textView: UITextView, latched: Bool) -> CGFloat {
+        /// Space below the bar's top that is not the bar's own height: the
+        /// home indicator when the log hangs below the column, or the keyboard
+        /// when that ended frame still covers the log. Latched during the
+        /// keyboard animation so the inset is not rewritten every frame.
+        private func extraBelowBar(for textView: UITextView, latched: Bool) -> CGFloat {
             if latched, let keyboardOverlapLatch, Date() < keyboardAnimationUntil {
                 return keyboardOverlapLatch
             }
-            return max(measuredKeyboardOverlap(in: textView), unsafeBottomOverlap(in: textView))
+            let belowColumn: CGFloat
+            if columnHeight > 1 {
+                belowColumn = max(0, textView.bounds.height - columnHeight)
+            } else {
+                belowColumn = unsafeBottomOverlap(in: textView)
+            }
+            return max(belowColumn, measuredKeyboardOverlap(in: textView))
         }
 
         /// How far this view extends below the safe area. Zero when the log
@@ -1086,15 +1160,30 @@ private struct TranscriptLog: UIViewRepresentable {
                 guard marker.separator, marker.contentLength > 0 else { return nil }
                 return NSRange(location: marker.location, length: marker.contentLength)
             }
+            // Lay the new tail out before the next draw, so a timestamp stamp
+            // is not placed on the enlarged line above it.
+            _ = textView.settledContentHeight()
             textView.setNeedsDisplay()
         }
 
         func scrollToBottom(animated: Bool) {
             guard let textView else { return }
+            guard pinning == false else { return }
+            pinning = true
+            defer { pinning = false }
             textView.enforceChromeInsets()
             let y = maxOffset(of: textView)
             stickToBottom = true
             holdUntil = Date().addingTimeInterval(0.25)
+            setBottomOffset(y, on: textView, animated: animated)
+            // ensureLayout can grow the used rect after the first assignment.
+            let settled = maxOffset(of: textView)
+            if abs(settled - y) > 0.5 {
+                setBottomOffset(settled, on: textView, animated: false)
+            }
+        }
+
+        private func setBottomOffset(_ y: CGFloat, on textView: TranscriptTextView, animated: Bool) {
             guard abs(textView.contentOffset.y - y) > 0.5 else { return }
             programmatic += 1
             if animated {
@@ -1105,7 +1194,7 @@ private struct TranscriptLog: UIViewRepresentable {
                 })
             } else {
                 textView.setContentOffset(CGPoint(x: 0, y: y), animated: false)
-                programmatic = max(0, self.programmatic - 1)
+                programmatic = max(0, programmatic - 1)
             }
         }
 
@@ -1226,11 +1315,15 @@ private struct TranscriptLog: UIViewRepresentable {
         }
 
         private func maxOffset(of textView: UITextView) -> CGFloat {
+            let inset = restingInsets(of: textView)
+            let height: CGFloat
             if let transcript = textView as? TranscriptTextView {
                 transcript.enforceChromeInsets()
+                height = transcript.settledContentHeight()
+            } else {
+                height = textView.contentSize.height
             }
-            let inset = restingInsets(of: textView)
-            return max(-inset.top, textView.contentSize.height + inset.bottom - textView.bounds.height)
+            return max(-inset.top, height - textView.bounds.height + inset.bottom)
         }
 
         private func distanceFromBottom(of textView: UITextView) -> CGFloat {
@@ -1318,6 +1411,41 @@ private struct BottomBarHeightKey: PreferenceKey {
     }
 }
 
+private struct TopBarBoundsKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
+private struct BottomBarBoundsKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) {
+        value = nextValue() ?? value
+    }
+}
+
+private struct TopClearanceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct BottomClearanceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct ColumnHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
@@ -1335,6 +1463,12 @@ struct TranscriptView: View {
     @State private var topBarHeight: CGFloat = 0
     /// Command bar or encamp-menu height. Bottom content inset of the log.
     @State private var bottomBarHeight: CGFloat = 0
+    /// Column top to the bottom edge of the name bar.
+    @State private var topClearance: CGFloat = 0
+    /// Top edge of the command bar or menu to the column bottom.
+    @State private var bottomClearance: CGFloat = 0
+    /// Laid-out height of the column behind the bars.
+    @State private var columnHeight: CGFloat = 0
 
     /// Count and the newest line, so a capped buffer and an insert both register
     /// without observing the whole transcript array.
@@ -1350,6 +1484,9 @@ struct TranscriptView: View {
                     scrollToken: scrollToken,
                     topBarHeight: topBarHeight,
                     bottomBarHeight: bottomBarHeight,
+                    topClearance: topClearance,
+                    bottomClearance: bottomClearance,
+                    columnHeight: columnHeight,
                     revealPending: session.pendingResumeReveal,
                     resumeSeparatorID: session.resumeSeparatorID,
                     onNearBottom: { near in
@@ -1396,6 +1533,22 @@ struct TranscriptView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(screen.ignoresSafeArea())
+            .backgroundPreferenceValue(TopBarBoundsKey.self) { topAnchor in
+                GeometryReader { proxy in
+                    let top = topAnchor.map { proxy[$0].maxY } ?? 0
+                    Color.clear.preference(key: TopClearanceKey.self, value: top)
+                }
+                .allowsHitTesting(false)
+            }
+            .backgroundPreferenceValue(BottomBarBoundsKey.self) { bottomAnchor in
+                GeometryReader { proxy in
+                    let overlap = bottomAnchor.map { max(0, proxy.size.height - proxy[$0].minY) } ?? 0
+                    Color.clear
+                        .preference(key: BottomClearanceKey.self, value: overlap)
+                        .preference(key: ColumnHeightKey.self, value: proxy.size.height)
+                }
+                .allowsHitTesting(false)
+            }
             .onPreferenceChange(TopBarHeightKey.self) { height in
                 guard height > 1, abs(height - topBarHeight) > 0.5 else { return }
                 topBarHeight = height
@@ -1403,6 +1556,18 @@ struct TranscriptView: View {
             .onPreferenceChange(BottomBarHeightKey.self) { height in
                 guard height > 1, abs(height - bottomBarHeight) > 0.5 else { return }
                 bottomBarHeight = height
+            }
+            .onPreferenceChange(TopClearanceKey.self) { value in
+                guard value > 1, abs(value - topClearance) > 0.5 else { return }
+                topClearance = value
+            }
+            .onPreferenceChange(BottomClearanceKey.self) { value in
+                guard value > 1, abs(value - bottomClearance) > 0.5 else { return }
+                bottomClearance = value
+            }
+            .onPreferenceChange(ColumnHeightKey.self) { value in
+                guard value > 1, abs(value - columnHeight) > 0.5 else { return }
+                columnHeight = value
             }
             .preferredColorScheme(.dark)
             .toolbar(.hidden, for: .navigationBar)
@@ -1461,6 +1626,7 @@ struct TranscriptView: View {
             .padding(.vertical, 10)
             .frame(maxWidth: .infinity)
             .background(Chrome.barBackground, ignoresSafeAreaEdges: .top)
+            .anchorPreference(key: TopBarBoundsKey.self, value: .bounds) { $0 }
             .background {
                 GeometryReader { proxy in
                     Color.clear.preference(key: TopBarHeightKey.self, value: proxy.size.height)
@@ -1592,6 +1758,7 @@ struct TranscriptView: View {
             .padding(.vertical, 4)
         }
         .background(Chrome.barBackground, ignoresSafeAreaEdges: .bottom)
+        .anchorPreference(key: BottomBarBoundsKey.self, value: .bounds) { $0 }
         .background {
             GeometryReader { proxy in
                 Color.clear.preference(key: BottomBarHeightKey.self, value: proxy.size.height)
@@ -1660,6 +1827,7 @@ private struct GameMenuPanel: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .foregroundStyle(ink)
         .background(Chrome.barBackground, ignoresSafeAreaEdges: .bottom)
+        .anchorPreference(key: BottomBarBoundsKey.self, value: .bounds) { $0 }
         .background {
             GeometryReader { proxy in
                 Color.clear.preference(key: BottomBarHeightKey.self, value: proxy.size.height)
