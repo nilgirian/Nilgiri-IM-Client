@@ -530,8 +530,14 @@ private final class TranscriptTextView: UITextView {
     /// The menu does not: its clearance is the bottom content inset. A keyboard
     /// frame must not publish SwiftUI state from here.
     var onViewportHeightChange: (() -> Void)?
-    /// Bar insets and the keyboard guide. Must not publish SwiftUI state.
+    /// Recompute bar insets after a real size change. Must not publish SwiftUI state.
     var onChromeLayout: (() -> Void)?
+    /// The live bottom inset was cleared and written back. Pin if still stuck.
+    var onChromeRepaired: (() -> Void)?
+    /// Clearance for the name bar and the command bar or menu. Enforced after
+    /// every layout so a scroll-view pass cannot leave the bottom at zero.
+    var chromeInsets: UIEdgeInsets = .zero
+    private var enforcingChrome = false
     private var laidWidth: CGFloat = -1
     private var laidContentHeight: CGFloat = -1
     private var laidBoundsHeight: CGFloat = -1
@@ -559,13 +565,13 @@ private final class TranscriptTextView: UITextView {
         dataDetectorTypes = []
         showsVerticalScrollIndicator = true
         showsHorizontalScrollIndicator = false
-        // The coordinator writes `contentInset` and `verticalScrollIndicatorInsets`
-        // for the bars. Automatic adjustment would add that safe area again.
-        // A hidden keyboard must not count as clearance: the home indicator is
-        // outside this view, and the command bar's height is the inset.
+        // The keyboard layout guide is not used here. Attaching it makes this
+        // scroll view track keyboard insets and, with the keyboard hidden,
+        // writes a bottom content inset of zero over the command-bar clearance.
+        // Automatic adjustment would add the safe area on top of the inset the
+        // coordinator already includes when this view extends into it.
         contentInsetAdjustmentBehavior = .never
         automaticallyAdjustsScrollIndicatorInsets = false
-        keyboardLayoutGuide.usesBottomSafeArea = false
         insetsLayoutMarginsFromSafeArea = false
         clipsToBounds = true
         tintColor = UIColor(white: 0.78, alpha: 1)
@@ -618,8 +624,25 @@ private final class TranscriptTextView: UITextView {
         layoutManager as? TranscriptLayoutManager
     }
 
+    /// Put `chromeInsets` back if layout cleared them. Returns whether it wrote.
+    @discardableResult
+    func enforceChromeInsets() -> Bool {
+        guard enforcingChrome == false else { return false }
+        let desired = chromeInsets
+        guard verticalInsetsDiffer(contentInset, desired)
+            || verticalInsetsDiffer(verticalScrollIndicatorInsets, desired) else {
+            return false
+        }
+        enforcingChrome = true
+        contentInset = desired
+        verticalScrollIndicatorInsets = desired
+        enforcingChrome = false
+        return verticalInsetsDiffer(contentInset, desired) == false
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
+        let repaired = enforceChromeInsets()
         // Keyboard animation changes the height every frame. That is not a
         // reason to measure or publish. Width and the text's own height are.
         // A settled height change still pins the bottom once. The menu does
@@ -646,15 +669,22 @@ private final class TranscriptTextView: UITextView {
             laidBoundsHeight = height
             boundsChanged = true
         }
-        // Scroll frames keep the same bounds. Insets are not rewritten then.
+        // Scroll frames keep the same bounds. Insets are not rewritten then,
+        // except to put back a bottom clearance that layout just cleared.
         if boundsChanged {
             onChromeLayout?()
+        } else if repaired {
+            onChromeRepaired?()
         }
         if structural {
             onStructuralLayout?()
         } else if heightChanged, previousHeight > 1 {
             onViewportHeightChange?()
         }
+    }
+
+    private func verticalInsetsDiffer(_ lhs: UIEdgeInsets, _ rhs: UIEdgeInsets) -> Bool {
+        abs(lhs.top - rhs.top) >= 0.5 || abs(lhs.bottom - rhs.bottom) >= 0.5
     }
 }
 
@@ -734,6 +764,9 @@ private struct TranscriptLog: UIViewRepresentable {
         }
         view.onChromeLayout = { [weak coordinator = context.coordinator] in
             coordinator?.refreshChromeInsets(pinIfStuck: false)
+        }
+        view.onChromeRepaired = { [weak coordinator = context.coordinator] in
+            coordinator?.chromeRepaired()
         }
         return host
     }
@@ -832,9 +865,10 @@ private struct TranscriptLog: UIViewRepresentable {
         private var keyboardOverlapLatch: CGFloat?
         private var keyboardToken = 0
         private var inChrome = false
-        /// Last insets written onto the text view. Compared here so a scroll
-        /// frame does not reapply them when UIKit's read-back differs.
-        private var appliedChrome = UIEdgeInsets(top: -1, left: -1, bottom: -1, right: -1)
+        /// Keyboard frame from the last ended animation, in screen coordinates.
+        /// Nil until a keyboard has been shown. Not the layout guide: that
+        /// guide clears this text view's bottom content inset.
+        private var keyboardEndFrame: CGRect?
         private var keyboardObserver: NSObjectProtocol?
 
         override init() {
@@ -856,19 +890,23 @@ private struct TranscriptLog: UIViewRepresentable {
 
         /// One follow-up after the keyboard animation, not one per frame.
         /// The bar moves with the keyboard safe area. The bottom inset gains
-        /// the keyboard only when that guide still overlaps the log, and the
-        /// overlap stays latched until the animation ends.
+        /// the keyboard only when that ended frame still overlaps the log, and
+        /// the overlap stays latched until the animation ends.
         private func keyboardWillChange(_ note: Notification) {
             let duration = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
-            keyboardOverlapLatch = max(0, appliedChrome.bottom - max(0, bottomBarHeight))
+            if let textView {
+                keyboardOverlapLatch = bottomClearance(for: textView, latched: false)
+            }
             keyboardAnimationUntil = Date().addingTimeInterval(duration)
             keyboardToken += 1
             let token = keyboardToken
+            let end = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
             let wasStuck = stickToBottom && revealing == false && revealPending == false
             DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
                 guard let coordinator = self, token == coordinator.keyboardToken else { return }
                 coordinator.keyboardOverlapLatch = nil
                 coordinator.keyboardAnimationUntil = .distantPast
+                coordinator.keyboardEndFrame = end
                 coordinator.refreshChromeInsets(pinIfStuck: false)
                 guard wasStuck, coordinator.stickToBottom, coordinator.revealing == false,
                       coordinator.revealPending == false else { return }
@@ -877,63 +915,84 @@ private struct TranscriptLog: UIViewRepresentable {
         }
 
         /// Top inset is the name bar. Bottom inset is the command bar or the
-        /// encamp menu, plus the keyboard where it still covers this view.
+        /// encamp menu, plus the home indicator when this view extends into it,
+        /// plus the keyboard where that ended frame still covers the log.
         /// The frame stays the full column, so a taller menu does not shorten it.
         func refreshChromeInsets(pinIfStuck: Bool) {
             guard inChrome == false else { return }
             guard let textView, textView.bounds.width > 1, textView.bounds.height > 1 else { return }
+            let insets = makeChromeInsets(for: textView)
+            let changed = verticalInsetsDiffer(textView.chromeInsets, insets)
+                || verticalInsetsDiffer(textView.contentInset, insets)
+            guard changed || pinIfStuck else { return }
             inChrome = true
             defer { inChrome = false }
-            let insets = chromeInsets(for: textView)
-            let changed = insetsDiffer(appliedChrome, insets)
-            if changed {
-                appliedChrome = insets
-                programmatic += 1
-                textView.contentInset = insets
-                textView.verticalScrollIndicatorInsets = insets
-                programmatic = max(0, programmatic - 1)
-            }
-            guard pinIfStuck || changed else { return }
+            textView.chromeInsets = insets
+            textView.enforceChromeInsets()
             guard stickToBottom, revealing == false, revealPending == false else { return }
             guard textView.isDragging == false, textView.isDecelerating == false else { return }
+            guard Date() >= keyboardAnimationUntil || pinIfStuck else { return }
             scrollToBottom(animated: false)
         }
 
-        private func chromeInsets(for textView: UITextView) -> UIEdgeInsets {
-            UIEdgeInsets(
-                top: max(0, topBarHeight),
-                left: 0,
-                bottom: max(0, bottomBarHeight) + keyboardOverlap(for: textView),
-                right: 0
-            )
+        /// Layout put the bottom clearance back after clearing it. Pin once.
+        func chromeRepaired() {
+            guard Date() >= keyboardAnimationUntil else { return }
+            guard stickToBottom, revealing == false, revealPending == false else { return }
+            guard let textView, textView.isDragging == false, textView.isDecelerating == false else { return }
+            scrollToBottom(animated: false)
         }
 
-        private func keyboardOverlap(for textView: UITextView) -> CGFloat {
-            if let keyboardOverlapLatch, Date() < keyboardAnimationUntil {
+        private func makeChromeInsets(for textView: UITextView) -> UIEdgeInsets {
+            let top = max(0, topBarHeight) + unsafeTopOverlap(in: textView)
+            let bottom = max(0, bottomBarHeight) + bottomClearance(for: textView, latched: true)
+            return UIEdgeInsets(top: top, left: 0, bottom: bottom, right: 0)
+        }
+
+        /// Keyboard overlap while an animation is running, otherwise the
+        /// greater of the keyboard intersection and the home-indicator strip.
+        private func bottomClearance(for textView: UITextView, latched: Bool) -> CGFloat {
+            if latched, let keyboardOverlapLatch, Date() < keyboardAnimationUntil {
                 return keyboardOverlapLatch
             }
-            return measuredKeyboardOverlap(in: textView)
+            return max(measuredKeyboardOverlap(in: textView), unsafeBottomOverlap(in: textView))
         }
 
-        /// Height of the keyboard layout guide that actually intersects the
-        /// log. Zero when the safe area has already lifted the log clear, and
-        /// zero while the keyboard is hidden (`usesBottomSafeArea` is false).
+        /// How far this view extends below the safe area. Zero when the log
+        /// already ends at the top of the home indicator.
+        private func unsafeBottomOverlap(in textView: UITextView) -> CGFloat {
+            guard let window = textView.window else { return 0 }
+            let frame = textView.convert(textView.bounds, to: window)
+            let safeMaxY = window.bounds.maxY - window.safeAreaInsets.bottom
+            return max(0, frame.maxY - safeMaxY)
+        }
+
+        /// How far this view extends above the safe area, under the status bar.
+        private func unsafeTopOverlap(in textView: UITextView) -> CGFloat {
+            guard let window = textView.window else { return 0 }
+            let frame = textView.convert(textView.bounds, to: window)
+            let safeMinY = window.bounds.minY + window.safeAreaInsets.top
+            return max(0, safeMinY - frame.minY)
+        }
+
+        /// Intersection of the last keyboard frame with this view. Zero when
+        /// the safe area has already lifted the log clear of the keyboard, and
+        /// zero for a floating keyboard that does not reach the bottom edge.
         private func measuredKeyboardOverlap(in textView: UITextView) -> CGFloat {
-            let guide = textView.keyboardLayoutGuide.layoutFrame
-            guard guide.height > 0.5, textView.bounds.height > 1 else { return 0 }
-            let overlap = textView.bounds.intersection(guide)
+            guard let keyboardEndFrame, let window = textView.window else { return 0 }
+            guard textView.bounds.height > 1 else { return 0 }
+            let screen = window.windowScene?.screen
+            let inWindow = screen.map { window.convert(keyboardEndFrame, from: $0.coordinateSpace) } ?? keyboardEndFrame
+            guard inWindow.maxY >= window.bounds.maxY - 1 else { return 0 }
+            let inView = textView.convert(inWindow, from: window)
+            let overlap = textView.bounds.intersection(inView)
             guard overlap.isNull == false, overlap.height > 0.5 else { return 0 }
-            // Docked keyboard covers the bottom edge. A guide that stops
-            // short of it (a floating keyboard) does not move this bar.
             guard overlap.maxY >= textView.bounds.maxY - 1 else { return 0 }
             return overlap.height
         }
 
-        private func insetsDiffer(_ lhs: UIEdgeInsets, _ rhs: UIEdgeInsets) -> Bool {
-            abs(lhs.top - rhs.top) >= 0.5
-                || abs(lhs.left - rhs.left) >= 0.5
-                || abs(lhs.bottom - rhs.bottom) >= 0.5
-                || abs(lhs.right - rhs.right) >= 0.5
+        private func verticalInsetsDiffer(_ lhs: UIEdgeInsets, _ rhs: UIEdgeInsets) -> Bool {
+            abs(lhs.top - rhs.top) >= 0.5 || abs(lhs.bottom - rhs.bottom) >= 0.5
         }
 
         func noteLayout() {
@@ -1032,6 +1091,7 @@ private struct TranscriptLog: UIViewRepresentable {
 
         func scrollToBottom(animated: Bool) {
             guard let textView else { return }
+            textView.enforceChromeInsets()
             let y = maxOffset(of: textView)
             stickToBottom = true
             holdUntil = Date().addingTimeInterval(0.25)
@@ -1085,11 +1145,11 @@ private struct TranscriptLog: UIViewRepresentable {
                 return
             }
             guard let rect = rect(of: marker, in: textView), rect.height > 0 else { return }
-            let visible = textView.bounds.height
-                - textView.adjustedContentInset.top
-                - textView.adjustedContentInset.bottom
+            textView.enforceChromeInsets()
+            let inset = restingInsets(of: textView)
+            let visible = textView.bounds.height - inset.top - inset.bottom
             var y = rect.maxY - visible
-            y = min(max(y, -textView.adjustedContentInset.top), maxOffset(of: textView))
+            y = min(max(y, -inset.top), maxOffset(of: textView))
             programmatic += 1
             textView.setContentOffset(CGPoint(x: 0, y: y), animated: false)
             programmatic = max(0, self.programmatic - 1)
@@ -1154,13 +1214,27 @@ private struct TranscriptLog: UIViewRepresentable {
             return rect
         }
 
+        /// The clearance actually written onto the text view. `adjustedContentInset`
+        /// is not used: with the keyboard guide detached it can still read as
+        /// zero after layout clears `contentInset`, which parks the last line
+        /// under the command bar.
+        private func restingInsets(of textView: UITextView) -> UIEdgeInsets {
+            if let transcript = textView as? TranscriptTextView {
+                return transcript.chromeInsets
+            }
+            return textView.contentInset
+        }
+
         private func maxOffset(of textView: UITextView) -> CGFloat {
-            let inset = textView.adjustedContentInset
+            if let transcript = textView as? TranscriptTextView {
+                transcript.enforceChromeInsets()
+            }
+            let inset = restingInsets(of: textView)
             return max(-inset.top, textView.contentSize.height + inset.bottom - textView.bounds.height)
         }
 
         private func distanceFromBottom(of textView: UITextView) -> CGFloat {
-            let inset = textView.adjustedContentInset
+            let inset = restingInsets(of: textView)
             let visibleMax = textView.contentOffset.y + textView.bounds.height - inset.bottom
             return textView.contentSize.height - visibleMax
         }
@@ -1315,14 +1389,6 @@ struct TranscriptView: View {
                             GameMenuPanel()
                         } else {
                             inputBar
-                        }
-                    }
-                    .background {
-                        GeometryReader { proxy in
-                            Color.clear.preference(
-                                key: BottomBarHeightKey.self,
-                                value: proxy.size.height
-                            )
                         }
                     }
                     .layoutPriority(1)
@@ -1526,6 +1592,11 @@ struct TranscriptView: View {
             .padding(.vertical, 4)
         }
         .background(Chrome.barBackground, ignoresSafeAreaEdges: .bottom)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: BottomBarHeightKey.self, value: proxy.size.height)
+            }
+        }
         .simultaneousGesture(
             DragGesture(minimumDistance: 15)
                 .onEnded { value in
@@ -1589,6 +1660,11 @@ private struct GameMenuPanel: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .foregroundStyle(ink)
         .background(Chrome.barBackground, ignoresSafeAreaEdges: .bottom)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: BottomBarHeightKey.self, value: proxy.size.height)
+            }
+        }
         .toolbar {
             if changingPassword {
                 ToolbarItemGroup(placement: .keyboard) {
