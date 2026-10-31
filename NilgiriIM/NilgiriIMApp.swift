@@ -26,7 +26,7 @@ struct NilgiriIMApp: App {
                 .task {
                     guard showLaunchSplash else { return }
                     do {
-                        try await Task.sleep(for: .seconds(1))
+                        try await Task.sleep(for: .seconds(2))
                     } catch {
                         return
                     }
@@ -68,26 +68,26 @@ private func clearDeliveredNotificationsAndBadge(_ session: IMSession) {
     }
 }
 
-/// Black cover over the root for about a second, then a short fade.
+/// White cover over the root for about two seconds, then a short fade.
 /// Display name, version, and build are read from the generated Info.plist.
+/// Black on white stays the same in light and dark mode.
 private struct LaunchSplash: View {
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            Color.white.ignoresSafeArea()
             VStack(spacing: 6) {
                 Text(appName)
                     .font(.title2.weight(.semibold))
-                    .foregroundStyle(Color(white: 0.78))
+                    .foregroundStyle(Color.black)
                     .multilineTextAlignment(.center)
                 Text(versionLine)
                     .font(.subheadline)
-                    .foregroundStyle(Color(white: 0.78))
+                    .foregroundStyle(Color.black)
                     .multilineTextAlignment(.center)
             }
             .padding(.horizontal, 32)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .preferredColorScheme(.dark)
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isModal)
     }
