@@ -11,6 +11,108 @@ private func transcriptFontSize(for width: CGFloat) -> CGFloat {
     max(8, (width - 16) / CGFloat(terminalColumns) / 0.62)
 }
 
+/// How many monospaced columns of `fontSize` fit the transcript slot.
+/// The base font is chosen so this is 80. A larger face fits fewer, and the
+/// paragraph clips, so the wrap has to come from this count.
+private func transcriptColumns(forFontSize fontSize: CGFloat, width: CGFloat) -> Int {
+    let usable = width - 16
+    guard fontSize > 0, usable > 0 else { return terminalColumns }
+    let columns = Int((usable / (fontSize * 0.62)).rounded(.down))
+    return max(1, min(terminalColumns, columns))
+}
+
+/// Portrait when the window is taller than it is wide. A phone size class
+/// is the fallback before that window has a size. The text view's height is
+/// left out of this, because the keyboard shortens the log without a rotation.
+private func transcriptIsPortrait(_ view: UIView) -> Bool {
+    if let window = view.window, window.bounds.width > 1, window.bounds.height > 1 {
+        return window.bounds.height >= window.bounds.width
+    }
+    let traits = view.traitCollection
+    if traits.verticalSizeClass == .compact {
+        return false
+    }
+    if traits.horizontalSizeClass == .compact, traits.verticalSizeClass == .regular {
+        return true
+    }
+    return UIScreen.main.bounds.height >= UIScreen.main.bounds.width
+}
+
+/// Channel speech. The client does not paint channels itself; it shows the
+/// MUD's ANSI. A line is communication when its `kind` already names a
+/// channel, or when the visible sentence is one of those channel lines.
+/// The test reads a copy with ANSI removed. The stored line is not edited.
+private enum CommunicationLine {
+    static let portraitBoost: CGFloat = 6
+
+    private static let kinds: Set<String> = [
+        "say", "says",
+        "ask", "asks",
+        "exclaim", "exclaims",
+        "question", "questions",
+        "gossip", "gossips",
+        "wizard", "wiz", "wiznet", "wizards", "wiznets",
+        "shout", "shouts",
+        "tell", "tells",
+        "whisper", "whispers",
+        "yell", "yells",
+        "murmur", "murmurs",
+        "pray", "prays"
+    ]
+
+    /// `You say, "hi"` / `You exclaim, 'Level!'` / `You tell Bob, "hi"`.
+    /// `Sin gossips, "hi"` / `The bartender says, "hi"` / `Sin tells you, "hi"`.
+    /// `Sin whispers to you, "hi"` / `You question, "hi"` / `You wizard, "hi"`.
+    /// The quote closes the line, so a room sentence that only mentions speech
+    /// stays at the normal size.
+    private static let expression: NSRegularExpression = {
+        let simple = "says?|asks?|exclaims?|questions?|gossips?|shouts?|yells?|whispers?|murmurs?|prays?|wiz(?:ards?|nets?)?"
+        let speaker = "[A-Z][A-Za-z0-9'._-]{0,40}(?: [A-Za-z0-9'._-]{1,40}){0,5}"
+        let directed = "whispers? to [^,'\"]+|tells? [^,'\"]+"
+        let pattern = "^" + speaker + " (?:(?:" + directed + ")|(?:" + simple + ")), [\"'][\\s\\S]*[\"']\\s*$"
+        return try! NSRegularExpression(pattern: pattern)
+    }()
+
+    static func isCommunication(_ line: LineDTO) -> Bool {
+        if line.isSeparator { return false }
+        let kind = line.kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if kinds.contains(kind) { return true }
+        return matches(line.text)
+    }
+
+    private static func matches(_ raw: String) -> Bool {
+        let visible = strippingCSI(raw)
+        guard visible.isEmpty == false else { return false }
+        let range = NSRange(visible.startIndex..., in: visible)
+        return expression.firstMatch(in: visible, options: [], range: range) != nil
+    }
+
+    private static func strippingCSI(_ raw: String) -> String {
+        var out = ""
+        var index = raw.startIndex
+        while index < raw.endIndex {
+            if raw[index] == "\u{001B}" {
+                let bracket = raw.index(after: index)
+                if bracket < raw.endIndex, raw[bracket] == "[" {
+                    var cursor = raw.index(after: bracket)
+                    while cursor < raw.endIndex {
+                        let character = raw[cursor]
+                        cursor = raw.index(after: cursor)
+                        if (character >= "A" && character <= "Z") || (character >= "a" && character <= "z") {
+                            break
+                        }
+                    }
+                    index = cursor
+                    continue
+                }
+            }
+            out.append(raw[index])
+            index = raw.index(after: index)
+        }
+        return out
+    }
+}
+
 /// SGR colour carried across transcript rows. Keyed by line id so a 4000-line
 /// buffer is not reparsed on scroll: only a changed suffix is scanned, and a
 /// separator passes the previous colour through. Surviving ids keep the end
@@ -142,19 +244,28 @@ private struct TranscriptEdit {
     var text: NSAttributedString
 }
 
-/// One attributed transcript. A scroll frame that does not change the lines
-/// or the font does not rebuild it. Appending lines keeps the prefix.
+/// One attributed transcript. A scroll frame that does not change the lines,
+/// the font, or portrait-vs-landscape does not rebuild it. Appending lines
+/// keeps the prefix. A portrait flip restyles the whole log once.
 private final class TranscriptDocumentStore {
     private(set) var attributed = NSAttributedString()
     private(set) var markers: [DocMarker] = []
 
     private var fontSize: CGFloat = -1
+    private var enlargeCommunication = false
+    /// Columns used when a portrait communication line is drawn larger.
+    /// Normal lines stay at 80. A scroll frame does not change this.
+    private var communicationColumns = terminalColumns
+    private var slotWidth: CGFloat = 0
     private var ids: [String] = []
     private var sigs: [Int] = []
     private var working = NSMutableAttributedString()
     private var held: [LineDTO] = []
     private var needsJoiner = false
     private var lastWasSeparator = false
+    /// Font size of the mud line the next newline closes. A portrait
+    /// communication line keeps that larger size on its break.
+    private var lastMudFontSize: CGFloat = 0
 
     private let mudParagraph: NSParagraphStyle = {
         let style = NSMutableParagraphStyle()
@@ -175,16 +286,30 @@ private final class TranscriptDocumentStore {
         return style
     }()
 
-    func update(lines: [LineDTO], fontSize: CGFloat, carry: ColourCarryCache) -> TranscriptEdit? {
+    func update(
+        lines: [LineDTO],
+        fontSize: CGFloat,
+        width: CGFloat,
+        enlargeCommunication: Bool,
+        carry: ColourCarryCache
+    ) -> TranscriptEdit? {
         carry.prepare(lines)
-        if sameStorage(lines, held), abs(self.fontSize - fontSize) < 0.01 {
+        let columns = enlargeCommunication
+            ? transcriptColumns(forFontSize: fontSize + CommunicationLine.portraitBoost, width: width)
+            : terminalColumns
+        if sameStorage(lines, held),
+           abs(self.fontSize - fontSize) < 0.01,
+           self.enlargeCommunication == enlargeCommunication,
+           self.communicationColumns == columns {
             return nil
         }
-        let fontChanged = abs(self.fontSize - fontSize) >= 0.01
+        let styleChanged = abs(self.fontSize - fontSize) >= 0.01
+            || self.enlargeCommunication != enlargeCommunication
+            || self.communicationColumns != columns
         let signatures = lines.map(signature)
         let lineIDs = lines.map(\.id)
         var index = 0
-        if fontChanged == false {
+        if styleChanged == false {
             let prefix = min(ids.count, lines.count)
             while index < prefix, ids[index] == lineIDs[index], sigs[index] == signatures[index] {
                 index += 1
@@ -206,6 +331,9 @@ private final class TranscriptDocumentStore {
             lines,
             from: index,
             fontSize: fontSize,
+            width: width,
+            communicationColumns: columns,
+            enlargeCommunication: enlargeCommunication,
             carry: carry,
             signatures: signatures,
             lineIDs: lineIDs
@@ -239,11 +367,17 @@ private final class TranscriptDocumentStore {
         _ lines: [LineDTO],
         from index: Int,
         fontSize: CGFloat,
+        width: CGFloat,
+        communicationColumns: Int,
+        enlargeCommunication: Bool,
         carry: ColourCarryCache,
         signatures: [Int],
         lineIDs: [String]
     ) {
         self.fontSize = fontSize
+        self.slotWidth = width
+        self.communicationColumns = communicationColumns
+        self.enlargeCommunication = enlargeCommunication
         if index == 0 {
             working = NSMutableAttributedString()
             markers = []
@@ -251,6 +385,7 @@ private final class TranscriptDocumentStore {
             sigs = []
             needsJoiner = false
             lastWasSeparator = false
+            lastMudFontSize = fontSize
         } else if index < markers.count {
             let cut = markers[index].location
             if cut < working.length {
@@ -275,7 +410,7 @@ private final class TranscriptDocumentStore {
 
     private func append(_ line: LineDTO, fontSize: CGFloat, carry: ColourCarryCache) {
         if needsJoiner {
-            working.append(joiner(separator: lastWasSeparator, fontSize: fontSize))
+            working.append(joiner(separator: lastWasSeparator, fontSize: lastMudFontSize))
         }
         let start = working.length
         if line.isSeparator {
@@ -285,11 +420,14 @@ private final class TranscriptDocumentStore {
                 .foregroundColor: UIColor.secondaryLabel,
                 .paragraphStyle: separatorParagraph
             ]))
+            lastMudFontSize = fontSize
         } else {
+            let size = displayFontSize(line, base: fontSize)
+            lastMudFontSize = size
             let piece = NSMutableAttributedString(attributedString: Ansi.attributed(
                 line.text,
-                fontSize: fontSize,
-                columns: terminalColumns,
+                fontSize: size,
+                columns: columns(forDisplaySize: size, base: fontSize),
                 initial: carry.startState(for: line.id)
             ))
             if piece.length > 0 {
@@ -309,6 +447,25 @@ private final class TranscriptDocumentStore {
         ))
         lastWasSeparator = line.isSeparator
         needsJoiner = true
+    }
+
+    /// Portrait communication is six points above the normal transcript size.
+    /// Landscape passes the normal size through. Characters, colours, and
+    /// links come from `Ansi` unchanged.
+    private func displayFontSize(_ line: LineDTO, base: CGFloat) -> CGFloat {
+        guard enlargeCommunication, CommunicationLine.isCommunication(line) else { return base }
+        return base + CommunicationLine.portraitBoost
+    }
+
+    /// Normal lines stay on the 80-column wrap. A larger portrait line wraps
+    /// at the fewer columns that fit the same slot, still as display breaks
+    /// only. The stored MUD text is not edited.
+    private func columns(forDisplaySize size: CGFloat, base: CGFloat) -> Int {
+        guard size > base + 0.01 else { return terminalColumns }
+        if communicationColumns > 0 {
+            return communicationColumns
+        }
+        return transcriptColumns(forFontSize: size, width: slotWidth)
     }
 
     private func joiner(separator: Bool, fontSize: CGFloat) -> NSAttributedString {
@@ -413,6 +570,13 @@ private final class TranscriptTextView: UITextView {
             .underlineColor: link
         ]
         textDragInteraction?.isEnabled = false
+        _ = registerForTraitChanges([
+            UITraitHorizontalSizeClass.self,
+            UITraitVerticalSizeClass.self
+        ]) { (view: Self, _: UITraitCollection) in
+            // One call when the size class flips, not once per animation frame.
+            view.onStructuralLayout?()
+        }
         // #74: the unwrapped line must not become this view's width.
         setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         setContentCompressionResistancePriority(.defaultLow, for: .vertical)
@@ -622,6 +786,9 @@ private struct TranscriptLog: UIViewRepresentable {
         var publishGeneration = 0
         var stickQueued = false
         var lastOffsetY: CGFloat = 0
+        /// Last portrait decision. Nil until the text view has a real width,
+        /// so the first layout is not treated as a rotation.
+        private var portraitEnlarged: Bool?
         /// While the keyboard frame is animating, height changes are not a
         /// second pin. The notification below scrolls once when it ends.
         private var keyboardAnimationUntil = Date.distantPast
@@ -682,7 +849,24 @@ private struct TranscriptLog: UIViewRepresentable {
             applying = true
             defer { applying = false }
             let font = transcriptFontSize(for: textView.bounds.width)
-            guard let edit = store.update(lines: lines, fontSize: font, carry: carry) else { return }
+            let portrait = transcriptIsPortrait(textView)
+            let flipped = portraitEnlarged != nil && portraitEnlarged != portrait
+            let wasAtBottom = stickToBottom || nearBottom
+            if flipped, wasAtBottom {
+                // Rotation keeps reporting scroll events while the text
+                // restyles. Hold the bottom pin across that animation.
+                stickToBottom = true
+                nearBottom = true
+                holdUntil = Date().addingTimeInterval(0.6)
+            }
+            portraitEnlarged = portrait
+            guard let edit = store.update(
+                lines: lines,
+                fontSize: font,
+                width: textView.bounds.width,
+                enlargeCommunication: portrait,
+                carry: carry
+            ) else { return }
             apply(edit, to: textView)
             if revealing {
                 deferredBottom = true
