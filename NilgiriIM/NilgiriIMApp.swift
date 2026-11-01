@@ -7,11 +7,14 @@ struct NilgiriIMApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var session = IMSession()
+    /// Launch cover only. Session restore starts in the same appearance and is not gated on this.
+    @State private var showLaunchSplash = true
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(session)
+                .accessibilityHidden(showLaunchSplash)
                 .onAppear {
                     AppDelegate.session = session
                     clearDeliveredNotificationsAndBadge(session)
@@ -19,6 +22,25 @@ struct NilgiriIMApp: App {
                 .task {
                     await session.restoreOnLaunch()
                     await PushRegistration.request(session: session)
+                }
+                .task {
+                    guard showLaunchSplash else { return }
+                    do {
+                        try await Task.sleep(for: .seconds(2))
+                    } catch {
+                        return
+                    }
+                    showLaunchSplash = false
+                }
+                .overlay {
+                    ZStack {
+                        if showLaunchSplash {
+                            LaunchSplash()
+                                .transition(.opacity)
+                        }
+                    }
+                    .animation(.easeOut(duration: 0.35), value: showLaunchSplash)
+                    .allowsHitTesting(showLaunchSplash)
                 }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -43,6 +65,47 @@ private func clearDeliveredNotificationsAndBadge(_ session: IMSession) {
     // IMSession is @MainActor. This helper is a nonisolated free function.
     Task { @MainActor in
         session.resetServerBadge()
+    }
+}
+
+/// White cover over the root for about two seconds, then a short fade.
+/// Display name, version, and build are read from the generated Info.plist.
+/// Black on white stays the same in light and dark mode.
+private struct LaunchSplash: View {
+    var body: some View {
+        ZStack {
+            Color.white.ignoresSafeArea()
+            VStack(spacing: 6) {
+                Text(appName)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(Color.black)
+                    .multilineTextAlignment(.center)
+                Text(versionLine)
+                    .font(.subheadline)
+                    .foregroundStyle(Color.black)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal, 32)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isModal)
+    }
+
+    /// `CFBundleDisplayName` ("Nilgiri IM").
+    private var appName: String {
+        bundleString("CFBundleDisplayName")
+    }
+
+    /// "Version <CFBundleShortVersionString> (build <CFBundleVersion>)".
+    private var versionLine: String {
+        let version = bundleString("CFBundleShortVersionString")
+        let build = bundleString("CFBundleVersion")
+        return "Version \(version) (build \(build))"
+    }
+
+    private func bundleString(_ key: String) -> String {
+        Bundle.main.infoDictionary?[key] as? String ?? ""
     }
 }
 
