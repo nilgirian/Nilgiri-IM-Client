@@ -2573,7 +2573,8 @@ private struct GameMenuPanel: View {
 }
 
 /// One row of compass commands on the input bar's frost. Each tap posts the
-/// full direction through `session.send()`, the same as typing it.
+/// full direction through `session.send()`, the same as typing it. The pressed
+/// letter stays lit for half a second, then returns to ink.
 private struct ActionPanel: View {
     var send: (String) -> Void
 
@@ -2592,22 +2593,51 @@ private struct ActionPanel: View {
         Direction(label: "D", command: "down"),
     ]
 
+    /// Commands whose letters are lit. A second tap of the same letter restarts the half second.
+    @State private var litCommands: Set<String> = []
+    /// Per-command generation so an earlier timer cannot put the light out early.
+    @State private var lightTokens: [String: Int] = [:]
+
     var body: some View {
         HStack(spacing: 0) {
             ForEach(Self.directions) { direction in
+                let lit = litCommands.contains(direction.command)
                 Button(direction.label) {
+                    light(direction.command)
                     send(direction.command)
                 }
                 .buttonStyle(.plain)
                 .font(.system(.body, design: .monospaced))
-                .foregroundStyle(ink)
+                .foregroundStyle(lit ? Color.white : ink)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
+                .background {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.white.opacity(lit ? 0.42 : 0))
+                        .padding(.horizontal, 3)
+                        .padding(.vertical, 3)
+                }
                 .contentShape(Rectangle())
                 .accessibilityLabel(direction.command)
             }
         }
         .padding(.horizontal, 4)
         .padding(.top, 4)
+    }
+
+    /// Brighten this letter for half a second. The button still sends the command.
+    private func light(_ command: String) {
+        let token = (lightTokens[command] ?? 0) + 1
+        lightTokens[command] = token
+        withAnimation(.easeOut(duration: 0.08)) {
+            litCommands.insert(command)
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard lightTokens[command] == token else { return }
+            withAnimation(.easeOut(duration: 0.15)) {
+                litCommands.remove(command)
+            }
+        }
     }
 }
