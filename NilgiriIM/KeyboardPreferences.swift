@@ -97,17 +97,26 @@ struct WindowPortraitProbe: UIViewRepresentable {
 }
 
 /// Dark grey card on the left edge. A rightward swipe from that edge opens it.
-/// The two switches are the portrait and landscape keyboard prefs.
+/// Portrait and landscape keyboard switches stay at the top. Report issues and
+/// the newbie guide open in Safari. Unlink, while the player is in the game,
+/// sits at the bottom of the card.
 struct KeyboardSettingsDrawer: View {
     @ObservedObject var preferences: KeyboardHidePreferences
     /// Toggled by the accessibility action. Each change opens the card.
     @Binding var openRequest: Bool
+    /// False on the welcome menu. Unlink is an in-game control.
+    var showsUnlink: Bool
+    /// Closes the MUD session. The caller owns the logout.
+    var onUnlink: () -> Void
     /// The card settled open or closed. Not called during the drag, so a swipe
     /// that slides back shut does not dismiss the keyboard and bring it back.
     var onOpenChange: (Bool) -> Void
 
     /// Dark grey, see-through, so the log shows behind the card.
     private static let menuGrey = Color(white: 0.22).opacity(0.55)
+
+    private static let reportIssuesURL = "https://github.com/nilgirian/Nilgiri-IM-Client/issues/new/choose"
+    private static let newbieGuideURL = "https://nilgiri.net/nilgiri/newbie-strategy"
 
     @State private var travel: CGFloat = 0
     @State private var dragOrigin: CGFloat?
@@ -142,7 +151,7 @@ struct KeyboardSettingsDrawer: View {
                     .ignoresSafeArea()
                     .accessibilityHidden(true)
 
-                    card(width: width, insets: insets)
+                    card(width: width, height: geo.size.height, insets: insets)
                         .offset(x: travel - width)
                         .accessibilityHidden(travel < width * 0.8)
                         .simultaneousGesture(pan(width: width, edge: edge, fromEdgeOnly: false))
@@ -181,21 +190,44 @@ struct KeyboardSettingsDrawer: View {
         return scene?.keyWindow?.safeAreaInsets ?? scene?.windows.first?.safeAreaInsets ?? .zero
     }
 
-    private func card(width: CGFloat, insets: UIEdgeInsets) -> some View {
-        VStack(alignment: .leading, spacing: 22) {
-            Text("Keyboard")
-                .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                .foregroundStyle(Color(white: 0.62))
-            Toggle("Hide keyboard in portrait mode", isOn: $preferences.hideInPortrait)
-            Toggle("Hide keyboard in landscape mode", isOn: $preferences.hideInLandscape)
+    private func card(width: CGFloat, height: CGFloat, insets: UIEdgeInsets) -> some View {
+        // The column is at least as tall as the window, so Unlink rests on the
+        // bottom when the rows fit. A short landscape window scrolls instead
+        // of clipping that button. Bounce stays off while nothing overflows.
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 22) {
+                Text("Keyboard")
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Color(white: 0.62))
+                Toggle("Hide keyboard in portrait mode", isOn: $preferences.hideInPortrait)
+                Toggle("Hide keyboard in landscape mode", isOn: $preferences.hideInLandscape)
+                VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("To report issues, take a screenshot and you should have an option to \"Share Beta Feedback\" or use this link to")
+                            .fixedSize(horizontal: false, vertical: true)
+                        infoLink("Report issues", urlString: Self.reportIssuesURL)
+                    }
+                    infoLink("Newbie guide", urlString: Self.newbieGuideURL)
+                }
+                if showsUnlink {
+                    Spacer(minLength: 22)
+                    unlinkButton
+                }
+            }
+            .font(.system(size: 17))
+            .toggleStyle(.switch)
+            .tint(Color(white: 0.78))
+            .foregroundStyle(Color(white: 0.92))
+            .padding(.leading, insets.left + 20)
+            .padding(.trailing, 18)
+            .padding(.top, insets.top + 24)
+            .padding(.bottom, insets.bottom + 20)
+            .frame(maxWidth: .infinity, minHeight: height, alignment: .topLeading)
         }
-        .font(.system(size: 17))
-        .toggleStyle(.switch)
-        .tint(Color(white: 0.78))
-        .foregroundStyle(Color(white: 0.92))
-        .padding(.leading, insets.left + 20)
-        .padding(.trailing, 18)
-        .padding(.top, insets.top + 24)
+        .scrollBounceBehavior(.basedOnSize)
+        // The drawer already pads for the notch. A scroll view would add that
+        // inset again and leave a gap above Keyboard.
+        .ignoresSafeArea()
         .frame(width: width, alignment: .topLeading)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(Self.menuGrey)
@@ -214,6 +246,36 @@ struct KeyboardSettingsDrawer: View {
                 .frame(width: 1)
         }
         .shadow(color: .black.opacity(0.45), radius: 14, x: 8, y: 0)
+    }
+
+    /// Same open path as a link in the log: `UIApplication.shared.open`, which
+    /// hands http to Safari.
+    private func infoLink(_ title: String, urlString: String) -> some View {
+        Button {
+            guard let url = URL(string: urlString) else { return }
+            UIApplication.shared.open(url)
+        } label: {
+            Text(title)
+                .underline()
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(.isLink)
+        .accessibilityHint("Opens in Safari")
+    }
+
+    /// Bottom of the card. The log no longer has a floating Unlink control.
+    private var unlinkButton: some View {
+        Button(action: onUnlink) {
+            Text("Unlink")
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.white.opacity(0.12), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Unlink")
     }
 
     /// Opens from the left edge, or follows a finger that is already dragging the card.
