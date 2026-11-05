@@ -285,6 +285,7 @@ enum OutageKind: Equatable {
 }
 
 /// The MUD status prompt, for example `<30h 100m 97v>` or `<30h 100m 97v fighting>`.
+/// Hit points go negative while dying: `<-9h 102m 113v MORTALLY WOUNDED>`.
 /// Real sessions put that token on its own line or fused with the text around it,
 /// including after a carriage-return redraw. ANSI around the token is ignored.
 /// A prompt cut in half across two server lines is not reassembled here.
@@ -293,22 +294,58 @@ enum HMVPrompt {
         var hp: Int
         var mana: Int
         var moves: Int
+        /// Words inside the prompt after the counts (`fighting`, `STUNNED`,
+        /// `MORTALLY WOUNDED`). Nil when the prompt is only the three counts.
+        var condition: String? = nil
 
         var label: String { "\(hp)h \(mana)m \(moves)v" }
 
-        var stored: String { "\(hp),\(mana),\(moves)" }
+        /// `hp,mana,moves`, plus the condition when the prompt had one.
+        /// Counts may be negative. Older saves are the three counts alone.
+        var stored: String {
+            guard let condition, condition.isEmpty == false else {
+                return "\(hp),\(mana),\(moves)"
+            }
+            return "\(hp),\(mana),\(moves),\(condition)"
+        }
+
+        /// Stunned, incapacitated, mortally wounded, dead, and the same kind of flag.
+        /// The prompt's own spelling is kept. Fighting and resting are not these.
+        var alarm: String? {
+            guard let condition else { return nil }
+            let folded = condition.lowercased()
+            let markers = [
+                "dead", "stun", "incap", "mortal", "dying",
+                "unconscious", "paralys", "paralyz", "bleed"
+            ]
+            guard markers.contains(where: { folded.contains($0) }) else { return nil }
+            return condition
+        }
+
+        /// The prompt itself says the character is dead. "Mortally wounded" is not.
+        var isDead: Bool {
+            guard let condition else { return false }
+            return condition.range(
+                of: #"\bdead\b"#,
+                options: [.regularExpression, .caseInsensitive]
+            ) != nil
+        }
 
         static func parse(_ raw: String) -> Vitals? {
             let parts = raw.split(separator: ",", omittingEmptySubsequences: false)
-            guard parts.count == 3,
-                  let hp = Int(parts[0]), hp >= 0,
-                  let mana = Int(parts[1]), mana >= 0,
-                  let moves = Int(parts[2]), moves >= 0 else { return nil }
-            return Vitals(hp: hp, mana: mana, moves: moves)
+            guard parts.count >= 3,
+                  let hp = Int(parts[0]),
+                  let mana = Int(parts[1]),
+                  let moves = Int(parts[2]) else { return nil }
+            let tail = parts.dropFirst(3).joined(separator: ",")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let condition = tail.isEmpty ? nil : tail
+            return Vitals(hp: hp, mana: mana, moves: moves, condition: condition)
         }
     }
 
-    /// Removes every prompt from `raw`. The last one supplies the vitals.
+    /// Removes every prompt from `raw`, including a negative count
+    /// (`<-5h 100m 94v MORTALLY WOUNDED>`). The last one supplies the vitals.
     /// Spaces and tabs that follow the prompt are removed with it. ANSI next to
     /// the `>` is left in place, so a reset still applies to the text after it.
     /// Everything else, including a newline or the leading spaces of the next
@@ -321,16 +358,22 @@ enum HMVPrompt {
         var vitals: Vitals?
         var removals: [Range<String.Index>] = []
         for match in matches {
-            guard match.numberOfRanges >= 4,
+            guard match.numberOfRanges >= 5,
                   let hpRange = Range(match.range(at: 1), in: plain),
                   let manaRange = Range(match.range(at: 2), in: plain),
                   let movesRange = Range(match.range(at: 3), in: plain),
+                  let conditionSpan = Range(match.range(at: 4), in: plain),
                   let whole = Range(match.range, in: plain),
                   let hp = Int(plain[hpRange]),
                   let mana = Int(plain[manaRange]),
                   let moves = Int(plain[movesRange]),
                   let original = originalRange(of: whole, in: plain, map: map, raw: raw) else { continue }
-            vitals = Vitals(hp: hp, mana: mana, moves: moves)
+            vitals = Vitals(
+                hp: hp,
+                mana: mana,
+                moves: moves,
+                condition: conditionText(plain[conditionSpan])
+            )
             removals.append(original)
             removals.append(contentsOf: trailingSeparators(after: original.upperBound, in: raw))
         }
@@ -354,6 +397,24 @@ enum HMVPrompt {
         // Prompt plus its separator, or only a color code. A newline is a blank line.
         if remainder.contains(where: \.isNewline) { return (text, vitals) }
         return ("", vitals)
+    }
+
+    /// `Sorry, you are dead.` and `You are DEAD!!`. A longer line that only
+    /// mentions those words is not the game's death sentence.
+    static func announcesDeath(_ raw: String) -> Bool {
+        let (plain, _) = strippingANSI(raw)
+        var folded = plain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while folded.last == "." || folded.last == "!" {
+            folded.removeLast()
+        }
+        folded = folded.trimmingCharacters(in: .whitespacesAndNewlines)
+        return folded == "sorry, you are dead" || folded == "you are dead"
+    }
+
+    /// The condition words, or nil when the prompt had none.
+    private static func conditionText(_ raw: Substring) -> String? {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : String(text)
     }
 
     /// Spaces and tabs after the prompt. Color codes between `>` and those
@@ -415,10 +476,11 @@ enum HMVPrompt {
         return result
     }
 
-    /// `<30h 100m 97v>`, spaces optional around the brackets, extra fields allowed
-    /// before `>` (`fighting`, and anything else that is not another bracket).
+    /// `<30h 100m 97v>` or `<-9h 102m 113v MORTALLY WOUNDED>`. Spaces optional
+    /// around the brackets. A leading minus belongs to that count. Words before
+    /// `>` are the condition (`fighting`, `STUNNED`, `MORTALLY WOUNDED`).
     private static let promptExpression: NSRegularExpression = {
-        let pattern = #"<\s*(\d+)h\s+(\d+)m\s+(\d+)v([^<>]*)>"#
+        let pattern = #"<\s*(-?\d+)h\s+(-?\d+)m\s+(-?\d+)v([^<>]*)>"#
         return try! NSRegularExpression(pattern: pattern)
     }()
 
