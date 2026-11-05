@@ -97,9 +97,9 @@ struct WindowPortraitProbe: UIViewRepresentable {
 }
 
 /// Dark grey card on the left edge. A rightward swipe from that edge opens it.
-/// Portrait and landscape keyboard switches stay at the top. Report issues and
-/// the newbie guide open in Safari. Unlink, while the player is in the game,
-/// sits at the bottom of the card.
+/// Portrait and landscape keyboard switches stay at the top. Report issues,
+/// the newbie guide, and About Nilgiri IM open in Safari. Unlink, while the
+/// player is in the game, sits at the bottom of the card.
 struct KeyboardSettingsDrawer: View {
     @ObservedObject var preferences: KeyboardHidePreferences
     /// Toggled by the accessibility action. Each change opens the card.
@@ -117,6 +117,7 @@ struct KeyboardSettingsDrawer: View {
 
     private static let reportIssuesURL = "https://github.com/nilgirian/Nilgiri-IM-Client/issues/new/choose"
     private static let newbieGuideURL = "https://nilgiri.net/nilgiri/newbie-strategy"
+    private static let aboutNilgiriIMURL = "https://nilgiri.net/nilgiri/im_client"
 
     @State private var travel: CGFloat = 0
     @State private var dragOrigin: CGFloat?
@@ -208,6 +209,7 @@ struct KeyboardSettingsDrawer: View {
                         infoLink("Report issues", urlString: Self.reportIssuesURL)
                     }
                     infoLink("Newbie guide", urlString: Self.newbieGuideURL)
+                    infoLink("About Nilgiri IM", urlString: Self.aboutNilgiriIMURL)
                 }
                 if showsUnlink {
                     Spacer(minLength: 22)
