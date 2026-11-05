@@ -1237,10 +1237,10 @@ final class IMSession: ObservableObject {
     }
 
     /// Drops the color question and a line that is only an HMV prompt.
-    /// A prompt fused with other text keeps that text. A negative prompt stays
-    /// in the line; the header still takes it. The newest prompt in the batch
-    /// is remembered for the header. `live` is false while replacing a buffer,
-    /// so an old death in that buffer does not flash the overlay.
+    /// A prompt fused with other text keeps that text, including when the
+    /// count is negative. The newest prompt in the batch is remembered for
+    /// the header. `live` is false while replacing a buffer, so an old death
+    /// in that buffer does not flash the overlay.
     private func presentable(_ line: LineDTO, live: Bool) -> LineDTO? {
         guard shouldShow(line) else { return nil }
         let stripped = HMVPrompt.strip(line.text)

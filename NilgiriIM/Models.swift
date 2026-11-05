@@ -344,13 +344,12 @@ enum HMVPrompt {
         }
     }
 
-    /// Removes every non-negative prompt from `raw`. The last prompt supplies
-    /// the vitals, including a negative one that is left in the text.
-    /// Spaces and tabs that follow a removed prompt are removed with it. ANSI
-    /// next to the `>` is left in place, so a reset still applies to the text
-    /// after it. Everything else, including a newline or the leading spaces of
-    /// the next line, stays byte for byte. An empty result means the line was
-    /// only a non-negative prompt.
+    /// Removes every prompt from `raw`, including a negative count
+    /// (`<-5h 100m 94v MORTALLY WOUNDED>`). The last one supplies the vitals.
+    /// Spaces and tabs that follow the prompt are removed with it. ANSI next to
+    /// the `>` is left in place, so a reset still applies to the text after it.
+    /// Everything else, including a newline or the leading spaces of the next
+    /// line, stays byte for byte. An empty result means the line was only a prompt.
     static func strip(_ raw: String) -> (text: String, vitals: Vitals?) {
         let (plain, map) = strippingANSI(raw)
         let ns = plain as NSString
@@ -375,13 +374,6 @@ enum HMVPrompt {
                 moves: moves,
                 condition: conditionText(plain[conditionSpan])
             )
-            // A minus used to miss the header entirely (`<-9h …>` stayed in the
-            // log while the bar kept the last positive count). Still don't cut
-            // that token out of the line.
-            let signed = plain[hpRange].hasPrefix("-")
-                || plain[manaRange].hasPrefix("-")
-                || plain[movesRange].hasPrefix("-")
-            if signed { continue }
             removals.append(original)
             removals.append(contentsOf: trailingSeparators(after: original.upperBound, in: raw))
         }
