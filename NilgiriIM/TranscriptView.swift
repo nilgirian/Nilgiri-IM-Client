@@ -426,7 +426,7 @@ private final class TranscriptDocumentStore {
             lastMudFontSize = size
             // Portrait draws these larger, so the wrap is short of 80. Landscape
             // keeps this face and the 80-column measure. Channel lines use the
-            // same rule in both: a word under 11 letters moves whole, and later
+            // same rule in both: a word under 13 letters moves whole, and later
             // lines indent two spaces. Other lines keep the column break.
             let wrap: Ansi.Wrap = CommunicationLine.isCommunication(line)
                 ? .communication
