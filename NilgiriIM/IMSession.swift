@@ -1257,8 +1257,12 @@ final class IMSession: ObservableObject {
     private func presentable(_ line: LineDTO, live: Bool) -> LineDTO? {
         guard shouldShow(line) else { return nil }
         let stripped = HMVPrompt.strip(line.text)
+        let announced = HMVPrompt.announcedAlarm(line.text)
         if let found = stripped.vitals {
-            pendingVitals = found
+            pendingVitals = mergingDowned(found, announced: announced)
+        } else if let announced, var base = pendingVitals ?? vitals, base.isDead == false {
+            base.condition = announced
+            pendingVitals = base
         }
         noteDeath(on: line, live: live, prompt: stripped.vitals)
         noteProgress(stripped.text, live: live)
@@ -1298,6 +1302,26 @@ final class IMSession: ObservableObject {
         guard notices.isEmpty == false else { return }
         progressSerial += 1
         progressPulse = ProgressPulse(id: progressSerial, messages: notices)
+    }
+
+    /// A stun or incapacitated sentence is not in the prompt. Keep that label
+    /// on the latest counts until the prompt names another downed state, or
+    /// hit points come back above zero. Fighting and a bare prompt keep the
+    /// alarm. The newest sentence wins. The sentence stays in the transcript.
+    private func mergingDowned(
+        _ prompt: HMVPrompt.Vitals,
+        announced: String?
+    ) -> HMVPrompt.Vitals {
+        if prompt.isDead { return prompt }
+        if prompt.alarm != nil { return prompt }
+        let prior = pendingVitals ?? vitals
+        guard let label = announced ?? prior?.heldDownedLabel else { return prompt }
+        if announced == nil, let prior, prompt.hp > prior.hp, prompt.hp > 0 {
+            return prompt
+        }
+        var copy = prompt
+        copy.condition = label
+        return copy
     }
 
     private func pulseDeathBanner() {

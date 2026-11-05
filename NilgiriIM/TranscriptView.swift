@@ -2203,7 +2203,7 @@ struct TranscriptView: View {
     }
 
     /// Character name with the latest prompt beside it: "Sin  30h 100m 97v".
-    /// A downed condition from that prompt is bold red: "STUNNED", "DEAD".
+    /// A downed condition is bold red: "STUNNED", "DEAD", "INCAPACITATED".
     private var sessionHeader: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(session.character ?? "IM")

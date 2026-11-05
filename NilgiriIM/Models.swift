@@ -331,6 +331,16 @@ enum HMVPrompt {
             ) != nil
         }
 
+        /// `INCAPACITATED` or `STUNNED`, including a label forced from a sentence.
+        /// Other alarms, fighting, and resting are not held across a bare prompt.
+        var heldDownedLabel: String? {
+            guard let condition else { return nil }
+            let folded = condition.lowercased()
+            if folded.contains("incap") { return "INCAPACITATED" }
+            if folded.contains("stun") { return "STUNNED" }
+            return nil
+        }
+
         static func parse(_ raw: String) -> Vitals? {
             let parts = raw.split(separator: ",", omittingEmptySubsequences: false)
             guard parts.count >= 3,
@@ -456,10 +466,50 @@ enum HMVPrompt {
         return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
     }()
 
+    /// Status-bar label for a downed sentence the prompt did not carry.
+    /// The last matching line wins. A prompt fused onto the text is ignored,
+    /// and the sentence itself is left in the transcript.
+    ///
+    /// Incapacitated: `You are incapacitated and will slowly die if not aided.`
+    /// Stunned: `You are stunned, but will probably regain consciousness again.`
+    /// The comma is optional. Trailing `.` and `!` are optional. Extra words
+    /// on that same line are not the sentence.
+    static func announcedAlarm(_ raw: String) -> String? {
+        let (plain, _) = strippingANSI(strip(raw).text)
+        var label: String?
+        for line in plain.split(whereSeparator: \.isNewline) {
+            if let found = downedSentence(line) {
+                label = found
+            }
+        }
+        return label
+    }
+
     /// The condition words, or nil when the prompt had none.
     private static func conditionText(_ raw: Substring) -> String? {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : String(text)
+    }
+
+    /// One visible line, commas removed, case folded, trailing `.`/`!` dropped.
+    private static func downedSentence(_ raw: Substring) -> String? {
+        var folded = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while let last = folded.last, last == "." || last == "!" {
+            folded.removeLast()
+        }
+        folded = folded.trimmingCharacters(in: .whitespacesAndNewlines)
+        let collapsed = folded
+            .replacingOccurrences(of: ",", with: "")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        switch collapsed {
+        case "you are incapacitated and will slowly die if not aided":
+            return "INCAPACITATED"
+        case "you are stunned but will probably regain consciousness again":
+            return "STUNNED"
+        default:
+            return nil
+        }
     }
 
     /// Spaces and tabs after the prompt. Color codes between `>` and those
