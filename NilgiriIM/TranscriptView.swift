@@ -1788,6 +1788,40 @@ private struct DeathFlash: View {
     }
 }
 
+/// Centered `+87 XP!` or `LEVEL!`. Black rounded is the fattest system face.
+/// The yellow is translucent so the log shows through, and the flash does not
+/// take taps. Placement matches `DeathFlash`.
+private struct AwardFlash: View {
+    var message: String
+    var opacity: Double
+
+    var body: some View {
+        GeometryReader { proxy in
+            let size = max(72, min(proxy.size.width, proxy.size.height) * 0.28)
+            Text(message)
+                .font(.system(size: size, weight: .black, design: .rounded))
+                .multilineTextAlignment(.center)
+                .foregroundStyle(Color.yellow.opacity(0.7))
+                .lineLimit(1)
+                .minimumScaleFactor(0.4)
+                .padding(.horizontal, 12)
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .opacity(opacity)
+        }
+        .allowsHitTesting(false)
+        .accessibilityLabel(message)
+        .accessibilityHidden(opacity < 0.05)
+    }
+}
+
+/// Holds award lines until each has been on screen. A class so the playback
+/// task and a later line share one queue.
+private final class AwardQueue {
+    var messages: [String] = []
+    var playing = false
+    var generation = 0
+}
+
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
@@ -1833,6 +1867,13 @@ struct TranscriptView: View {
     /// 1 while the sentence is held, then animated to 0.
     @State private var deathOpacity = 0.0
     @State private var deathTask: Task<Void, Never>?
+    /// The experience or level flash is on screen. Cleared after it fades.
+    @State private var awardShown = false
+    /// 1 while `+87 XP!` or `LEVEL!` is held, then animated to 0.
+    @State private var awardOpacity = 0.0
+    @State private var awardText = ""
+    @State private var awardTask: Task<Void, Never>?
+    @State private var awardQueue = AwardQueue()
 
     /// Count and the newest line, so a capped buffer and an insert both register
     /// without observing the whole transcript array.
@@ -1947,6 +1988,12 @@ struct TranscriptView: View {
                         .ignoresSafeArea()
                 }
             }
+            .overlay {
+                if awardShown {
+                    AwardFlash(message: awardText, opacity: awardOpacity)
+                        .ignoresSafeArea()
+                }
+            }
             .background {
                 WindowPortraitProbe { portrait in
                     orientationChanged(toPortrait: portrait)
@@ -2000,10 +2047,15 @@ struct TranscriptView: View {
                 guard id > 0 else { return }
                 playDeathFlash()
             }
+            .onChange(of: session.progressPulse) { _, pulse in
+                guard let pulse else { return }
+                enqueueAwards(pulse.messages)
+            }
             .onDisappear {
                 deathTask?.cancel()
                 deathShown = false
                 deathOpacity = 0
+                stopAwardFlash()
             }
             .task {
                 await PushRegistration.request(session: session)
@@ -2055,6 +2107,54 @@ struct TranscriptView: View {
             guard Task.isCancelled == false else { return }
             deathShown = false
         }
+    }
+
+    /// Queues `+87 XP!` and `LEVEL!`. Each is held for two seconds, then faded,
+    /// the same timing as the death flash. A later award waits its turn.
+    private func enqueueAwards(_ messages: [String]) {
+        awardQueue.messages.append(contentsOf: messages)
+        startAwardPlayback()
+    }
+
+    private func startAwardPlayback() {
+        guard awardQueue.playing == false else { return }
+        guard awardQueue.messages.isEmpty == false else { return }
+        awardQueue.playing = true
+        awardQueue.generation += 1
+        let generation = awardQueue.generation
+        awardTask = Task { @MainActor in
+            while Task.isCancelled == false, generation == awardQueue.generation {
+                guard awardQueue.messages.isEmpty == false else { break }
+                let message = awardQueue.messages.removeFirst()
+                awardText = message
+                awardShown = true
+                withAnimation(.none) {
+                    awardOpacity = 1
+                }
+                try? await Task.sleep(for: .seconds(2))
+                if Task.isCancelled || generation != awardQueue.generation { return }
+                withAnimation(.easeOut(duration: 0.8)) {
+                    awardOpacity = 0
+                }
+                try? await Task.sleep(for: .milliseconds(800))
+                if Task.isCancelled || generation != awardQueue.generation { return }
+            }
+            guard generation == awardQueue.generation else { return }
+            // Nothing awaits between the empty check and this assignment, so a
+            // line that arrives afterwards finds playing false and starts again.
+            awardQueue.playing = false
+            awardShown = false
+            awardOpacity = 0
+        }
+    }
+
+    private func stopAwardFlash() {
+        awardQueue.generation += 1
+        awardQueue.messages.removeAll()
+        awardQueue.playing = false
+        awardTask?.cancel()
+        awardShown = false
+        awardOpacity = 0
     }
 
     /// Same frost as the input bar (`Chrome.barBackground`), extended

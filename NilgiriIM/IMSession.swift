@@ -3,6 +3,13 @@ import Combine
 import UIKit
 import UserNotifications
 
+/// One batch of experience and level overlays, in transcript order.
+/// `messages` are already the on-screen words (`+87 XP!`, `LEVEL!`).
+struct ProgressPulse: Equatable {
+    let id: Int
+    let messages: [String]
+}
+
 @MainActor
 final class IMSession: ObservableObject {
     /// Always the public IM host. A URL saved by an older build is removed and never read.
@@ -18,6 +25,9 @@ final class IMSession: ObservableObject {
     /// Bumps when a line that just arrived says the character died.
     /// Replacing a saved transcript does not bump it.
     @Published private(set) var deathBannerID = 0
+    /// Awards from lines that just arrived (`+87 XP!`, `LEVEL!`), in order.
+    /// Replacing a saved transcript does not set it. The line text stays.
+    @Published private(set) var progressPulse: ProgressPulse?
     @Published var lines: [LineDTO] = []
     @Published var status = "Parked on the IM server when this app is in the background."
     /// Set for one login, resume, reconnect, or creation attempt. Nil hides the alert.
@@ -111,6 +121,9 @@ final class IMSession: ObservableObject {
     /// Cleared on commit. The overlay runs only when the batch still ends dead,
     /// so a later prompt in the same catch-up does not flash.
     private var liveDeathInBatch = false
+    /// `+87 XP!` / `LEVEL!` collected from this live batch. Cleared on commit.
+    private var liveProgress: [String] = []
+    private var progressSerial = 0
     private let defaults = UserDefaults.standard
 
     private enum StoreKey {
@@ -1240,7 +1253,7 @@ final class IMSession: ObservableObject {
     /// A prompt fused with other text keeps that text, including when the
     /// count is negative. The newest prompt in the batch is remembered for
     /// the header. `live` is false while replacing a buffer, so an old death
-    /// in that buffer does not flash the overlay.
+    /// or experience line in that buffer does not flash.
     private func presentable(_ line: LineDTO, live: Bool) -> LineDTO? {
         guard shouldShow(line) else { return nil }
         let stripped = HMVPrompt.strip(line.text)
@@ -1248,6 +1261,7 @@ final class IMSession: ObservableObject {
             pendingVitals = found
         }
         noteDeath(on: line, live: live, prompt: stripped.vitals)
+        noteProgress(stripped.text, live: live)
         guard stripped.text.isEmpty == false else { return nil }
         guard stripped.text != line.text else { return line }
         return LineDTO(seq: line.seq, at: line.at, kind: line.kind, text: stripped.text)
@@ -1269,6 +1283,21 @@ final class IMSession: ObservableObject {
         if live, prompt?.isDead == true {
             liveDeathInBatch = true
         }
+    }
+
+    /// Experience and level-up are overlays. The stored line is not rewritten.
+    /// A replaced buffer passes `live: false`, so history does not flash.
+    private func noteProgress(_ text: String, live: Bool) {
+        guard live else { return }
+        liveProgress.append(contentsOf: HMVPrompt.progressBanners(in: text))
+    }
+
+    private func commitProgress() {
+        let notices = liveProgress
+        liveProgress = []
+        guard notices.isEmpty == false else { return }
+        progressSerial += 1
+        progressPulse = ProgressPulse(id: progressSerial, messages: notices)
     }
 
     private func pulseDeathBanner() {
@@ -1300,6 +1329,7 @@ final class IMSession: ObservableObject {
         if died, stillDead {
             pulseDeathBanner()
         }
+        commitProgress()
     }
 
     private func restoreVitals() {
@@ -1477,6 +1507,8 @@ final class IMSession: ObservableObject {
         vitals = nil
         deathBannerAt = nil
         liveDeathInBatch = false
+        liveProgress = []
+        progressPulse = nil
         atMenu = false
         menuBusy = false
         menuExit = false
