@@ -1458,6 +1458,14 @@ struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
     @FocusState private var commandFocused: Bool
+    @StateObject private var keyboardPrefs = KeyboardHidePreferences()
+    /// The command field is up, and the player has not dismissed it.
+    /// A rotation that hides the keyboard leaves this set so the keyboard
+    /// comes back in an orientation that keeps it.
+    @State private var keyboardHeld = false
+    @State private var keyboardOrientationToken = 0
+    /// Bumped by the accessibility action. Each change opens the left card.
+    @State private var settingsOpenRequest = false
     /// True when the latest text is within `nearBottomSlack` of the viewport.
     /// Written only when that flips.
     @State private var nearBottom = true
@@ -1579,6 +1587,25 @@ struct TranscriptView: View {
             }
             .preferredColorScheme(.dark)
             .toolbar(.hidden, for: .navigationBar)
+            .overlay {
+                KeyboardSettingsDrawer(preferences: keyboardPrefs, openRequest: $settingsOpenRequest)
+            }
+            .background {
+                WindowPortraitProbe { portrait in
+                    orientationChanged(toPortrait: portrait)
+                }
+            }
+            .accessibilityAction(named: Text("Keyboard settings")) {
+                settingsOpenRequest.toggle()
+            }
+            .onChange(of: keyboardPrefs.hideInPortrait) { _, _ in
+                guard KeyboardHidePreferences.interfaceIsPortrait() else { return }
+                applyKeyboardPreference()
+            }
+            .onChange(of: keyboardPrefs.hideInLandscape) { _, _ in
+                guard KeyboardHidePreferences.interfaceIsPortrait() == false else { return }
+                applyKeyboardPreference()
+            }
             .onChange(of: linesScrollSignal) { _, _ in
                 guard session.pendingResumeReveal == false, nearBottom == false else { return }
                 showNewLines = true
@@ -1599,7 +1626,7 @@ struct TranscriptView: View {
             }
             .onChange(of: session.atMenu) { _, atMenu in
                 if atMenu {
-                    commandFocused = false
+                    releaseCommandKeyboard()
                     actionPanelShown = false
                 }
             }
@@ -1658,7 +1685,7 @@ struct TranscriptView: View {
 
     private func sendCommand() async {
         await session.send()
-        commandFocused = false
+        hideCommandKeyboardIfPreferred()
     }
 
     /// Posts `say` plus the field. Text that already starts with `say` is sent
@@ -1678,7 +1705,57 @@ struct TranscriptView: View {
             session.command = draft
             return
         }
+        hideCommandKeyboardIfPreferred()
+    }
+
+    /// Send and Say drop the keyboard only when this orientation's switch is on.
+    /// iPhone defaults to landscape on, portrait off. iPad defaults to both off.
+    private func hideCommandKeyboardIfPreferred() {
+        guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) else { return }
+        releaseCommandKeyboard()
+    }
+
+    /// The player swiped the keyboard away, or left the command field for the menu.
+    private func releaseCommandKeyboard() {
+        keyboardOrientationToken += 1
+        keyboardHeld = false
         commandFocused = false
+    }
+
+    /// The current orientation's switch just moved. Hide now when it asks to.
+    /// Turning it off brings the keyboard back only if the player still had it.
+    private func applyKeyboardPreference() {
+        keyboardOrientationToken += 1
+        if keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) {
+            commandFocused = false
+        } else if keyboardHeld {
+            commandFocused = true
+        }
+    }
+
+    /// The window's portrait bit flipped. Hide when that orientation asks for it.
+    /// SwiftUI can drop first responder during the rotation, so a keep
+    /// preference puts the field back once the animation has settled.
+    private func orientationChanged(toPortrait portrait: Bool) {
+        guard portrait == KeyboardHidePreferences.interfaceIsPortrait() else { return }
+        keyboardOrientationToken += 1
+        let token = keyboardOrientationToken
+        if keyboardPrefs.hidesKeyboard(isPortrait: portrait) {
+            commandFocused = false
+            return
+        }
+        restoreHeldKeyboard()
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard token == keyboardOrientationToken else { return }
+            restoreHeldKeyboard()
+        }
+    }
+
+    private func restoreHeldKeyboard() {
+        guard keyboardHeld else { return }
+        guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
+        commandFocused = true
     }
 
     private func alreadySay(_ text: String) -> Bool {
@@ -1752,6 +1829,11 @@ struct TranscriptView: View {
                     .submitLabel(.send)
                     .focused($commandFocused)
                     .onSubmit { Task { await sendCommand() } }
+                    .onChange(of: commandFocused) { _, focused in
+                        if focused {
+                            keyboardHeld = true
+                        }
+                    }
                     .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                     .padding(.trailing, 16)
                 commandIcon("bubble.left.fill", label: "Say") {
@@ -1779,7 +1861,7 @@ struct TranscriptView: View {
                     if translation.height < -30, abs(translation.height) > abs(translation.width) {
                         actionPanelShown.toggle()
                     } else if translation.height > abs(translation.width), translation.height > 0 {
-                        commandFocused = false
+                        releaseCommandKeyboard()
                         actionPanelShown = false
                     }
                 }
