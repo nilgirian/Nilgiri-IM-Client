@@ -1764,14 +1764,14 @@ private struct CommandLineField: UIViewRepresentable {
     }
 }
 
-/// Centered death sentence. The red is translucent so the log shows through,
-/// and the flash does not take taps.
+/// Death sentence, centered in the top two-thirds. The red is translucent
+/// so the log shows through, and the flash does not take taps.
 private struct DeathFlash: View {
     var opacity: Double
 
     var body: some View {
         GeometryReader { proxy in
-            let size = max(72, min(proxy.size.width, proxy.size.height) * 0.28)
+            let size = max(72, min(proxy.size.width, proxy.size.height) * 0.28) * 0.75
             Text("YOU ARE DEAD!")
                 .font(.system(size: size, weight: .bold))
                 .multilineTextAlignment(.center)
@@ -1779,7 +1779,8 @@ private struct DeathFlash: View {
                 .lineLimit(3)
                 .minimumScaleFactor(0.4)
                 .padding(.horizontal, 12)
-                .frame(width: proxy.size.width, height: proxy.size.height)
+                .frame(width: proxy.size.width, height: proxy.size.height * 2 / 3)
+                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
                 .opacity(opacity)
         }
         .allowsHitTesting(false)
@@ -1788,24 +1789,24 @@ private struct DeathFlash: View {
     }
 }
 
-/// Centered `+87 XP!` or `LEVEL!`. Black rounded is the fattest system face.
-/// The yellow is translucent so the log shows through, and the flash does not
-/// take taps. Placement matches `DeathFlash`.
+/// `+87 XP!` or `LEVEL!`. Matches `DeathFlash` except the color is yellow.
+/// The flash does not take taps.
 private struct AwardFlash: View {
     var message: String
     var opacity: Double
 
     var body: some View {
         GeometryReader { proxy in
-            let size = max(72, min(proxy.size.width, proxy.size.height) * 0.28)
+            let size = max(72, min(proxy.size.width, proxy.size.height) * 0.28) * 0.75
             Text(message)
-                .font(.system(size: size, weight: .black, design: .rounded))
+                .font(.system(size: size, weight: .bold))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(Color.yellow.opacity(0.7))
                 .lineLimit(1)
                 .minimumScaleFactor(0.4)
                 .padding(.horizontal, 12)
-                .frame(width: proxy.size.width, height: proxy.size.height)
+                .frame(width: proxy.size.width, height: proxy.size.height * 2 / 3)
+                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
                 .opacity(opacity)
         }
         .allowsHitTesting(false)
