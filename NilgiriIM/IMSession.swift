@@ -31,6 +31,9 @@ final class IMSession: ObservableObject {
     /// Replacing a saved transcript does not set it. The line text stays.
     @Published private(set) var progressPulse: ProgressPulse?
     @Published var lines: [LineDTO] = []
+    /// Word hilited in the main transcript. Nil when nothing is hilited.
+    /// Later actions can target this. The server's line text is not changed.
+    @Published private(set) var hilitedWord: String?
     @Published var status = "Parked on the IM server when this app is in the background."
     /// Set for one login, resume, reconnect, or creation attempt. Nil hides the alert.
     @Published var outageAlert: OutageKind?
@@ -220,6 +223,12 @@ final class IMSession: ObservableObject {
         suppressNameClear = false
         nameAssignedByApp = nil
         return false
+    }
+
+    /// The transcript reports the hilited word, or nil when that hilite clears.
+    func setHilitedWord(_ word: String?) {
+        guard hilitedWord != word else { return }
+        hilitedWord = word
     }
 
     /// True when Enter should try the saved bearer token before posting a login.

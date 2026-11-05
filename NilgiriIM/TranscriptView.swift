@@ -489,11 +489,155 @@ private final class TranscriptDocumentStore {
     }
 }
 
+/// A word in the display string. The stored line is not edited: these are
+/// characters already drawn. Edge punctuation is not part of the word,
+/// so "guard," and "2.guard" hilite `guard` and `2.guard`.
+private enum TranscriptWord {
+    struct Hit: Equatable {
+        var range: NSRange
+        var word: String
+    }
+
+    private static let trimSet = CharacterSet.punctuationCharacters.union(.symbols)
+    private static let coreSet = CharacterSet.alphanumerics
+
+    /// The word under `viewPoint`, or nil when the tap is on a gap or padding.
+    static func hit(in textView: UITextView, at viewPoint: CGPoint) -> Hit? {
+        let storage = textView.textStorage
+        guard storage.length > 0 else { return nil }
+        let layout = textView.layoutManager
+        guard layout.numberOfGlyphs > 0 else { return nil }
+        let origin = textView.textContainerOrigin
+        let point = CGPoint(x: viewPoint.x - origin.x, y: viewPoint.y - origin.y)
+        let glyph = layout.glyphIndex(
+            for: point,
+            in: textView.textContainer,
+            fractionOfDistanceThroughGlyph: nil
+        )
+        guard glyph < layout.numberOfGlyphs else { return nil }
+        let charIndex = layout.characterIndexForGlyph(at: glyph)
+        guard charIndex < storage.length else { return nil }
+        layout.ensureLayout(forGlyphRange: NSRange(location: glyph, length: 1))
+        var glyphRect = layout.boundingRect(
+            forGlyphRange: NSRange(location: glyph, length: 1),
+            in: textView.textContainer
+        )
+        glyphRect.origin.x += origin.x
+        glyphRect.origin.y += origin.y
+        let slop = glyphRect.insetBy(dx: -2, dy: -3)
+        guard slop.isNull == false, slop.contains(viewPoint) else { return nil }
+        return span(in: storage.string as NSString, at: charIndex)
+    }
+
+    /// `word` inside `text`, preferring the occurrence nearest `offset`.
+    /// A hit inside a longer token does not count.
+    static func find(_ word: String, in text: NSString, near offset: Int) -> NSRange? {
+        guard word.isEmpty == false, text.length > 0 else { return nil }
+        var search = 0
+        var best: NSRange?
+        var bestDistance = Int.max
+        while search < text.length {
+            let found = text.range(
+                of: word,
+                options: [],
+                range: NSRange(location: search, length: text.length - search)
+            )
+            if found.location == NSNotFound { break }
+            if let hit = span(in: text, at: found.location),
+               hit.word == word,
+               NSEqualRanges(hit.range, found) {
+                let distance = abs(found.location - offset)
+                if distance < bestDistance {
+                    bestDistance = distance
+                    best = found
+                }
+            }
+            let next = found.location + max(found.length, 1)
+            if next <= search { break }
+            search = next
+        }
+        return best
+    }
+
+    /// Whitespace-delimited token at `index`, with punctuation peeled off the ends.
+    private static func span(in text: NSString, at index: Int) -> Hit? {
+        guard index >= 0, index < text.length else { return nil }
+        if isBreak(text.character(at: index)) { return nil }
+        var start = index
+        var end = index + 1
+        while start > 0, isBreak(text.character(at: start - 1)) == false {
+            start -= 1
+        }
+        while end < text.length, isBreak(text.character(at: end)) == false {
+            end += 1
+        }
+        while start < end, isTrimmed(text.character(at: start)) {
+            start += 1
+        }
+        while end > start, isTrimmed(text.character(at: end - 1)) {
+            end -= 1
+        }
+        guard start < end else { return nil }
+        let range = NSRange(location: start, length: end - start)
+        let word = text.substring(with: range)
+        guard word.unicodeScalars.contains(where: { coreSet.contains($0) }) else { return nil }
+        return Hit(range: range, word: word)
+    }
+
+    private static func isBreak(_ unit: unichar) -> Bool {
+        guard let scalar = Unicode.Scalar(UInt32(unit)) else { return false }
+        return CharacterSet.whitespacesAndNewlines.contains(scalar)
+    }
+
+    private static func isTrimmed(_ unit: unichar) -> Bool {
+        guard let scalar = Unicode.Scalar(UInt32(unit)) else { return false }
+        return trimSet.contains(scalar)
+    }
+}
+
 /// Rules beside a disconnect stamp. Drawn with the glyphs, so they scroll with
 /// the text and are not a second SwiftUI layout pass.
+/// The word hilite is the same kind of overlay: paint behind the glyphs, and
+/// leave the attributed line alone.
 private final class TranscriptLayoutManager: NSLayoutManager {
     var separatorRanges: [NSRange] = []
+    private(set) var hiliteRange: NSRange?
     private var drawingRules = false
+    private static let hiliteFill = UIColor(red: 0.98, green: 0.80, blue: 0.22, alpha: 0.45)
+
+    func setHilite(_ range: NSRange?) {
+        let next = range.flatMap { $0.length > 0 ? $0 : nil }
+        if let hiliteRange, let next, NSEqualRanges(hiliteRange, next) { return }
+        if hiliteRange == nil, next == nil { return }
+        let previous = hiliteRange
+        hiliteRange = next
+        if let previous, previous.length > 0 {
+            invalidateDisplay(forCharacterRange: previous)
+        }
+        if let next {
+            invalidateDisplay(forCharacterRange: next)
+        }
+    }
+
+    override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: CGPoint) {
+        super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
+        guard let range = hiliteRange, range.length > 0,
+              let storage = textStorage, NSMaxRange(range) <= storage.length,
+              let container = textContainers.first else { return }
+        let glyphs = glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let overlap = NSIntersectionRange(glyphs, glyphsToShow)
+        guard overlap.length > 0 else { return }
+        Self.hiliteFill.setFill()
+        enumerateEnclosingRects(
+            forGlyphRange: overlap,
+            withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+            in: container
+        ) { rect, _ in
+            let box = rect.offsetBy(dx: origin.x, dy: origin.y).insetBy(dx: 0, dy: 0.5)
+            guard box.isNull == false, box.width > 0.5, box.height > 0.5 else { return }
+            UIBezierPath(roundedRect: box, cornerRadius: 2).fill()
+        }
+    }
 
     override func drawGlyphs(forGlyphRange glyphsToShow: NSRange, at origin: CGPoint) {
         super.drawGlyphs(forGlyphRange: glyphsToShow, at: origin)
@@ -802,6 +946,8 @@ private struct TranscriptLog: UIViewRepresentable {
     var launchSplashVisible: Bool
     var onNearBottom: (Bool) -> Void
     var onRevealFinished: (String) -> Void
+    /// Hilited word, or nil when the hilite clears. The line text is not edited.
+    var onHilitedWord: (String?) -> Void
 
     func makeUIView(context: Context) -> TranscriptHost {
         let host = TranscriptHost(frame: .zero)
@@ -827,6 +973,16 @@ private struct TranscriptLog: UIViewRepresentable {
         view.onPinnedLayout = { [weak coordinator = context.coordinator] in
             coordinator?.layoutWhilePinned()
         }
+        // A quick tap hilites a word. Touches are not cancelled, so a drag still
+        // scrolls, a link still opens, and the command field keeps first responder
+        // when this orientation leaves the keyboard up.
+        let tap = UITapGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.wordTapped(_:))
+        )
+        tap.cancelsTouchesInView = false
+        tap.delegate = context.coordinator
+        view.addGestureRecognizer(tap)
         return host
     }
 
@@ -856,8 +1012,11 @@ private struct TranscriptLog: UIViewRepresentable {
         let coordinator = context.coordinator
         let offset = textView.contentOffset
         coordinator.textView = textView
+        coordinator.holdHiliteClear = true
+        defer { coordinator.holdHiliteClear = false }
         coordinator.onNearBottom = onNearBottom
         coordinator.onRevealFinished = onRevealFinished
+        coordinator.onHilitedWord = onHilitedWord
         coordinator.revealPending = revealPending
         coordinator.resumeSeparatorID = resumeSeparatorID
         coordinator.lines = lines
@@ -901,17 +1060,26 @@ private struct TranscriptLog: UIViewRepresentable {
                 textView.setContentOffset(offset, animated: false)
             }
         }
+        // Inset and text edits above can move the offset and then put it back.
+        // Judge the hilite against the offset that sticks.
+        coordinator.holdHiliteClear = false
+        coordinator.clearHiliteIfOffscreen()
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    final class Coordinator: NSObject, UITextViewDelegate {
+    static func dismantleUIView(_: TranscriptHost, coordinator: Coordinator) {
+        coordinator.cancelHilitePublish()
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
         weak var textView: TranscriptTextView?
         let store = TranscriptDocumentStore()
         let carry = ColourCarryCache()
         var lines: [LineDTO] = []
         var onNearBottom: (Bool) -> Void = { _ in }
         var onRevealFinished: (String) -> Void = { _ in }
+        var onHilitedWord: (String?) -> Void = { _ in }
         var revealPending = false
         var resumeSeparatorID: String?
         /// Starts covered. `makeUIView` copies the real flag before the first
@@ -973,6 +1141,28 @@ private struct TranscriptLog: UIViewRepresentable {
         /// does not pull them back down.
         private var launchPinToken = 0
         private var keyboardObservers: [NSObjectProtocol] = []
+        /// One hilited word, tied to its line so a cap trim can keep it when
+        /// that row is still on screen. The drawn range is overlay-only.
+        private struct WordHilite: Equatable {
+            var lineID: String
+            var word: String
+            var offsetInLine: Int
+            var length: Int
+        }
+        private var hilite: WordHilite?
+        /// Glyph box in the text view's coordinate space (`firstRect`).
+        /// A scroll compares it with the visible window and does not measure
+        /// TextKit on every frame.
+        private var hiliteBounds: CGRect?
+        private var publishedHilite: String?
+        private var hilitePublishGeneration = 0
+        private var checkingHilite = false
+        /// Set while resolving a tap, so a layout pass from that tap cannot
+        /// drop the hilite before its glyph box is known.
+        private var tappingWord = false
+        private var measuringHilite = false
+        /// Set for the body of `updateUIView` until the offset is restored.
+        var holdHiliteClear = false
 
         /// A resume reveal owns the offset until it eases to the bottom.
         /// The launch cover is not that reveal: the reader cannot see it, and
@@ -1143,7 +1333,10 @@ private struct TranscriptLog: UIViewRepresentable {
                 || verticalInsetsDiffer(textView.contentInset, insets)
             guard changed || pinIfStuck else { return }
             inChrome = true
-            defer { inChrome = false }
+            defer {
+                inChrome = false
+                clearHiliteIfOffscreen()
+            }
             textView.chromeInsets = insets
             textView.enforceChromeInsets()
             guard stickToBottom, revealBlocksBottomPin == false else { return }
@@ -1387,6 +1580,11 @@ private struct TranscriptLog: UIViewRepresentable {
             let previous = storage.string
             let selected = textView.selectedRange
             let cut = edit.replaceFrom
+            // A full replace or a tail edit would leave the old character range
+            // pointing at different glyphs. An append keeps the prefix.
+            if let range = textView.rules?.hiliteRange, cut <= range.location {
+                textView.rules?.setHilite(nil)
+            }
             storage.beginEditing()
             if cut <= 0 {
                 storage.setAttributedString(edit.text)
@@ -1415,6 +1613,7 @@ private struct TranscriptLog: UIViewRepresentable {
             // Lay the new tail out before the next draw, so a timestamp stamp
             // is not placed on the enlarged line above it.
             _ = textView.settledContentHeight()
+            remapHilite(in: textView)
             textView.setNeedsDisplay()
         }
 
@@ -1597,6 +1796,186 @@ private struct TranscriptLog: UIViewRepresentable {
             }
         }
 
+        /// Quick tap. The same word again clears the hilite. Another word switches it.
+        /// A drag does not land here: the recognizer waits for the pan to fail.
+        @objc func wordTapped(_ gesture: UITapGestureRecognizer) {
+            guard gesture.state == .ended, let textView else { return }
+            guard launchSplashVisible == false, textView.isDragging == false else { return }
+            tappingWord = true
+            defer { tappingWord = false }
+            guard let hit = TranscriptWord.hit(in: textView, at: gesture.location(in: textView)) else { return }
+            guard let anchor = hiliteAnchor(for: hit) else { return }
+            if hilite == anchor {
+                clearHilite()
+                return
+            }
+            hilite = anchor
+            textView.rules?.setHilite(hit.range)
+            hiliteBounds = measureHiliteBounds(in: textView)
+            publishHilite(anchor.word)
+        }
+
+        func gestureRecognizer(
+            _: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+        ) -> Bool {
+            // Link taps still fire. The scroll pan must not also count as a tap.
+            other is UIPanGestureRecognizer == false
+        }
+
+        func gestureRecognizer(
+            _: UIGestureRecognizer,
+            shouldRequireFailureOf other: UIGestureRecognizer
+        ) -> Bool {
+            guard let textView else { return false }
+            return other === textView.panGestureRecognizer
+        }
+
+        private func hiliteAnchor(for hit: TranscriptWord.Hit) -> WordHilite? {
+            guard let marker = store.markers.last(where: {
+                hit.range.location >= $0.location
+                    && hit.range.location + hit.range.length <= $0.location + $0.contentLength
+            }) else { return nil }
+            return WordHilite(
+                lineID: marker.id,
+                word: hit.word,
+                offsetInLine: hit.range.location - marker.location,
+                length: hit.range.length
+            )
+        }
+
+        /// Put the hilite back on the same line after an append or a cap trim.
+        /// The row's id is the anchor. A trim of other rows does not drop it.
+        /// The row itself leaving the storage leaves nothing on screen to draw.
+        private func remapHilite(in textView: TranscriptTextView) {
+            guard let anchor = hilite else {
+                textView.rules?.setHilite(nil)
+                hiliteBounds = nil
+                return
+            }
+            guard let located = locate(anchor, in: textView) else {
+                clearHilite()
+                return
+            }
+            if located.offset != anchor.offsetInLine || located.range.length != anchor.length {
+                hilite = WordHilite(
+                    lineID: anchor.lineID,
+                    word: anchor.word,
+                    offsetInLine: located.offset,
+                    length: located.range.length
+                )
+            }
+            textView.rules?.setHilite(located.range)
+            hiliteBounds = measureHiliteBounds(in: textView)
+        }
+
+        private func locate(
+            _ anchor: WordHilite,
+            in textView: TranscriptTextView
+        ) -> (range: NSRange, offset: Int)? {
+            guard let marker = store.markers.first(where: { $0.id == anchor.lineID }) else { return nil }
+            let storage = textView.textStorage.string as NSString
+            guard marker.location >= 0, marker.location < storage.length else { return nil }
+            let lineLength = min(marker.contentLength, storage.length - marker.location)
+            guard lineLength > 0 else { return nil }
+            let lineText = storage.substring(
+                with: NSRange(location: marker.location, length: lineLength)
+            ) as NSString
+            if anchor.offsetInLine >= 0,
+               anchor.offsetInLine + anchor.length <= lineText.length {
+                let slice = NSRange(location: anchor.offsetInLine, length: anchor.length)
+                if lineText.substring(with: slice) == anchor.word {
+                    return (
+                        NSRange(location: marker.location + anchor.offsetInLine, length: anchor.length),
+                        anchor.offsetInLine
+                    )
+                }
+            }
+            guard let found = TranscriptWord.find(anchor.word, in: lineText, near: anchor.offsetInLine) else {
+                return nil
+            }
+            return (
+                NSRange(location: marker.location + found.location, length: found.length),
+                found.location
+            )
+        }
+
+        private func measureHiliteBounds(in textView: TranscriptTextView) -> CGRect? {
+            guard measuringHilite == false else { return hiliteBounds }
+            measuringHilite = true
+            defer { measuringHilite = false }
+            guard let range = textView.rules?.hiliteRange, range.length > 0 else { return nil }
+            let storageLength = textView.textStorage.length
+            guard range.location >= 0, NSMaxRange(range) <= storageLength else { return nil }
+            guard let start = textView.position(from: textView.beginningOfDocument, offset: range.location),
+                  let end = textView.position(from: start, offset: range.length),
+                  let textRange = textView.textRange(from: start, to: end) else { return nil }
+            let rect = textView.firstRect(for: textRange)
+            guard rect.isNull == false, rect.isInfinite == false,
+                  rect.width > 0.5, rect.height > 0.5 else { return nil }
+            return rect
+        }
+
+        /// The bars and the keyboard cover `chromeInsets`. The word stays hilited
+        /// until its glyphs have left that window. Still being in the 4000-line
+        /// buffer is not enough, and a trim of older rows is not a reason to drop
+        /// a word that is still visible.
+        func clearHiliteIfOffscreen() {
+            guard holdHiliteClear == false else { return }
+            guard tappingWord == false, measuringHilite == false else { return }
+            guard checkingHilite == false, applying == false else { return }
+            guard hilite != nil, let textView else { return }
+            if hiliteBounds == nil {
+                hiliteBounds = measureHiliteBounds(in: textView)
+            }
+            guard let wordRect = hiliteBounds, wordRect.width > 0.5, wordRect.height > 0.5 else { return }
+            let visible = visibleWordRect(in: textView)
+            guard visible.isNull == false, visible.width > 1, visible.height > 1 else { return }
+            let overlap = wordRect.intersection(visible)
+            guard overlap.isNull || overlap.width < 1 || overlap.height < 1 else { return }
+            checkingHilite = true
+            defer { checkingHilite = false }
+            clearHilite()
+        }
+
+        private func visibleWordRect(in textView: TranscriptTextView) -> CGRect {
+            let inset = textView.chromeInsets
+            let bounds = textView.bounds
+            let width = bounds.width - inset.left - inset.right
+            let height = bounds.height - inset.top - inset.bottom
+            guard width > 1, height > 1 else { return .null }
+            return CGRect(
+                x: bounds.minX + inset.left,
+                y: bounds.minY + inset.top,
+                width: width,
+                height: height
+            )
+        }
+
+        private func clearHilite() {
+            guard hilite != nil || textView?.rules?.hiliteRange != nil else { return }
+            hilite = nil
+            hiliteBounds = nil
+            textView?.rules?.setHilite(nil)
+            publishHilite(nil)
+        }
+
+        func cancelHilitePublish() {
+            hilitePublishGeneration += 1
+        }
+
+        private func publishHilite(_ word: String?) {
+            guard publishedHilite != word else { return }
+            publishedHilite = word
+            hilitePublishGeneration += 1
+            let generation = hilitePublishGeneration
+            let callback = onHilitedWord
+            DispatchQueue.main.async { [weak self] in
+                guard let self, generation == self.hilitePublishGeneration else { return }
+                callback(word)
+            }
+        }
+
         func scrollViewWillBeginDragging(_: UIScrollView) {
             launchPinToken += 1
             bottomPinHeld = false
@@ -1613,6 +1992,9 @@ private struct TranscriptLog: UIViewRepresentable {
             let offsetY = textView.contentOffset.y
             let moved = abs(offsetY - lastOffsetY) > 0.5
             lastOffsetY = offsetY
+            if moved {
+                clearHiliteIfOffscreen()
+            }
             // Bounds and content-size changes call this too. Only a real offset
             // change is the reader moving; a keyboard frame must not flip the flag.
             // Rotation and the dismiss arm `holdUntil` before this runs.
@@ -2040,6 +2422,9 @@ struct TranscriptView: View {
                     },
                     onRevealFinished: { id in
                         session.finishResumeReveal(separatorID: id)
+                    },
+                    onHilitedWord: { word in
+                        session.setHilitedWord(word)
                     }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -2195,6 +2580,7 @@ struct TranscriptView: View {
                 deathShown = false
                 deathOpacity = 0
                 stopAwardFlash()
+                session.setHilitedWord(nil)
             }
             .task {
                 await PushRegistration.request(session: session)
