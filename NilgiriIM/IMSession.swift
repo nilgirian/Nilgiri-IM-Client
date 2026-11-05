@@ -137,6 +137,10 @@ final class IMSession: ObservableObject {
     /// False until the first login or since body in this process is applied.
     /// Death inside that first backlog is history, same as a replaced buffer.
     private var didApplyEntryBacklog = false
+    /// Seq of the line that last changed the header. Catch-up can hand the
+    /// death lines over again after `<2h 100m 94v>` has already arrived.
+    /// An older seq must not put those counts, or DEAD, back.
+    private var headerSeq: Int64 = 0
     /// `+87 XP!` / `LEVEL!` collected from this live batch. Cleared on commit.
     private var liveProgress: [String] = []
     private var progressSerial = 0
@@ -1116,10 +1120,22 @@ final class IMSession: ObservableObject {
     ) {
         let seenSeq = lastSeq
         var next = lines
-        for line in incoming where line.seq > lastSeq {
-            lastSeq = line.seq
-            guard let shownLine = presentable(line, live: true, adoptDeath: adoptDeath) else { continue }
-            next.append(shownLine)
+        for line in incoming {
+            // A prompt-only update can reuse a seq the scroll already showed,
+            // or a later poll can repeat the death lines. Header changes still
+            // run; the scroll does not gain a second copy.
+            let fresh = line.seq > lastSeq
+            if fresh {
+                lastSeq = line.seq
+            }
+            guard let shownLine = presentable(
+                line,
+                live: fresh,
+                adoptDeath: fresh && adoptDeath
+            ) else { continue }
+            if fresh {
+                next.append(shownLine)
+            }
         }
         commitVitals()
         publishLines(
@@ -1321,22 +1337,24 @@ final class IMSession: ObservableObject {
         guard shouldShow(line) else { return nil }
         let stripped = HMVPrompt.strip(line.text)
         let announced = HMVPrompt.announcedAlarm(line.text)
-        if let found = stripped.vitals {
-            // Stun and incapacitated merge onto the prompt first. A dead
-            // prompt from a login or resume backlog is then dropped, and a
-            // living prompt replaces every count, including an old DEAD.
-            let merged = mergingDowned(found, announced: announced)
-            if let header = adoptingHeaderPrompt(merged, adoptDeath: adoptDeath) {
-                pendingVitals = header
-                if header.isDead {
-                    noteLiveDeathAdopted()
+        if line.seq >= headerSeq {
+            if let found = stripped.vitals {
+                // Stun and incapacitated merge onto the prompt first. A dead
+                // prompt from a login or resume backlog is then dropped, and a
+                // living prompt replaces every count, including an old DEAD.
+                let merged = mergingDowned(found, announced: announced)
+                if let header = adoptingHeaderPrompt(merged, adoptDeath: adoptDeath) {
+                    acceptHeader(from: line, header)
+                    if header.isDead {
+                        noteLiveDeathAdopted()
+                    }
+                } else {
+                    acceptHeader(from: line, nil)
                 }
-            } else {
-                pendingVitals = nil
+            } else if let announced, var base = pendingVitals ?? vitals, base.isDead == false {
+                base.condition = announced
+                acceptHeader(from: line, base)
             }
-        } else if let announced, var base = pendingVitals ?? vitals, base.isDead == false {
-            base.condition = announced
-            pendingVitals = base
         }
         noteDeath(on: line, live: live, prompt: stripped.vitals, adoptDeath: adoptDeath)
         noteProgress(stripped.text, live: live)
@@ -1366,9 +1384,25 @@ final class IMSession: ObservableObject {
         )
     }
 
+    /// Takes this line as the header only when it is not older than the
+    /// prompt already showing. Nil clears a backlog death without copying
+    /// its counts forward, and only when that sentence is strictly newer
+    /// than the prompt so `<2h 100m 94v>` is not thrown away.
+    private func acceptHeader(from line: LineDTO, _ next: HMVPrompt.Vitals?) {
+        if next == nil {
+            guard line.seq > headerSeq else { return }
+        } else {
+            guard line.seq >= headerSeq else { return }
+        }
+        headerSeq = line.seq
+        pendingVitals = next
+    }
+
     /// Death is a header flag. The overlay waits until the batch commits, and
     /// the stored line is not rewritten. A login or resume backlog does not
-    /// set the flag or start the overlay. A live line still does.
+    /// set the flag or start the overlay. A live line still does. A sentence
+    /// older than the current prompt does not touch the header: that is how
+    /// `<2h 100m 94v>` survives a catch-up that replays the death.
     private func noteDeath(
         on line: LineDTO,
         live: Bool,
@@ -1376,10 +1410,13 @@ final class IMSession: ObservableObject {
         adoptDeath: Bool = true
     ) {
         if HMVPrompt.announcesDeath(line.text) {
+            guard line.seq >= headerSeq else { return }
             if adoptDeath {
                 if var base = pendingVitals ?? vitals, base.isDead == false {
                     base.condition = "DEAD"
-                    pendingVitals = base
+                    acceptHeader(from: line, base)
+                } else {
+                    headerSeq = line.seq
                 }
                 noteLiveDeathAdopted()
                 if live {
@@ -1387,7 +1424,8 @@ final class IMSession: ObservableObject {
                 }
             } else {
                 // The counts sitting with this sentence are the old death.
-                pendingVitals = nil
+                // Do not keep them, and do not erase a newer prompt.
+                acceptHeader(from: line, nil)
             }
             return
         }
@@ -1536,6 +1574,7 @@ final class IMSession: ObservableObject {
         guard let held = defaults.string(forKey: StoreKey.hmvName),
               namesEqual(held, next) == false else { return }
         vitals = nil
+        headerSeq = 0
         defaults.removeObject(forKey: StoreKey.hmv)
         defaults.removeObject(forKey: StoreKey.hmvName)
     }
@@ -1708,6 +1747,7 @@ final class IMSession: ObservableObject {
         lastSeq = 0
         pendingVitals = nil
         vitals = nil
+        headerSeq = 0
         deathBannerAt = nil
         liveDeathInBatch = false
         liveProgress = []
