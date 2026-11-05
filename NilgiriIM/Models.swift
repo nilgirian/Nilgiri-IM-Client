@@ -411,6 +411,51 @@ enum HMVPrompt {
         return folded == "sorry, you are dead" || folded == "you are dead"
     }
 
+    /// Overlay text for a Nilgiri award, in the order the sentences appear.
+    /// The stored line is not read for editing: callers keep the MUD text.
+    ///
+    /// Experience is its own line: `You gain 87 experience points!`
+    /// (also `point`, or a trailing `.`). `You gain 18 practice sessions.`
+    /// and `You gain 11 hit points.` are not experience.
+    ///
+    /// A level-up starts `You raise a level!` and then lists practice
+    /// sessions, hit points, mana, movement, and sometimes a skill percent.
+    /// That opening sentence is the announcement. A say or gossip that only
+    /// mentions the words does not start with it.
+    static func progressBanners(in raw: String) -> [String] {
+        let (plain, _) = strippingANSI(raw)
+        var banners: [String] = []
+        for piece in plain.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            let visible = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard visible.isEmpty == false else { continue }
+            if visible.range(
+                of: #"^you raise a level!"#,
+                options: [.regularExpression, .caseInsensitive]
+            ) != nil {
+                banners.append("LEVEL!")
+                continue
+            }
+            if let amount = experienceAward(in: visible) {
+                banners.append("+\(amount) XP!")
+            }
+        }
+        return banners
+    }
+
+    /// `You gain 87 experience points!` as the whole visible line.
+    private static func experienceAward(in visible: String) -> Int? {
+        let range = NSRange(visible.startIndex..., in: visible)
+        guard let match = experienceExpression.firstMatch(in: visible, options: [], range: range),
+              match.numberOfRanges >= 2,
+              let amountRange = Range(match.range(at: 1), in: visible) else { return nil }
+        return Int(visible[amountRange])
+    }
+
+    private static let experienceExpression: NSRegularExpression = {
+        let pattern = #"^you gain (\d+) experience points?[!.]*$"#
+        return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }()
+
     /// The condition words, or nil when the prompt had none.
     private static func conditionText(_ raw: Substring) -> String? {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
