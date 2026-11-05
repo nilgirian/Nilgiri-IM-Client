@@ -40,7 +40,7 @@ struct NilgiriIMApp: App {
                 .task {
                     guard showLaunchSplash else { return }
                     do {
-                        try await Task.sleep(for: .seconds(2))
+                        try await Task.sleep(for: .seconds(3))
                     } catch {
                         return
                     }
@@ -82,23 +82,34 @@ private func clearDeliveredNotificationsAndBadge(_ session: IMSession) {
     }
 }
 
-/// White cover over the root for about two seconds, then a short fade.
+/// White cover over the root for about three seconds, then a short fade.
 /// Display name, version, and build are read from the generated Info.plist.
+/// The app credit and the world credit sit between those two lines.
 /// Black on white stays the same in light and dark mode.
 private struct LaunchSplash: View {
     var body: some View {
         ZStack {
             Color.white.ignoresSafeArea()
-            VStack(spacing: 6) {
-                Text(appName)
-                    .font(.title2.weight(.semibold))
-                    .foregroundStyle(Color.black)
-                    .multilineTextAlignment(.center)
+            VStack(spacing: 22) {
+                VStack(spacing: 6) {
+                    Text(appName)
+                        .font(.title2.weight(.semibold))
+                    Text("by Frederick Nacino")
+                        .font(.subheadline)
+                }
+                VStack(spacing: 4) {
+                    Text("Nilgiri the Forgotten World")
+                        .font(.title3.bold())
+                    Text("by")
+                        .font(.subheadline)
+                    Text("Frederick Nacino and Robert Jeremy Bogue")
+                        .font(.subheadline)
+                }
                 Text(versionLine)
                     .font(.subheadline)
-                    .foregroundStyle(Color.black)
-                    .multilineTextAlignment(.center)
             }
+            .foregroundStyle(Color.black)
+            .multilineTextAlignment(.center)
             .padding(.horizontal, 32)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
