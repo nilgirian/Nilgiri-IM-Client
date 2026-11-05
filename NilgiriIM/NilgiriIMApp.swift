@@ -2,6 +2,19 @@ import SwiftUI
 import UIKit
 import UserNotifications
 
+private struct LaunchSplashVisibleKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    /// True while the white launch cover is on screen. The command field
+    /// waits to become first responder until this drops.
+    var launchSplashVisible: Bool {
+        get { self[LaunchSplashVisibleKey.self] }
+        set { self[LaunchSplashVisibleKey.self] = newValue }
+    }
+}
+
 @main
 struct NilgiriIMApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -14,6 +27,7 @@ struct NilgiriIMApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(session)
+                .environment(\.launchSplashVisible, showLaunchSplash)
                 .accessibilityHidden(showLaunchSplash)
                 .onAppear {
                     AppDelegate.session = session
