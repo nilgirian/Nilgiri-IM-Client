@@ -1637,6 +1637,30 @@ private struct CommandLineField: UIViewRepresentable {
     }
 }
 
+/// Centered death sentence. The red is translucent so the log shows through,
+/// and the flash does not take taps.
+private struct DeathFlash: View {
+    var opacity: Double
+
+    var body: some View {
+        GeometryReader { proxy in
+            let size = max(72, min(proxy.size.width, proxy.size.height) * 0.28)
+            Text("YOU ARE DEAD!")
+                .font(.system(size: size, weight: .bold))
+                .multilineTextAlignment(.center)
+                .foregroundStyle(Color.red.opacity(0.7))
+                .lineLimit(3)
+                .minimumScaleFactor(0.4)
+                .padding(.horizontal, 12)
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .opacity(opacity)
+        }
+        .allowsHitTesting(false)
+        .accessibilityLabel("You are dead")
+        .accessibilityHidden(opacity < 0.05)
+    }
+}
+
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
@@ -1677,6 +1701,11 @@ struct TranscriptView: View {
     @State private var bottomClearance: CGFloat = 0
     /// Laid-out height of the column behind the bars.
     @State private var columnHeight: CGFloat = 0
+    /// The death flash is on screen. Cleared after it fades.
+    @State private var deathShown = false
+    /// 1 while the sentence is held, then animated to 0.
+    @State private var deathOpacity = 0.0
+    @State private var deathTask: Task<Void, Never>?
 
     /// Count and the newest line, so a capped buffer and an insert both register
     /// without observing the whole transcript array.
@@ -1788,6 +1817,12 @@ struct TranscriptView: View {
                     }
                 )
             }
+            .overlay {
+                if deathShown {
+                    DeathFlash(opacity: deathOpacity)
+                        .ignoresSafeArea()
+                }
+            }
             .background {
                 WindowPortraitProbe { portrait in
                     orientationChanged(toPortrait: portrait)
@@ -1837,6 +1872,15 @@ struct TranscriptView: View {
                     showCommandKeyboardIfPreferred()
                 }
             }
+            .onChange(of: session.deathBannerID) { _, id in
+                guard id > 0 else { return }
+                playDeathFlash()
+            }
+            .onDisappear {
+                deathTask?.cancel()
+                deathShown = false
+                deathOpacity = 0
+            }
             .task {
                 await PushRegistration.request(session: session)
             }
@@ -1844,6 +1888,7 @@ struct TranscriptView: View {
     }
 
     /// Character name with the latest prompt beside it: "Sin  30h 100m 97v".
+    /// A downed condition from that prompt is bold red: "STUNNED", "DEAD".
     private var sessionHeader: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(session.character ?? "IM")
@@ -1854,10 +1899,38 @@ struct TranscriptView: View {
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
                     .foregroundStyle(.yellow)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.7)
                     .layoutPriority(1)
+            }
+            if let alarm = session.vitals?.alarm {
+                Text(alarm)
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.red)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .layoutPriority(2)
             }
         }
         .accessibilityElement(children: .combine)
+    }
+
+    /// Holds `YOU ARE DEAD!` for two seconds, then fades it out.
+    private func playDeathFlash() {
+        deathTask?.cancel()
+        deathShown = true
+        withAnimation(.none) {
+            deathOpacity = 1
+        }
+        deathTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            guard Task.isCancelled == false else { return }
+            withAnimation(.easeOut(duration: 0.8)) {
+                deathOpacity = 0
+            }
+            try? await Task.sleep(for: .milliseconds(800))
+            guard Task.isCancelled == false else { return }
+            deathShown = false
+        }
     }
 
     /// Same frost as the input bar (`Chrome.barBackground`), extended

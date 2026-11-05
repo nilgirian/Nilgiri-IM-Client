@@ -13,7 +13,11 @@ final class IMSession: ObservableObject {
     @Published var sessionId: String?
     @Published var character: String?
     /// Last HMV prompt. Kept across catch-up and relaunch until a newer prompt arrives.
+    /// A negative count and a downed condition live here, not in the line text.
     @Published private(set) var vitals: HMVPrompt.Vitals?
+    /// Bumps when a line that just arrived says the character died.
+    /// Replacing a saved transcript does not bump it.
+    @Published private(set) var deathBannerID = 0
     @Published var lines: [LineDTO] = []
     @Published var status = "Parked on the IM server when this app is in the background."
     /// Set for one login, resume, reconnect, or creation attempt. Nil hides the alert.
@@ -100,6 +104,13 @@ final class IMSession: ObservableObject {
     private var parkWaiters: [CheckedContinuation<Void, Never>] = []
     /// Prompt parsed from the batch currently being applied. Committed once.
     private var pendingVitals: HMVPrompt.Vitals?
+    /// When the death overlay last started, so a prompt and the death sentence
+    /// in the same breath do not start it twice.
+    private var deathBannerAt: Date?
+    /// This live batch included a death sentence or a prompt that says dead.
+    /// Cleared on commit. The overlay runs only when the batch still ends dead,
+    /// so a later prompt in the same catch-up does not flash.
+    private var liveDeathInBatch = false
     private let defaults = UserDefaults.standard
 
     private enum StoreKey {
@@ -114,7 +125,7 @@ final class IMSession: ObservableObject {
         /// Last server instant already drawn, so a later poll of the same value does not
         /// add another separator.
         static let shownDisconnectMs = "im.shownDisconnectMs"
-        /// "hp,mana,moves" for the character in `hmvName`.
+        /// "hp,mana,moves" or "hp,mana,moves,condition" for the character in `hmvName`.
         static let hmv = "im.hmv"
         static let hmvName = "im.hmvName"
         /// Draft id while creation is open. Cleared on finish and on cancel.
@@ -1005,7 +1016,7 @@ final class IMSession: ObservableObject {
             if line.seq > maxSeq {
                 maxSeq = line.seq
             }
-            guard let shownLine = presentable(line) else { continue }
+            guard let shownLine = presentable(line, live: false) else { continue }
             shown.append(shownLine)
         }
         commitVitals()
@@ -1033,7 +1044,7 @@ final class IMSession: ObservableObject {
         var next = lines
         for line in incoming where line.seq > lastSeq {
             lastSeq = line.seq
-            guard let shownLine = presentable(line) else { continue }
+            guard let shownLine = presentable(line, live: true) else { continue }
             next.append(shownLine)
         }
         commitVitals()
@@ -1226,28 +1237,68 @@ final class IMSession: ObservableObject {
     }
 
     /// Drops the color question and a line that is only an HMV prompt.
-    /// A prompt fused with other text keeps that text. The newest prompt in
-    /// the batch is remembered for the header.
-    private func presentable(_ line: LineDTO) -> LineDTO? {
+    /// A prompt fused with other text keeps that text. A negative prompt stays
+    /// in the line; the header still takes it. The newest prompt in the batch
+    /// is remembered for the header. `live` is false while replacing a buffer,
+    /// so an old death in that buffer does not flash the overlay.
+    private func presentable(_ line: LineDTO, live: Bool) -> LineDTO? {
         guard shouldShow(line) else { return nil }
         let stripped = HMVPrompt.strip(line.text)
         if let found = stripped.vitals {
             pendingVitals = found
         }
+        noteDeath(on: line, live: live, prompt: stripped.vitals)
         guard stripped.text.isEmpty == false else { return nil }
         guard stripped.text != line.text else { return line }
         return LineDTO(seq: line.seq, at: line.at, kind: line.kind, text: stripped.text)
     }
 
+    /// Death is a header flag. The overlay waits until the batch commits, and
+    /// the stored line is not rewritten.
+    private func noteDeath(on line: LineDTO, live: Bool, prompt: HMVPrompt.Vitals?) {
+        if HMVPrompt.announcesDeath(line.text) {
+            if var base = pendingVitals ?? vitals, base.isDead == false {
+                base.condition = "DEAD"
+                pendingVitals = base
+            }
+            if live {
+                liveDeathInBatch = true
+            }
+            return
+        }
+        if live, prompt?.isDead == true {
+            liveDeathInBatch = true
+        }
+    }
+
+    private func pulseDeathBanner() {
+        let now = Date()
+        if let deathBannerAt, now.timeIntervalSince(deathBannerAt) < 2.5 {
+            return
+        }
+        deathBannerAt = now
+        deathBannerID += 1
+    }
+
     private func commitVitals() {
-        guard let found = pendingVitals else { return }
-        pendingVitals = nil
-        guard vitals != found else { return }
-        vitals = found
-        defaults.set(found.stored, forKey: StoreKey.hmv)
-        let owner = character ?? name
-        if owner.isEmpty == false {
-            defaults.set(owner, forKey: StoreKey.hmvName)
+        let died = liveDeathInBatch
+        liveDeathInBatch = false
+        if let found = pendingVitals {
+            pendingVitals = nil
+            if vitals != found {
+                vitals = found
+                defaults.set(found.stored, forKey: StoreKey.hmv)
+                let owner = character ?? name
+                if owner.isEmpty == false {
+                    defaults.set(owner, forKey: StoreKey.hmvName)
+                }
+            }
+        }
+        // Flash when this batch died and no later prompt shows them alive.
+        // No header yet still counts: the sentence is the death.
+        let stillDead = vitals?.isDead ?? true
+        if died, stillDead {
+            pulseDeathBanner()
         }
     }
 
@@ -1424,6 +1475,8 @@ final class IMSession: ObservableObject {
         lastSeq = 0
         pendingVitals = nil
         vitals = nil
+        deathBannerAt = nil
+        liveDeathInBatch = false
         atMenu = false
         menuBusy = false
         menuExit = false
