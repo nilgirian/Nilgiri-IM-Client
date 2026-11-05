@@ -202,7 +202,11 @@ struct KeyboardSettingsDrawer: View {
                 Toggle("Hide keyboard in portrait mode", isOn: $preferences.hideInPortrait)
                 Toggle("Hide keyboard in landscape mode", isOn: $preferences.hideInLandscape)
                 VStack(alignment: .leading, spacing: 12) {
-                    infoLink("Report issues", urlString: Self.reportIssuesURL)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("To report issues, take a screenshot and you should have an option to \"Share Beta Feedback\" or use this link to")
+                            .fixedSize(horizontal: false, vertical: true)
+                        infoLink("Report issues", urlString: Self.reportIssuesURL)
+                    }
                     infoLink("Newbie guide", urlString: Self.newbieGuideURL)
                 }
                 if showsUnlink {
