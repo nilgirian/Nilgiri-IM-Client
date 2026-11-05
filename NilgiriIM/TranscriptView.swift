@@ -2306,7 +2306,7 @@ struct TranscriptView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
                 .frame(maxWidth: .infinity)
-            if session.atMenu == false, let opponent = session.opponent {
+            if session.atMenu == false, session.vitals?.isDead != true, let opponent = session.opponent {
                 opponentBar(opponent)
             }
         }
@@ -2323,18 +2323,20 @@ struct TranscriptView: View {
     /// The fight line, under the player prompt. The scrollback keeps the original.
     private func opponentBar(_ opponent: OpponentStatus.Snapshot) -> some View {
         VStack(spacing: 2) {
-            Text("[\(opponent.phrase)]")
+            Text(opponent.phrase)
                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white)
                 .multilineTextAlignment(.center)
                 .lineLimit(2)
                 .minimumScaleFactor(0.7)
-            Text("(\(opponent.vitalsLabel))")
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .foregroundStyle(.yellow)
-                .multilineTextAlignment(.center)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
+            if let pools = opponent.vitalsLabel {
+                Text("(\(pools))")
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.yellow)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.top, 8)
@@ -2347,7 +2349,10 @@ struct TranscriptView: View {
                 .padding(.horizontal, 12)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Opponent \(opponent.phrase), \(opponent.vitalsLabel)")
+        .accessibilityLabel(
+            opponent.vitalsLabel.map { "Opponent \(opponent.phrase), \($0)" }
+                ?? "Opponent \(opponent.phrase)"
+        )
     }
 
     private func sendCommand() async {

@@ -28,10 +28,10 @@ final class IMSession: ObservableObject {
     /// Awards from lines that just arrived (`+87 XP!`, `LEVEL!`), in order.
     /// Replacing a saved transcript does not set it. The line text stays.
     @Published private(set) var progressPulse: ProgressPulse?
-    /// Opponent condition under the player bar while the latest prompt says
-    /// `fighting`. Nil when that fight ends, the character is dead, the welcome
-    /// menu is up, or no opponent line has arrived. The server line stays in
-    /// the transcript.
+    /// Latest opponent condition under the player bar. Nil when the character
+    /// is dead, the welcome menu is up, or no opponent line has arrived.
+    /// A later prompt that does not say `fighting` leaves it up. The server
+    /// line stays in the transcript.
     @Published private(set) var opponent: OpponentStatus.Snapshot?
     @Published var lines: [LineDTO] = []
     @Published var status = "Parked on the IM server when this app is in the background."
@@ -129,11 +129,9 @@ final class IMSession: ObservableObject {
     /// `+87 XP!` / `LEVEL!` collected from this live batch. Cleared on commit.
     private var liveProgress: [String] = []
     private var progressSerial = 0
-    /// Latest opponent line in the scan. Held until a prompt, death, or the menu ends the fight.
+    /// Latest opponent line in the scan. Held until death, the menu, or a character change.
     private var pendingOpponent: OpponentStatus.Snapshot?
-    /// True when this scan's latest fight signal is still a fight.
-    private var pendingFighting = false
-    /// A prompt, an opponent line, a death, or a full transcript replace needs a commit.
+    /// An opponent line, a death, or a full transcript replace needs a commit.
     private var fightStateDirty = false
     private let defaults = UserDefaults.standard
 
@@ -1277,7 +1275,7 @@ final class IMSession: ObservableObject {
         if let found = stripped.vitals {
             pendingVitals = found
         }
-        noteFight(on: line.text, prompt: stripped.vitals)
+        noteFight(on: line.text)
         noteDeath(on: line, live: live, prompt: stripped.vitals)
         noteProgress(stripped.text, live: live)
         guard stripped.text.isEmpty == false else { return nil }
@@ -1285,43 +1283,18 @@ final class IMSession: ObservableObject {
         return LineDTO(seq: line.seq, at: line.at, kind: line.kind, text: stripped.text)
     }
 
-    /// Opponent text is not rewritten. The bar is on only while the latest
-    /// prompt says `fighting` and an opponent line is in hand. A prompt that
-    /// finishes after the opponent line and does not say `fighting` drops both.
-    /// An opponent line after an older prompt only stores the condition; it
-    /// does not by itself start or end the fight.
-    private func noteFight(on raw: String, prompt: HMVPrompt.Vitals?) {
-        let opponentHit = OpponentStatus.parse(raw)
-        let promptPlainEnd = HMVPrompt.lastPromptPlainEnd(raw)
-        let promptIsLater: Bool = {
-            guard let promptPlainEnd, let opponentHit else { return prompt != nil }
-            return promptPlainEnd >= opponentHit.plainEnd
-        }()
-        if let opponentHit, promptIsLater == false {
-            pendingOpponent = opponentHit.snapshot
-            if prompt?.isFighting == true {
-                pendingFighting = true
-            }
-            fightStateDirty = true
-            return
-        }
-        guard let prompt else { return }
+    /// Opponent text is not rewritten. A bracketed condition stays up through
+    /// later prompts, including ones that do not say `fighting`. Death, the
+    /// welcome menu, and a character change clear it.
+    private func noteFight(on raw: String) {
+        guard let found = OpponentStatus.parse(raw) else { return }
+        pendingOpponent = found
         fightStateDirty = true
-        if prompt.isFighting {
-            pendingFighting = true
-            if let opponentHit {
-                pendingOpponent = opponentHit.snapshot
-            }
-        } else {
-            pendingFighting = false
-            pendingOpponent = nil
-        }
     }
 
     /// A new transcript is its own fight. Commit publishes whatever the lines decide.
     private func beginOpponentScan() {
         pendingOpponent = nil
-        pendingFighting = false
         fightStateDirty = true
     }
 
@@ -1329,13 +1302,11 @@ final class IMSession: ObservableObject {
     /// the same batch can still be a new fight.
     private func endFightInScan() {
         pendingOpponent = nil
-        pendingFighting = false
         fightStateDirty = true
     }
 
     private func hideOpponentBar() {
         pendingOpponent = nil
-        pendingFighting = false
         fightStateDirty = false
         if opponent != nil {
             opponent = nil
@@ -1347,13 +1318,9 @@ final class IMSession: ObservableObject {
         fightStateDirty = false
         if atMenu || vitals?.isDead == true {
             pendingOpponent = nil
-            pendingFighting = false
         }
-        // A condition line can arrive before the prompt that says fighting.
-        // Keep it, and publish only once that prompt is the latest one.
-        let shown = pendingFighting ? pendingOpponent : nil
-        if opponent != shown {
-            opponent = shown
+        if opponent != pendingOpponent {
+            opponent = pendingOpponent
         }
     }
 
