@@ -1743,16 +1743,9 @@ struct TranscriptView: View {
                 VStack(spacing: 0) {
                     topBar
                     ZStack(alignment: .bottom) {
-                        ZStack(alignment: .topTrailing) {
-                            Color.clear
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                .allowsHitTesting(false)
-                            if session.atMenu == false {
-                                unlinkButton
-                                    .padding(.top, 8)
-                                    .padding(.trailing, 12)
-                            }
-                        }
+                        Color.clear
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .allowsHitTesting(false)
                         if showNewLines, nearBottom == false, session.pendingResumeReveal == false {
                             newLinesButton
                                 .padding(.bottom, 8)
@@ -1812,6 +1805,10 @@ struct TranscriptView: View {
                 KeyboardSettingsDrawer(
                     preferences: keyboardPrefs,
                     openRequest: $settingsOpenRequest,
+                    showsUnlink: session.atMenu == false,
+                    onUnlink: {
+                        Task { await session.logout(closeMud: true) }
+                    },
                     onOpenChange: { open in
                         keyboardSettingsCardChanged(open: open)
                     }
@@ -1947,20 +1944,6 @@ struct TranscriptView: View {
                     Color.clear.preference(key: TopBarHeightKey.self, value: proxy.size.height)
                 }
             }
-    }
-
-    /// Floats just under the name bar, on the trailing side. Lighter than the
-    /// bar so it does not read as part of that chrome.
-    private var unlinkButton: some View {
-        Button("Unlink") {
-            Task { await session.logout(closeMud: true) }
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(ink)
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .background(.ultraThinMaterial.opacity(0.25), in: Capsule())
-        .accessibilityLabel("Unlink")
     }
 
     private func sendCommand() async {
