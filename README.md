@@ -29,6 +29,7 @@ Push notifications only work in builds signed for the official app, because the 
 | `PushRegistration.swift` | Push notification registration |
 | `SessionSecrets.swift` | Keychain storage for passwords and session tokens |
 | `Theme.swift` | Shared colors and translucent bar styling |
+| `KeyboardPreferences.swift` | Left-edge menu and saved keyboard hide switches |
 | `Models.swift` | Shared data types |
 
 ## Reporting problems
