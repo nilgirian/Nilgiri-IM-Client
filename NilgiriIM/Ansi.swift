@@ -27,9 +27,10 @@ enum Ansi {
     enum Wrap: Equatable {
         /// Break at the column, including inside a word.
         case columns
-        /// Enlarged say, gossip, and the other communication lines. A word of
-        /// fewer than 11 letters that would cross the column moves onto the
-        /// next line whole, and every line after the first is indented two spaces.
+        /// Say, gossip, and the other communication lines, portrait or landscape.
+        /// A word of fewer than 11 letters that would cross the column moves
+        /// onto the next line whole, and every line after the first is indented
+        /// two spaces.
         case communication
     }
 
@@ -478,7 +479,7 @@ enum Ansi {
         return (out, wrapBreaks)
     }
 
-    /// Enlarged communication. A word is the visible columns up to the next
+    /// Communication lines. A word is the visible columns up to the next
     /// space, tab, or newline; ANSI is copied and takes no column. Fewer than
     /// 11 letters means that run is shorter than 11 columns. Such a word is
     /// moved whole when it would cross the column and still fits on a

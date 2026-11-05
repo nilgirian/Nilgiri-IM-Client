@@ -424,9 +424,13 @@ private final class TranscriptDocumentStore {
         } else {
             let size = displayFontSize(line, base: fontSize)
             lastMudFontSize = size
-            // The larger face is the only one that wraps short of 80. A word
-            // under 11 letters moves whole, and later lines indent two spaces.
-            let wrap: Ansi.Wrap = size > fontSize + 0.01 ? .communication : .columns
+            // Portrait draws these larger, so the wrap is short of 80. Landscape
+            // keeps this face and the 80-column measure. Channel lines use the
+            // same rule in both: a word under 11 letters moves whole, and later
+            // lines indent two spaces. Other lines keep the column break.
+            let wrap: Ansi.Wrap = CommunicationLine.isCommunication(line)
+                ? .communication
+                : .columns
             let piece = NSMutableAttributedString(attributedString: Ansi.attributed(
                 line.text,
                 fontSize: size,
