@@ -103,7 +103,8 @@ struct KeyboardSettingsDrawer: View {
     /// Toggled by the accessibility action. Each change opens the card.
     @Binding var openRequest: Bool
 
-    private static let menuGrey = Color(white: 0.22)
+    /// Dark grey, see-through, so the log shows behind the card.
+    private static let menuGrey = Color(white: 0.22).opacity(0.55)
 
     @State private var travel: CGFloat = 0
     @State private var dragOrigin: CGFloat?
@@ -119,16 +120,24 @@ struct KeyboardSettingsDrawer: View {
                 // Absent while closed, so the full-screen reader does not eat
                 // taps meant for the log or the command field.
                 if travel > 0 {
-                    Color.black.opacity(0.4 * progress)
-                        .ignoresSafeArea()
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            withAnimation(.easeOut(duration: 0.22)) {
-                                travel = 0
+                    // Dim only the screen beside the card. The grey itself is
+                    // translucent, so the log under the card stays visible.
+                    HStack(spacing: 0) {
+                        Color.clear
+                            .frame(width: travel)
+                            .allowsHitTesting(false)
+                        Color.black.opacity(0.4 * progress)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                withAnimation(.easeOut(duration: 0.22)) {
+                                    travel = 0
+                                }
                             }
-                        }
-                        .simultaneousGesture(pan(width: width, edge: edge, fromEdgeOnly: false))
-                        .accessibilityHidden(true)
+                            .simultaneousGesture(pan(width: width, edge: edge, fromEdgeOnly: false))
+                    }
+                    .ignoresSafeArea()
+                    .accessibilityHidden(true)
 
                     card(width: width, insets: insets)
                         .offset(x: travel - width)
