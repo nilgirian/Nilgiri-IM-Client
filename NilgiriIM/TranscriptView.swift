@@ -503,12 +503,27 @@ private enum TranscriptWord {
 
     /// The word under `viewPoint`, or nil when the tap is on a gap or padding.
     static func hit(in textView: UITextView, at viewPoint: CGPoint) -> Hit? {
+        guard let index = characterIndex(in: textView, at: viewPoint) else { return nil }
+        return span(in: textView.textStorage.string as NSString, at: index)
+    }
+
+    /// Link under `viewPoint`, or nil on a gap or on text that is not a link.
+    static func link(in textView: UITextView, at viewPoint: CGPoint) -> URL? {
+        guard let index = characterIndex(in: textView, at: viewPoint) else { return nil }
+        let value = textView.textStorage.attribute(.link, at: index, effectiveRange: nil)
+        if let url = value as? URL { return url }
+        if let string = value as? String { return URL(string: string) }
+        return nil
+    }
+
+    /// Character under `viewPoint`, or nil when the tap misses the glyph.
+    /// UITextView has no textContainerOrigin (that is AppKit). The container
+    /// sits at the inset; line fragment padding on this view is zero.
+    private static func characterIndex(in textView: UITextView, at viewPoint: CGPoint) -> Int? {
         let storage = textView.textStorage
         guard storage.length > 0 else { return nil }
         let layout = textView.layoutManager
         guard layout.numberOfGlyphs > 0 else { return nil }
-        // UITextView has no textContainerOrigin (that is AppKit). The container
-        // sits at the inset; line fragment padding on this view is zero.
         let origin = CGPoint(x: textView.textContainerInset.left, y: textView.textContainerInset.top)
         let point = CGPoint(x: viewPoint.x - origin.x, y: viewPoint.y - origin.y)
         let glyph = layout.glyphIndex(
@@ -528,7 +543,7 @@ private enum TranscriptWord {
         glyphRect.origin.y += origin.y
         let slop = glyphRect.insetBy(dx: -2, dy: -3)
         guard slop.isNull == false, slop.contains(viewPoint) else { return nil }
-        return span(in: storage.string as NSString, at: charIndex)
+        return charIndex
     }
 
     /// `word` inside `text`, preferring the occurrence nearest `offset`.
@@ -594,6 +609,21 @@ private enum TranscriptWord {
     private static func isTrimmed(_ unit: unichar) -> Bool {
         guard let scalar = Unicode.Scalar(UInt32(unit)) else { return false }
         return trimSet.contains(scalar)
+    }
+}
+
+/// One open per tap. The system link action and the hilite tap can both see
+/// the same URL when the command field keeps first responder.
+private enum TranscriptLinkOpener {
+    private static var lastURL: URL?
+    private static var lastTime: TimeInterval = -.greatestFiniteMagnitude
+
+    static func open(_ url: URL) {
+        let now = CACurrentMediaTime()
+        if lastURL == url, now - lastTime < 0.8 { return }
+        lastURL = url
+        lastTime = now
+        UIApplication.shared.open(url)
     }
 }
 
@@ -702,6 +732,13 @@ private final class TranscriptTextView: UITextView {
     private var laidWidth: CGFloat = -1
     private var laidContentHeight: CGFloat = -1
     private var laidBoundsHeight: CGFloat = -1
+    /// The log on screen. The command field asks it whether a selection
+    /// press is taking focus.
+    private static weak var installed: TranscriptTextView?
+    /// `CACurrentMediaTime` when the finger went down. Compared only with
+    /// itself, never with `UITouch.timestamp`.
+    private var fingerDownAt: TimeInterval?
+    private var fingerIsDown = false
 
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         let storage = NSTextStorage()
@@ -764,8 +801,110 @@ private final class TranscriptTextView: UITextView {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
+        if window != nil {
+            Self.installed = self
+        } else if Self.installed === self {
+            Self.installed = nil
+        }
         guard window != nil else { return }
         onChromeLayout?()
+    }
+
+    /// A tap must not take first responder while the command field is up and
+    /// this orientation leaves the keyboard up. Handing first responder to a
+    /// non-editable text view removes the keyboard with no slide. A long
+    /// press still falls through, and so does hide-on.
+    override func becomeFirstResponder() -> Bool {
+        if keepsCommandFieldForQuickTap() {
+            return false
+        }
+        return super.becomeFirstResponder()
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        noteFingerDown()
+        super.touchesBegan(touches, with: event)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        noteFingerUp()
+        super.touchesEnded(touches, with: event)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        noteFingerUp()
+        super.touchesCancelled(touches, with: event)
+    }
+
+    /// Hide is off, and this touch is not a selection press. The command
+    /// field should stay first responder. A plain tap does not have to be
+    /// classified first: the previous guard missed the resign when that
+    /// classification was false.
+    static func logTapShouldKeepCommandField() -> Bool {
+        guard KeyboardHidePreferences.hidesKeyboardForCurrentInterface() == false else { return false }
+        if installed?.selectionPressIsTakingFocus() == true {
+            return false
+        }
+        return true
+    }
+
+    /// The command field is still up, so a link under a tap is opened here.
+    /// Refusing first responder can skip the system's link action.
+    func keepsCommandFieldForQuickTap() -> Bool {
+        guard Self.logTapShouldKeepCommandField() else { return false }
+        guard let window else { return false }
+        return Self.commandFieldIsFirstResponder(in: window)
+    }
+
+    func noteFingerDown() {
+        if window != nil {
+            Self.installed = self
+        }
+        if fingerIsDown == false {
+            fingerDownAt = CACurrentMediaTime()
+            fingerIsDown = true
+        }
+    }
+
+    private func noteFingerUp() {
+        fingerIsDown = false
+        fingerDownAt = nil
+    }
+
+    /// The selection long press has begun, or the finger has been down long
+    /// enough that it is about to. A short tap stays false.
+    func selectionPressIsTakingFocus() -> Bool {
+        let now = CACurrentMediaTime()
+        var sawLongPress = false
+        for case let press as UILongPressGestureRecognizer in gestureRecognizers ?? [] {
+            sawLongPress = true
+            switch press.state {
+            case .began, .changed:
+                return true
+            case .possible:
+                let threshold = max(0.2, press.minimumPressDuration - 0.02)
+                if fingerIsDown, let down = fingerDownAt, now - down >= threshold {
+                    return true
+                }
+            default:
+                break
+            }
+        }
+        if sawLongPress == false, fingerIsDown, let down = fingerDownAt, now - down >= 0.45 {
+            return true
+        }
+        return false
+    }
+
+    private static func commandFieldIsFirstResponder(in root: UIView) -> Bool {
+        var stack = [root]
+        while let view = stack.popLast() {
+            if let field = view as? CommandTextField, field.isFirstResponder {
+                return true
+            }
+            stack.append(contentsOf: view.subviews)
+        }
+        return false
     }
 
     override var intrinsicContentSize: CGSize {
@@ -825,6 +964,9 @@ private final class TranscriptTextView: UITextView {
     }
 
     override func layoutSubviews() {
+        if window != nil {
+            Self.installed = self
+        }
         let width = bounds.width
         if width > 1, laidWidth > 1, abs(width - laidWidth) >= 0.5 {
             onWidthWillChange?()
@@ -976,8 +1118,8 @@ private struct TranscriptLog: UIViewRepresentable {
             coordinator?.layoutWhilePinned()
         }
         // A quick tap hilites a word. Touches are not cancelled, so a drag still
-        // scrolls, a link still opens, and the command field keeps first responder
-        // when this orientation leaves the keyboard up.
+        // scrolls and a link still opens. The text view refuses first responder
+        // for that tap when this orientation leaves the keyboard up.
         let tap = UITapGestureRecognizer(
             target: context.coordinator,
             action: #selector(Coordinator.wordTapped(_:))
@@ -985,6 +1127,7 @@ private struct TranscriptLog: UIViewRepresentable {
         tap.cancelsTouchesInView = false
         tap.delegate = context.coordinator
         view.addGestureRecognizer(tap)
+        context.coordinator.wordTap = tap
         return host
     }
 
@@ -1076,6 +1219,7 @@ private struct TranscriptLog: UIViewRepresentable {
 
     final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
         weak var textView: TranscriptTextView?
+        weak var wordTap: UITapGestureRecognizer?
         let store = TranscriptDocumentStore()
         let carry = ColourCarryCache()
         var lines: [LineDTO] = []
@@ -1803,9 +1947,16 @@ private struct TranscriptLog: UIViewRepresentable {
         @objc func wordTapped(_ gesture: UITapGestureRecognizer) {
             guard gesture.state == .ended, let textView else { return }
             guard launchSplashVisible == false, textView.isDragging == false else { return }
+            let point = gesture.location(in: textView)
+            // The field stayed first responder, so the system's link action may
+            // not run. Open the same URL the delegate would have opened.
+            if textView.keepsCommandFieldForQuickTap(),
+               let url = TranscriptWord.link(in: textView, at: point) {
+                TranscriptLinkOpener.open(url)
+            }
             tappingWord = true
             defer { tappingWord = false }
-            guard let hit = TranscriptWord.hit(in: textView, at: gesture.location(in: textView)) else { return }
+            guard let hit = TranscriptWord.hit(in: textView, at: point) else { return }
             guard let anchor = hiliteAnchor(for: hit) else { return }
             if hilite == anchor {
                 clearHilite()
@@ -1815,6 +1966,13 @@ private struct TranscriptLog: UIViewRepresentable {
             textView.rules?.setHilite(hit.range)
             hiliteBounds = measureHiliteBounds(in: textView)
             publishHilite(anchor.word)
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive _: UITouch) -> Bool {
+            if gestureRecognizer === wordTap {
+                textView?.noteFingerDown()
+            }
+            return true
         }
 
         func gestureRecognizer(
@@ -2030,7 +2188,7 @@ private struct TranscriptLog: UIViewRepresentable {
                 return defaultAction
             }
             return UIAction(title: defaultAction.title) { _ in
-                UIApplication.shared.open(url)
+                TranscriptLinkOpener.open(url)
             }
         }
 
@@ -2108,12 +2266,28 @@ private struct LogGlobalFrameKey: PreferenceKey {
     }
 }
 
+/// The command line, as opposed to a password field. A log tap uses the
+/// class to see which field is first responder, and refuses to resign while
+/// this orientation leaves the keyboard up.
+private final class CommandTextField: UITextField {
+    /// True when a log tap must leave this field first responder.
+    var shouldRemainFirstResponder: (() -> Bool)?
+
+    override func resignFirstResponder() -> Bool {
+        if shouldRemainFirstResponder?() == true {
+            return false
+        }
+        return super.resignFirstResponder()
+    }
+}
+
 /// Command line. A stock SwiftUI field resigns on Return and again when focus
 /// is written `true` while it is already first responder, so the keyboard
 /// drops and comes back. This field becomes first responder only on the
 /// transition into focus. Return resigns only when this orientation hides
-/// the keyboard. A selection in the log, a swipe-down, and a hide-on send
-/// still end editing.
+/// the keyboard. A long-press selection in the log, a swipe-down, and a
+/// hide-on send still end editing. A tap on the log does not, when this
+/// orientation leaves the keyboard up.
 ///
 /// Traits are set once. `textInputMode` is not overridden, and
 /// `becomeFirstResponder` is not called from `updateUIView`: doing either
@@ -2126,7 +2300,7 @@ private struct CommandLineField: UIViewRepresentable {
     var onSubmit: () -> Void
 
     func makeUIView(context: Context) -> UITextField {
-        let field = UITextField()
+        let field = CommandTextField()
         field.delegate = context.coordinator
         field.font = UIFont.monospacedSystemFont(
             ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize,
@@ -2181,6 +2355,14 @@ private struct CommandLineField: UIViewRepresentable {
         coordinator.dismissOnSubmit = dismissOnSubmit
         coordinator.isFocused = $isFocused
         coordinator.textChanged = { text = $0 }
+        if let command = field as? CommandTextField {
+            // Live hide switch, not `dismissOnSubmit`: that flag can be a
+            // frame behind the drawer. A swipe clears `wantsFocus` first.
+            command.shouldRemainFirstResponder = { [weak coordinator] in
+                guard let coordinator, coordinator.wantsFocus else { return false }
+                return TranscriptTextView.logTapShouldKeepCommandField()
+            }
+        }
         // A programmatic clear (send) must not restart the input session.
         // Marked text is an in-progress composition; replacing it drops characters.
         if field.markedTextRange == nil, field.text != text {
@@ -2224,6 +2406,17 @@ private struct CommandLineField: UIViewRepresentable {
         @objc func editingChanged(_ field: UITextField) {
             guard applyingText == false else { return }
             textChanged(field.text ?? "")
+        }
+
+        /// Hide-off: any log tap must not resign. Returning false leaves this
+        /// field first responder, so the keyboard never starts to hide. A
+        /// long-press selection still resigns. A swipe-down clears
+        /// `wantsFocus` before it resigns. Hide-on fails the keep check.
+        func textFieldShouldEndEditing(_: UITextField) -> Bool {
+            if wantsFocus, TranscriptTextView.logTapShouldKeepCommandField() {
+                return false
+            }
+            return true
         }
 
         func textFieldDidBeginEditing(_ textField: UITextField) {
@@ -3030,9 +3223,11 @@ struct TranscriptView: View {
                             return
                         }
                         // Becoming first responder holds the keyboard. Losing it
-                        // (a log selection, or a swipe that already cleared the
-                        // hold) stays dismissed. Send calls `keepCommandKeyboard`
-                        // only when this orientation is keeping the keyboard.
+                        // (a long-press selection in the log, or a swipe that
+                        // already cleared the hold) stays dismissed. A quick tap
+                        // does not clear focus while this orientation keeps the
+                        // keyboard. Send calls `keepCommandKeyboard` only when
+                        // hide is off.
                         if focused {
                             keyboardHeld = true
                             restoringKeyboard = false
@@ -3350,13 +3545,17 @@ private struct ActionPanel: View {
         let token = (lightTokens[command] ?? 0) + 1
         lightTokens[command] = token
         withAnimation(.easeOut(duration: 0.08)) {
+            // `insert` returns whether the command was new. The closure must
+            // stay Void so `withAnimation` does not return that tuple.
             litCommands.insert(command)
+            return
         }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             guard lightTokens[command] == token else { return }
             withAnimation(.easeOut(duration: 0.15)) {
                 litCommands.remove(command)
+                return
             }
         }
     }
@@ -3440,12 +3639,14 @@ private struct SkillActionStack: View {
         lightTokens[index] = token
         withAnimation(.easeOut(duration: 0.08)) {
             litSlots.insert(index)
+            return
         }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             guard lightTokens[index] == token else { return }
             withAnimation(.easeOut(duration: 0.15)) {
                 litSlots.remove(index)
+                return
             }
         }
     }
