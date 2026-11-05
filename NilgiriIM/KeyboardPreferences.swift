@@ -29,6 +29,16 @@ final class KeyboardHidePreferences: ObservableObject {
         isPortrait ? hideInPortrait : hideInLandscape
     }
 
+    /// Hide switch for the window on screen. The drawer writes the same keys.
+    static func hidesKeyboardForCurrentInterface() -> Bool {
+        let defaults = UserDefaults.standard
+        let phone = UIDevice.current.userInterfaceIdiom == .phone
+        if interfaceIsPortrait() {
+            return stored(defaults, Key.portrait, fallback: false)
+        }
+        return stored(defaults, Key.landscape, fallback: phone)
+    }
+
     /// The window, not the log. The keyboard shortens the log without a rotation.
     static func interfaceIsPortrait() -> Bool {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
