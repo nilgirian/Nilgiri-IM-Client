@@ -2574,7 +2574,7 @@ private struct GameMenuPanel: View {
 
 /// One row of compass commands on the input bar's frost. Each tap posts the
 /// full direction through `session.send()`, the same as typing it. The pressed
-/// letter stays lit for half a second, then returns to ink.
+/// letter stays lit for a quarter second, then returns to ink.
 private struct ActionPanel: View {
     var send: (String) -> Void
 
@@ -2593,7 +2593,7 @@ private struct ActionPanel: View {
         Direction(label: "D", command: "down"),
     ]
 
-    /// Commands whose letters are lit. A second tap of the same letter restarts the half second.
+    /// Commands whose letters are lit. A second tap of the same letter restarts a quarter second.
     @State private var litCommands: Set<String> = []
     /// Per-command generation so an earlier timer cannot put the light out early.
     @State private var lightTokens: [String: Int] = [:]
@@ -2625,7 +2625,7 @@ private struct ActionPanel: View {
         .padding(.top, 4)
     }
 
-    /// Brighten this letter for half a second. The button still sends the command.
+    /// Brighten this letter for a quarter second. The button still sends the command.
     private func light(_ command: String) {
         let token = (lightTokens[command] ?? 0) + 1
         lightTokens[command] = token
@@ -2633,7 +2633,7 @@ private struct ActionPanel: View {
             litCommands.insert(command)
         }
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(500))
+            try? await Task.sleep(for: .milliseconds(250))
             guard lightTokens[command] == token else { return }
             withAnimation(.easeOut(duration: 0.15)) {
                 litCommands.remove(command)
