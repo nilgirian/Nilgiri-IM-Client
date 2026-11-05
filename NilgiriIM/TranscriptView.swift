@@ -797,6 +797,9 @@ private struct TranscriptLog: UIViewRepresentable {
     var columnHeight: CGFloat
     var revealPending: Bool
     var resumeSeparatorID: String?
+    /// White launch cover. While it is up the log is not hit-testable, so a
+    /// scroll under it is layout, and the bottom pin is put back when it ends.
+    var launchSplashVisible: Bool
     var onNearBottom: (Bool) -> Void
     var onRevealFinished: (String) -> Void
 
@@ -804,6 +807,7 @@ private struct TranscriptLog: UIViewRepresentable {
         let host = TranscriptHost(frame: .zero)
         let view = host.textView
         view.delegate = context.coordinator
+        context.coordinator.launchSplashVisible = launchSplashVisible
         context.coordinator.textView = view
         view.onStructuralLayout = { [weak coordinator = context.coordinator] in
             coordinator?.noteLayout()
@@ -857,6 +861,13 @@ private struct TranscriptLog: UIViewRepresentable {
         coordinator.revealPending = revealPending
         coordinator.resumeSeparatorID = resumeSeparatorID
         coordinator.lines = lines
+        let splashEnded = coordinator.launchSplashVisible && launchSplashVisible == false
+        coordinator.launchSplashVisible = launchSplashVisible
+        if splashEnded {
+            // Arm the hold before text or insets move the offset. Those
+            // callbacks look like a reader scroll once the cover flag drops.
+            coordinator.prepareForLaunchSplashEnd()
+        }
         let heightsChanged = abs(coordinator.topBarHeight - topBarHeight) >= 0.5
             || abs(coordinator.bottomBarHeight - bottomBarHeight) >= 0.5
             || abs(coordinator.topClearance - topClearance) >= 0.5
@@ -877,6 +888,11 @@ private struct TranscriptLog: UIViewRepresentable {
             coordinator.scrollToBottom(animated: false)
         }
         coordinator.applyIfPossible()
+        if splashEnded {
+            // Text that arrived under the cover is in the storage now.
+            // Pin after that apply so the offset includes it.
+            coordinator.pinAfterLaunchSplash()
+        }
         coordinator.syncReveal()
         if requestedScroll == false, coordinator.stickToBottom == false, coordinator.revealing == false {
             let deltaY = abs(textView.contentOffset.y - offset.y)
@@ -898,6 +914,9 @@ private struct TranscriptLog: UIViewRepresentable {
         var onRevealFinished: (String) -> Void = { _ in }
         var revealPending = false
         var resumeSeparatorID: String?
+        /// Starts covered. `makeUIView` copies the real flag before the first
+        /// layout, so a launch scroll is not treated as the reader leaving.
+        var launchSplashVisible = true
         var nearBottom = true
         var stickToBottom = true
         var holdUntil = Date.distantPast
@@ -946,7 +965,26 @@ private struct TranscriptLog: UIViewRepresentable {
         /// animation. A finger drag clears it. The scroll view reports both
         /// as scrolls, so the pin is put back when the keyboard animation ends.
         private var bottomPinHeld = false
+        /// Resume separator whose ease ran, or would have run, under the launch
+        /// cover. `revealPending` stays true until SwiftUI applies the finish
+        /// callback, and that gap must not block the pin when the cover ends.
+        private var coveredRevealID: String?
+        /// Bumped when the reader drags, so a follow-up pin after the cover
+        /// does not pull them back down.
+        private var launchPinToken = 0
         private var keyboardObservers: [NSObjectProtocol] = []
+
+        /// A resume reveal owns the offset until it eases to the bottom.
+        /// The launch cover is not that reveal: the reader cannot see it, and
+        /// the keyboard that appears when the cover ends would leave a stale
+        /// ease target short of the latest line.
+        private var revealBlocksBottomPin: Bool {
+            if launchSplashVisible { return false }
+            if revealing { return true }
+            guard revealPending else { return false }
+            if let coveredRevealID, coveredRevealID == resumeSeparatorID { return false }
+            return true
+        }
 
         override init() {
             super.init()
@@ -1029,7 +1067,7 @@ private struct TranscriptLog: UIViewRepresentable {
                 keyboardEndFrame = end
             }
             restoreHeldBottomPin()
-            let pin = stickToBottom && revealing == false && revealPending == false
+            let pin = stickToBottom && revealBlocksBottomPin == false
             refreshChromeInsets(pinIfStuck: pin)
             pinRestingBottomAfterLayout()
         }
@@ -1037,7 +1075,7 @@ private struct TranscriptLog: UIViewRepresentable {
         /// Width change or keyboard animation. Does not pull a reader who has
         /// scrolled up, and does not fight a finger that is already down.
         func holdBottomPin(for duration: TimeInterval) {
-            guard revealing == false, revealPending == false else { return }
+            guard revealBlocksBottomPin == false else { return }
             guard let textView,
                   textView.isTracking == false,
                   textView.isDragging == false,
@@ -1057,7 +1095,7 @@ private struct TranscriptLog: UIViewRepresentable {
         private func restoreHeldBottomPin() {
             let held = bottomPinHeld
             bottomPinHeld = false
-            guard held, revealing == false, revealPending == false else { return }
+            guard held, revealBlocksBottomPin == false else { return }
             guard let textView,
                   textView.isTracking == false,
                   textView.isDragging == false,
@@ -1074,7 +1112,7 @@ private struct TranscriptLog: UIViewRepresentable {
         /// next layout. Rotation often ends the keyboard animation before the
         /// landscape column and the reflowed text have both settled.
         private func pinRestingBottomAfterLayout() {
-            guard stickToBottom, revealing == false, revealPending == false else { return }
+            guard stickToBottom, revealBlocksBottomPin == false else { return }
             guard let textView,
                   textView.isTracking == false,
                   textView.isDragging == false,
@@ -1083,8 +1121,7 @@ private struct TranscriptLog: UIViewRepresentable {
             let token = keyboardToken
             DispatchQueue.main.async { [weak self] in
                 guard let coordinator = self, token == coordinator.keyboardToken else { return }
-                guard coordinator.stickToBottom, coordinator.revealing == false,
-                      coordinator.revealPending == false else { return }
+                guard coordinator.stickToBottom, coordinator.revealBlocksBottomPin == false else { return }
                 guard let textView = coordinator.textView,
                       textView.isTracking == false,
                       textView.isDragging == false,
@@ -1109,7 +1146,7 @@ private struct TranscriptLog: UIViewRepresentable {
             defer { inChrome = false }
             textView.chromeInsets = insets
             textView.enforceChromeInsets()
-            guard stickToBottom, revealing == false, revealPending == false else { return }
+            guard stickToBottom, revealBlocksBottomPin == false else { return }
             guard textView.isDragging == false, textView.isDecelerating == false else { return }
             guard Date() >= keyboardAnimationUntil || pinIfStuck else { return }
             scrollToBottom(animated: false)
@@ -1120,7 +1157,7 @@ private struct TranscriptLog: UIViewRepresentable {
         func layoutWhilePinned() {
             guard pinning == false, inChrome == false else { return }
             guard Date() >= keyboardAnimationUntil else { return }
-            guard stickToBottom, revealing == false, revealPending == false else { return }
+            guard stickToBottom, revealBlocksBottomPin == false else { return }
             guard let textView, textView.isDragging == false, textView.isDecelerating == false else { return }
             scrollToBottom(animated: false)
         }
@@ -1128,7 +1165,7 @@ private struct TranscriptLog: UIViewRepresentable {
         /// Layout put the bottom clearance back after clearing it. Pin once.
         func chromeRepaired() {
             guard Date() >= keyboardAnimationUntil else { return }
-            guard stickToBottom, revealing == false, revealPending == false else { return }
+            guard stickToBottom, revealBlocksBottomPin == false else { return }
             guard let textView, textView.isDragging == false, textView.isDecelerating == false else { return }
             scrollToBottom(animated: false)
         }
@@ -1241,18 +1278,103 @@ private struct TranscriptLog: UIViewRepresentable {
                 carry: carry
             ) else { return }
             apply(edit, to: textView)
-            if revealing {
+            if revealing && launchSplashVisible == false {
                 deferredBottom = true
-            } else if revealPending == false, nearBottom {
+            } else if nearBottom, revealBlocksBottomPin == false {
                 stickToBottom = true
                 let follow = self
                 DispatchQueue.main.async {
+                    // A drag in this gap is the reader leaving the bottom.
+                    // The launch follow-up uses the same rule.
+                    guard follow.stickToBottom, follow.revealBlocksBottomPin == false else { return }
+                    guard let textView = follow.textView,
+                          textView.isDragging == false,
+                          textView.isDecelerating == false else { return }
                     follow.scrollToBottom(animated: false)
                 }
             }
         }
 
+        /// The cover is about to stop eating touches. Keep the pin through the
+        /// fade, and do not play a resume ease that ran only under the cover.
+        func prepareForLaunchSplashEnd() {
+            if revealPending || revealing {
+                skipCoveredReveal()
+            }
+            stickToBottom = true
+            bottomPinHeld = true
+            if nearBottom == false {
+                emitNear(true)
+            }
+            extendBottomHold(by: 1.0)
+        }
+
+        /// Latest line, after the text that arrived under the cover is applied.
+        /// A second pin follows the keyboard that the command field takes as
+        /// the cover fades. A drag cancels that follow-up.
+        func pinAfterLaunchSplash() {
+            launchPinToken += 1
+            let token = launchPinToken
+            stickToBottom = true
+            scrollToBottom(animated: false)
+            DispatchQueue.main.async { [weak self] in
+                self?.repeatLaunchPin(token)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                self?.repeatLaunchPin(token)
+            }
+        }
+
+        private func repeatLaunchPin(_ token: Int) {
+            guard token == launchPinToken else { return }
+            guard stickToBottom, revealBlocksBottomPin == false else { return }
+            guard let textView,
+                  textView.isTracking == false,
+                  textView.isDragging == false,
+                  textView.isDecelerating == false else { return }
+            if Date() < keyboardAnimationUntil {
+                let delay = keyboardAnimationUntil.timeIntervalSinceNow + 0.05
+                DispatchQueue.main.asyncAfter(deadline: .now() + max(delay, 0.05)) { [weak self] in
+                    self?.repeatLaunchPin(token)
+                }
+                return
+            }
+            scrollToBottom(animated: false)
+        }
+
+        /// The separator stays in the log. The ease does not: it would finish
+        /// on an offset from before the cover's keyboard inset.
+        private func skipCoveredReveal() {
+            revealToken += 1
+            let wasRevealing = revealing
+            revealing = false
+            deferredBottom = false
+            if wasRevealing, let textView {
+                textView.layer.removeAllAnimations()
+                programmatic += 1
+                textView.setContentOffset(textView.contentOffset, animated: false)
+                programmatic = max(0, programmatic - 1)
+            }
+            let id = resumeSeparatorID ?? startedRevealID
+            guard let id, id.isEmpty == false else {
+                revealPending = false
+                return
+            }
+            coveredRevealID = id
+            startedRevealID = id
+            revealPending = false
+            guard finishedRevealID != id else { return }
+            finishedRevealID = id
+            let callback = onRevealFinished
+            DispatchQueue.main.async {
+                callback(id)
+            }
+        }
+
         func syncReveal() {
+            // The ease would run under the cover and then refuse later pins.
+            // It starts once the cover is gone, unless that gap was already skipped.
+            guard launchSplashVisible == false else { return }
             guard revealPending, let id = resumeSeparatorID, id.isEmpty == false else { return }
             guard startedRevealID != id else { return }
             guard textView?.bounds.width ?? 0 > 1 else { return }
@@ -1329,13 +1451,13 @@ private struct TranscriptLog: UIViewRepresentable {
         }
 
         func stickIfNeeded() {
-            guard stickToBottom, revealing == false, revealPending == false else { return }
+            guard stickToBottom, revealBlocksBottomPin == false else { return }
             guard stickQueued == false else { return }
             guard let textView, textView.isDragging == false, textView.isDecelerating == false else { return }
             stickQueued = true
             DispatchQueue.main.async {
                 self.stickQueued = false
-                guard self.stickToBottom, self.revealing == false, self.revealPending == false else { return }
+                guard self.stickToBottom, self.revealBlocksBottomPin == false else { return }
                 guard let textView = self.textView,
                       textView.isDragging == false, textView.isDecelerating == false else { return }
                 self.scrollToBottom(animated: false)
@@ -1476,6 +1598,7 @@ private struct TranscriptLog: UIViewRepresentable {
         }
 
         func scrollViewWillBeginDragging(_: UIScrollView) {
+            launchPinToken += 1
             bottomPinHeld = false
             holdUntil = .distantPast
             if revealing {
@@ -1494,6 +1617,14 @@ private struct TranscriptLog: UIViewRepresentable {
             // change is the reader moving; a keyboard frame must not flip the flag.
             // Rotation and the dismiss arm `holdUntil` before this runs.
             guard programmatic == 0, moved else { return }
+            // The cover eats touches. Inset and content-size changes still
+            // call this, and they were clearing the pin before the new lines
+            // had a chance to follow the bottom.
+            if launchSplashVisible {
+                extendBottomHold(by: 0.25)
+                emitNear(true)
+                return
+            }
             let near: Bool
             if Date() < holdUntil {
                 near = true
@@ -1895,6 +2026,7 @@ struct TranscriptView: View {
                     columnHeight: columnHeight,
                     revealPending: session.pendingResumeReveal,
                     resumeSeparatorID: session.resumeSeparatorID,
+                    launchSplashVisible: launchSplashVisible,
                     onNearBottom: { near in
                         if nearBottom != near {
                             nearBottom = near
