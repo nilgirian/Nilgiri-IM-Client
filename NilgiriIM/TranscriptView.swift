@@ -2867,13 +2867,13 @@ struct TranscriptView: View {
     private func playDeathFlash() {
         deathTask?.cancel()
         deathShown = true
-        _ = withAnimation(.none) {
+        withAnimation(.none) {
             deathOpacity = 1
         }
         deathTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(2))
             guard Task.isCancelled == false else { return }
-            _ = withAnimation(.easeOut(duration: 0.8)) {
+            withAnimation(.easeOut(duration: 0.8)) {
                 deathOpacity = 0
             }
             try? await Task.sleep(for: .milliseconds(800))
@@ -2901,12 +2901,12 @@ struct TranscriptView: View {
                 let message = awardQueue.messages.removeFirst()
                 awardText = message
                 awardShown = true
-                _ = withAnimation(.none) {
+                withAnimation(.none) {
                     awardOpacity = 1
                 }
                 try? await Task.sleep(for: .seconds(2))
                 if Task.isCancelled || generation != awardQueue.generation { return }
-                _ = withAnimation(.easeOut(duration: 0.8)) {
+                withAnimation(.easeOut(duration: 0.8)) {
                     awardOpacity = 0
                 }
                 try? await Task.sleep(for: .milliseconds(800))
@@ -3544,14 +3544,18 @@ private struct ActionPanel: View {
     private func light(_ command: String) {
         let token = (lightTokens[command] ?? 0) + 1
         lightTokens[command] = token
-        _ = withAnimation(.easeOut(duration: 0.08)) {
-            _ = litCommands.insert(command)
+        withAnimation(.easeOut(duration: 0.08)) {
+            // `insert` returns whether the command was new. The closure must
+            // stay Void so `withAnimation` does not return that tuple.
+            litCommands.insert(command)
+            return
         }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             guard lightTokens[command] == token else { return }
-            _ = withAnimation(.easeOut(duration: 0.15)) {
-                _ = litCommands.remove(command)
+            withAnimation(.easeOut(duration: 0.15)) {
+                litCommands.remove(command)
+                return
             }
         }
     }
