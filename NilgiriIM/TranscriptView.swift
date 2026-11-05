@@ -1454,11 +1454,196 @@ private struct ColumnHeightKey: PreferenceKey {
     }
 }
 
+/// Command line. A stock SwiftUI field resigns on Return and again when focus
+/// is written `true` while it is already first responder, so the keyboard
+/// drops and comes back. This field becomes first responder only on the
+/// transition into focus. Return resigns only when this orientation hides
+/// the keyboard. A selection in the log, a swipe-down, and a hide-on send
+/// still end editing.
+///
+/// Traits are set once. `textInputMode` is not overridden, and
+/// `becomeFirstResponder` is not called from `updateUIView`: doing either
+/// restarts the input session, the caret blinks, and the keyboard never attaches.
+private struct CommandLineField: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+    /// Hide switch for the orientation on screen. Return dismisses only then.
+    var dismissOnSubmit: Bool
+    var onSubmit: () -> Void
+
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        field.delegate = context.coordinator
+        field.font = UIFont.monospacedSystemFont(
+            ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize,
+            weight: .regular
+        )
+        field.textColor = UIColor(white: 0.78, alpha: 1)
+        field.tintColor = field.textColor
+        field.backgroundColor = .clear
+        field.borderStyle = .none
+        field.keyboardType = .asciiCapable
+        field.returnKeyType = .send
+        field.autocorrectionType = .no
+        field.spellCheckingType = .no
+        field.autocapitalizationType = .none
+        field.keyboardAppearance = .dark
+        field.attributedPlaceholder = NSAttributedString(
+            string: "command",
+            attributes: [.foregroundColor: UIColor(white: 0.78, alpha: 0.45)]
+        )
+        field.accessibilityLabel = "command"
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        field.setContentHuggingPriority(.defaultLow, for: .vertical)
+        field.setContentCompressionResistancePriority(.defaultHigh, for: .vertical)
+        field.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.editingChanged(_:)),
+            for: .editingChanged
+        )
+        return field
+    }
+
+    /// One line, the same height as Say and Send. A proposed height is often
+    /// the whole column; using it made the command bar as tall as the screen.
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: UITextField,
+        context _: Context
+    ) -> CGSize? {
+        let width: CGFloat
+        if let proposed = proposal.width, proposed > 0, proposed < .greatestFiniteMagnitude {
+            width = proposed
+        } else {
+            width = uiView.bounds.width
+        }
+        return CGSize(width: width, height: 44)
+    }
+
+    func updateUIView(_ field: UITextField, context: Context) {
+        let coordinator = context.coordinator
+        coordinator.onSubmit = onSubmit
+        coordinator.dismissOnSubmit = dismissOnSubmit
+        coordinator.isFocused = $isFocused
+        coordinator.textChanged = { text = $0 }
+        // A programmatic clear (send) must not restart the input session.
+        // Marked text is an in-progress composition; replacing it drops characters.
+        if field.markedTextRange == nil, field.text != text {
+            coordinator.applyingText = true
+            field.text = text
+            coordinator.applyingText = false
+        }
+        if coordinator.wantsFocus != isFocused {
+            coordinator.wantsFocus = isFocused
+            if isFocused {
+                coordinator.scheduleBecome(field)
+            } else {
+                coordinator.scheduleResign(field)
+            }
+        } else if isFocused, coordinator.wantsFocus, field.isFirstResponder == false {
+            // The focus flag was set before the field was in a window.
+            // A field that already resigned has wantsFocus clear, so this
+            // does not put the keyboard back over a log selection.
+            coordinator.scheduleBecome(field)
+        }
+    }
+
+    static func dismantleUIView(_ uiView: UITextField, coordinator: Coordinator) {
+        coordinator.wantsFocus = false
+        if uiView.isFirstResponder {
+            uiView.resignFirstResponder()
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var onSubmit: () -> Void = {}
+        var textChanged: (String) -> Void = { _ in }
+        var isFocused: Binding<Bool> = .constant(false)
+        var dismissOnSubmit = false
+        var wantsFocus = false
+        var applyingText = false
+        var becoming = false
+
+        @objc func editingChanged(_ field: UITextField) {
+            guard applyingText == false else { return }
+            textChanged(field.text ?? "")
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            wantsFocus = true
+            if isFocused.wrappedValue == false {
+                isFocused.wrappedValue = true
+            }
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            wantsFocus = false
+            if isFocused.wrappedValue {
+                isFocused.wrappedValue = false
+            }
+        }
+
+        /// Return sends. Hide-off leaves the field first responder so the
+        /// keyboard does not animate out. Hide-on resigns on the keypress.
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            let dismiss = dismissOnSubmit
+            onSubmit()
+            if dismiss, textField.isFirstResponder {
+                textField.resignFirstResponder()
+            }
+            return false
+        }
+
+        func scheduleBecome(_ field: UITextField, retries: Int = 10) {
+            guard becoming == false else { return }
+            becoming = true
+            DispatchQueue.main.async { [weak field] in
+                guard let field else {
+                    self.becoming = false
+                    return
+                }
+                guard self.wantsFocus else {
+                    self.becoming = false
+                    return
+                }
+                guard field.window != nil else {
+                    self.becoming = false
+                    guard retries > 0 else { return }
+                    self.scheduleBecome(field, retries: retries - 1)
+                    return
+                }
+                // Stay marked until become returns. A layout pass inside
+                // become must not schedule a second one; that restarts the
+                // input session and the keyboard never attaches.
+                if field.isFirstResponder == false {
+                    field.becomeFirstResponder()
+                }
+                self.becoming = false
+            }
+        }
+
+        func scheduleResign(_ field: UITextField) {
+            DispatchQueue.main.async { [weak field] in
+                guard let field else { return }
+                guard self.wantsFocus == false else { return }
+                if field.isFirstResponder {
+                    field.resignFirstResponder()
+                }
+            }
+        }
+    }
+}
+
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.launchSplashVisible) private var launchSplashVisible
-    @FocusState private var commandFocused: Bool
+    /// Owned here, not by SwiftUI's focus engine. Nothing uses `.focused` on
+    /// this flag; the command field reads it and resigns only when it drops.
+    @State private var commandFocused = false
     @StateObject private var keyboardPrefs = KeyboardHidePreferences()
     /// The command field should be first responder. Set when this orientation
     /// keeps the keyboard, cleared when the player swipes it away or a switch hides it.
@@ -1706,8 +1891,11 @@ struct TranscriptView: View {
     }
 
     private func sendCommand() async {
-        await session.send()
+        // Hide-on drops the keyboard on the keypress, not after the round trip.
+        // Hide-off leaves an already-focused field alone so it does not resign
+        // and become again.
         hideCommandKeyboardIfPreferred()
+        await session.send()
     }
 
     /// Posts `say` plus the field. Text that already starts with `say` is sent
@@ -1719,6 +1907,9 @@ struct TranscriptView: View {
         guard trimmed.isEmpty == false else { return }
         if alreadySay(trimmed) == false {
             session.command = "say " + trimmed
+        }
+        if keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false {
+            keepCommandKeyboard()
         }
         let statusBefore = session.status
         await session.send()
@@ -1732,12 +1923,33 @@ struct TranscriptView: View {
 
     /// Send and Say drop the keyboard only when this orientation's switch is on.
     /// iPhone defaults to landscape on, portrait off. iPad defaults to both off.
+    /// Off does not request focus again: the field is already first responder,
+    /// and writing that again resigns and becomes, which flickers the keyboard.
     private func hideCommandKeyboardIfPreferred() {
         guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) else {
-            showCommandKeyboardIfPreferred()
+            keepCommandKeyboard()
             return
         }
         releaseCommandKeyboard()
+    }
+
+    /// Hide is off and the player has not swiped the keyboard away.
+    /// An already-focused field is left focused. A field that has actually
+    /// resigned is made first responder once, in this turn, with no second
+    /// write after a delay.
+    private func keepCommandKeyboard() {
+        guard commandKeyboardPaused == false else { return }
+        guard session.atMenu == false else { return }
+        guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
+        guard UIApplication.shared.applicationState == .active else { return }
+        guard keyboardHeld else { return }
+        guard commandFocused == false else { return }
+        guard restoringKeyboard == false else { return }
+        restoringKeyboard = true
+        commandFocused = true
+        Task { @MainActor in
+            restoringKeyboard = false
+        }
     }
 
     /// The player swiped the keyboard away, left the command field for the menu,
@@ -1808,10 +2020,18 @@ struct TranscriptView: View {
         guard commandKeyboardPaused == false else { return }
         guard session.atMenu == false else { return }
         guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
-        keyboardOrientationToken += 1
-        let token = keyboardOrientationToken
         keyboardHeld = true
-        commandFocused = true
+        // Already up. Requesting focus again restarts the keyboard. Rotation
+        // can still clear it after this returns, so the later check runs only
+        // if the field actually resigned.
+        let token: Int
+        if commandFocused {
+            token = keyboardOrientationToken
+        } else {
+            keyboardOrientationToken += 1
+            token = keyboardOrientationToken
+            commandFocused = true
+        }
         Task { @MainActor in
             await Task.yield()
             reassertCommandKeyboard(token: token)
@@ -1825,6 +2045,7 @@ struct TranscriptView: View {
         guard commandKeyboardPaused == false else { return }
         guard keyboardHeld, session.atMenu == false else { return }
         guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
+        guard commandFocused == false else { return }
         commandFocused = true
     }
 
@@ -1884,21 +2105,17 @@ struct TranscriptView: View {
                     .font(.system(.body, design: .monospaced))
                     .foregroundStyle(ink)
                     .padding(.trailing, 8)
-                // Stock field. The UIKit subclass overrode textInputMode and
-                // called becomeFirstResponder from updateUIView; the caret
-                // blinked, but the keyboard session never attached. One line
-                // tall, same as the Say/Send targets, so the bar does not
-                // take the height proposed to this safe-area inset.
-                TextField("command", text: $session.command)
-                    .font(.system(.body, design: .monospaced))
-                    .foregroundStyle(ink)
-                    .textFieldStyle(.plain)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.asciiCapable)
-                    .submitLabel(.send)
-                    .focused($commandFocused)
-                    .onSubmit { Task { await sendCommand() } }
+                // One line tall, same as the Say/Send targets, so the bar does not
+                // take the height proposed to this safe-area inset. Focus is not
+                // written again while the field is already first responder.
+                CommandLineField(
+                    text: $session.command,
+                    isFocused: $commandFocused,
+                    dismissOnSubmit: keyboardPrefs.hidesKeyboard(
+                        isPortrait: KeyboardHidePreferences.interfaceIsPortrait()
+                    ),
+                    onSubmit: { Task { await sendCommand() } }
+                )
                     .onAppear {
                         showCommandKeyboardIfPreferred()
                     }
@@ -1909,22 +2126,13 @@ struct TranscriptView: View {
                             }
                             return
                         }
+                        // Becoming first responder holds the keyboard. Losing it
+                        // (a log selection, or a swipe that already cleared the
+                        // hold) stays dismissed. Send calls `keepCommandKeyboard`
+                        // only when this orientation is keeping the keyboard.
                         if focused {
                             keyboardHeld = true
                             restoringKeyboard = false
-                            return
-                        }
-                        // A layout pass dropped the field. Put it back while this
-                        // orientation is set to keep the keyboard.
-                        guard keyboardHeld, restoringKeyboard == false, session.atMenu == false else { return }
-                        guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
-                        restoringKeyboard = true
-                        let token = keyboardOrientationToken
-                        Task { @MainActor in
-                            try? await Task.sleep(for: .milliseconds(50))
-                            defer { restoringKeyboard = false }
-                            guard token == keyboardOrientationToken else { return }
-                            reassertCommandKeyboard(token: token)
                         }
                     }
                     .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
