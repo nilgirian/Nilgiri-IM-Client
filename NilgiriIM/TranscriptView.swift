@@ -424,11 +424,15 @@ private final class TranscriptDocumentStore {
         } else {
             let size = displayFontSize(line, base: fontSize)
             lastMudFontSize = size
+            // The larger face is the only one that wraps short of 80. A word
+            // under 11 letters moves whole, and later lines indent two spaces.
+            let wrap: Ansi.Wrap = size > fontSize + 0.01 ? .communication : .columns
             let piece = NSMutableAttributedString(attributedString: Ansi.attributed(
                 line.text,
                 fontSize: size,
                 columns: columns(forDisplaySize: size, base: fontSize),
-                initial: carry.startState(for: line.id)
+                initial: carry.startState(for: line.id),
+                wrap: wrap
             ))
             if piece.length > 0 {
                 piece.addAttribute(

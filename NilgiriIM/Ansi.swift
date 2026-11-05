@@ -23,6 +23,16 @@ enum Ansi {
         )
     }
 
+    /// Column breaks inserted for display. The MUD string is not rewritten.
+    enum Wrap: Equatable {
+        /// Break at the column, including inside a word.
+        case columns
+        /// Enlarged say, gossip, and the other communication lines. A word of
+        /// fewer than 11 letters that would cross the column moves onto the
+        /// next line whole, and every line after the first is indented two spaces.
+        case communication
+    }
+
     /// `initial` defaults to a reset terminal, so `text(_:fontSize:columns:)` is unchanged.
     static func text(_ raw: String, fontSize: CGFloat, columns: Int, initial: State = .initial) -> Text {
         swiftText(runs(raw, columns: columns, initial: initial), fontSize: fontSize)
@@ -34,9 +44,10 @@ enum Ansi {
         _ raw: String,
         fontSize: CGFloat,
         columns: Int,
-        initial: State = .initial
+        initial: State = .initial,
+        wrap: Wrap = .columns
     ) -> NSAttributedString {
-        let pieces = runs(raw, columns: columns, initial: initial)
+        let pieces = runs(raw, columns: columns, initial: initial, wrap: wrap)
         let result = NSMutableAttributedString()
         for piece in pieces {
             var attributes: [NSAttributedString.Key: Any] = [
@@ -85,8 +96,8 @@ enum Ansi {
 
     /// Display runs for one raw line. Characters match `layout`: ANSI is not shown,
     /// and a column-cap newline is in the run but not in the link.
-    private static func runs(_ raw: String, columns: Int, initial: State) -> [Run] {
-        let laid = layout(raw, columns: columns)
+    private static func runs(_ raw: String, columns: Int, initial: State, wrap: Wrap = .columns) -> [Run] {
+        let laid = layout(raw, columns: columns, wrap: wrap)
         let spans = linkSpans(in: raw)
         let wrapped = laid.text
         var produced: [Run] = []
@@ -144,14 +155,13 @@ enum Ansi {
                 continue
             }
             let character = wrapped[index]
-            if character == "\n" {
-                let inserted = laid.wrapBreaks.contains(offset)
-                // A column-cap break is not a character of the unwrapped line,
-                // and it stays out of the URL.
+            if laid.wrapBreaks.contains(offset) {
+                // A column-cap break, or the two-space continuation indent, is
+                // not a character of the unwrapped line, and it stays out of the URL.
+                appendPiece(character, link: nil)
+            } else if character == "\n" {
                 appendPiece("\n", link: nil)
-                if inserted == false {
-                    visibleIndex += 1
-                }
+                visibleIndex += 1
             } else {
                 let link = linkURL(at: visibleIndex, spans: spans, cursor: &spanCursor)
                 appendPiece(character, link: link)
@@ -266,6 +276,23 @@ enum Ansi {
         case notCSI
         /// `sgr` is set when the sequence ends in `m` (including empty ESC[m).
         case sequence(sgr: String?)
+    }
+
+    /// The index just after a CSI starting at `index`, matching the bytes
+    /// `layout` copies without giving them a column. Nil when `index` is not a CSI.
+    private static func indexAfterCSI(_ raw: String, from index: String.Index) -> String.Index? {
+        guard raw[index] == "\u{001B}" else { return nil }
+        let bracket = raw.index(after: index)
+        guard bracket < raw.endIndex, raw[bracket] == "[" else { return nil }
+        var cursor = raw.index(after: bracket)
+        while cursor < raw.endIndex {
+            let character = raw[cursor]
+            cursor = raw.index(after: cursor)
+            if (character >= "A" && character <= "Z") || (character >= "a" && character <= "z") {
+                break
+            }
+        }
+        return cursor
     }
 
     /// Consumes a CSI at `index`, or reports that `index` is not one.
@@ -385,10 +412,24 @@ enum Ansi {
         layout(raw, columns: columns).text
     }
 
-    /// Same wrap as before. `wrapBreaks` are character offsets of newlines this
-    /// inserts at the column cap. Newlines that were already in `raw` are not listed,
-    /// so a URL can be found on the unwrapped line and those breaks stay out of it.
-    private static func layout(_ raw: String, columns: Int) -> (text: String, wrapBreaks: Set<Int>) {
+    /// `wrapBreaks` are offsets of characters this inserts. Newlines that were
+    /// already in `raw` are not listed, so a URL can be found on the unwrapped
+    /// line and those breaks stay out of it.
+    private static func layout(
+        _ raw: String,
+        columns: Int,
+        wrap: Wrap = .columns
+    ) -> (text: String, wrapBreaks: Set<Int>) {
+        switch wrap {
+        case .columns:
+            return layoutColumns(raw, columns: columns)
+        case .communication:
+            return layoutCommunication(raw, columns: columns)
+        }
+    }
+
+    /// Break at the column, including inside a word.
+    private static func layoutColumns(_ raw: String, columns: Int) -> (text: String, wrapBreaks: Set<Int>) {
         var out = ""
         var wrapBreaks = Set<Int>()
         var outCount = 0
@@ -432,6 +473,155 @@ enum Ansi {
             }
             push(raw[index])
             col += 1
+            index = raw.index(after: index)
+        }
+        return (out, wrapBreaks)
+    }
+
+    /// Enlarged communication. A word is the visible columns up to the next
+    /// space, tab, or newline; ANSI is copied and takes no column. Fewer than
+    /// 11 letters means that run is shorter than 11 columns. Such a word is
+    /// moved whole when it would cross the column and still fits on a
+    /// continuation line (the line is two spaces shorter). A longer word
+    /// still breaks at the column, so a long token does not leave a hole.
+    /// Lines after the first start with two spaces. Inserted newlines and
+    /// those spaces are the only characters added; every MUD character is kept.
+    private static func layoutCommunication(
+        _ raw: String,
+        columns: Int
+    ) -> (text: String, wrapBreaks: Set<Int>) {
+        let width = max(columns, 1)
+        let indent = min(2, width - 1)
+        let shortWord = 11
+        var out = ""
+        var wrapBreaks = Set<Int>()
+        var outCount = 0
+        var col = 0
+        var indentPending = false
+        var lineHasContent = false
+        var atWordBoundary = true
+        var index = raw.startIndex
+
+        func push(_ character: Character, synthetic: Bool = false) {
+            if synthetic {
+                wrapBreaks.insert(outCount)
+            }
+            out.append(character)
+            outCount += 1
+        }
+
+        func breakForWrap() {
+            push("\n", synthetic: true)
+            col = 0
+            indentPending = indent > 0
+            lineHasContent = false
+        }
+
+        func flushIndent() {
+            guard indentPending else { return }
+            indentPending = false
+            var remaining = indent
+            while remaining > 0 {
+                push(" ", synthetic: true)
+                remaining -= 1
+                col += 1
+            }
+        }
+
+        /// The next visible character, skipping CSI. Nil at the end of the line.
+        func nextVisible(from start: String.Index) -> Character? {
+            var cursor = start
+            while cursor < raw.endIndex {
+                if let next = indexAfterCSI(raw, from: cursor) {
+                    cursor = next
+                    continue
+                }
+                return raw[cursor]
+            }
+            return nil
+        }
+
+        func visibleWordLength(from start: String.Index) -> Int {
+            var cursor = start
+            var count = 0
+            while cursor < raw.endIndex {
+                if let next = indexAfterCSI(raw, from: cursor) {
+                    cursor = next
+                    continue
+                }
+                let character = raw[cursor]
+                if character == "\n" || character == " " || character == "\t" {
+                    break
+                }
+                count += 1
+                cursor = raw.index(after: cursor)
+            }
+            return count
+        }
+
+        while index < raw.endIndex {
+            if raw[index] == "\n" {
+                push("\n")
+                col = 0
+                indentPending = indent > 0
+                lineHasContent = false
+                atWordBoundary = true
+                index = raw.index(after: index)
+                continue
+            }
+            if let next = indexAfterCSI(raw, from: index) {
+                while index < next {
+                    push(raw[index])
+                    index = raw.index(after: index)
+                }
+                continue
+            }
+
+            let character = raw[index]
+            let whitespace = character == " " || character == "\t"
+            if whitespace == false, atWordBoundary, lineHasContent {
+                let length = visibleWordLength(from: index)
+                let remaining = width - col
+                if length > 0, length < shortWord, length > remaining, length <= width - indent {
+                    breakForWrap()
+                }
+            }
+
+            // A separator that falls on the column stays at the end of this
+            // line. Putting it after the indent would show as a third space.
+            // It is only moved aside when more visible text follows; a trailing
+            // run does not grow an extra blank line.
+            if col == width, whitespace {
+                var cursor = index
+                while cursor < raw.endIndex, raw[cursor] == " " || raw[cursor] == "\t" {
+                    cursor = raw.index(after: cursor)
+                }
+                let more: Bool
+                if let next = nextVisible(from: cursor) {
+                    more = next != "\n"
+                } else {
+                    more = false
+                }
+                while index < cursor {
+                    push(raw[index])
+                    index = raw.index(after: index)
+                }
+                atWordBoundary = true
+                lineHasContent = true
+                if more {
+                    breakForWrap()
+                }
+                continue
+            }
+
+            if col == width {
+                breakForWrap()
+            }
+            flushIndent()
+            push(character)
+            col += 1
+            lineHasContent = true
+            atWordBoundary = whitespace
             index = raw.index(after: index)
         }
         return (out, wrapBreaks)
