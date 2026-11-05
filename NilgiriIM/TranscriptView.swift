@@ -1459,11 +1459,12 @@ struct TranscriptView: View {
     @Environment(\.scenePhase) private var scenePhase
     @FocusState private var commandFocused: Bool
     @StateObject private var keyboardPrefs = KeyboardHidePreferences()
-    /// The command field is up, and the player has not dismissed it.
-    /// A rotation that hides the keyboard leaves this set so the keyboard
-    /// comes back in an orientation that keeps it.
+    /// The command field should be first responder. Set when this orientation
+    /// keeps the keyboard, cleared when the player swipes it away or a switch hides it.
     @State private var keyboardHeld = false
     @State private var keyboardOrientationToken = 0
+    /// One restore is in flight. Stops a focus drop from scheduling another.
+    @State private var restoringKeyboard = false
     /// Bumped by the accessibility action. Each change opens the left card.
     @State private var settingsOpenRequest = false
     /// True when the latest text is within `nearBottomSlack` of the viewport.
@@ -1616,11 +1617,12 @@ struct TranscriptView: View {
                 }
             }
             .onChange(of: scenePhase) { _, phase in
-                Task {
+                Task { @MainActor in
                     if phase == .background {
                         await session.sceneWentBackground()
                     } else if phase == .active {
                         await session.sceneBecameActive()
+                        showCommandKeyboardIfPreferred()
                     }
                 }
             }
@@ -1628,6 +1630,8 @@ struct TranscriptView: View {
                 if atMenu {
                     releaseCommandKeyboard()
                     actionPanelShown = false
+                } else {
+                    showCommandKeyboardIfPreferred()
                 }
             }
             .task {
@@ -1711,49 +1715,63 @@ struct TranscriptView: View {
     /// Send and Say drop the keyboard only when this orientation's switch is on.
     /// iPhone defaults to landscape on, portrait off. iPad defaults to both off.
     private func hideCommandKeyboardIfPreferred() {
-        guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) else { return }
+        guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) else {
+            showCommandKeyboardIfPreferred()
+            return
+        }
         releaseCommandKeyboard()
     }
 
     /// The player swiped the keyboard away, or left the command field for the menu.
     private func releaseCommandKeyboard() {
         keyboardOrientationToken += 1
+        restoringKeyboard = false
         keyboardHeld = false
         commandFocused = false
     }
 
-    /// The current orientation's switch just moved. Hide now when it asks to.
-    /// Turning it off brings the keyboard back only if the player still had it.
+    /// The current orientation's switch just moved. Off makes the command
+    /// field first responder. On dismisses the keyboard.
     private func applyKeyboardPreference() {
-        keyboardOrientationToken += 1
         if keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) {
-            commandFocused = false
-        } else if keyboardHeld {
-            commandFocused = true
+            releaseCommandKeyboard()
+        } else {
+            showCommandKeyboardIfPreferred()
         }
     }
 
-    /// The window's portrait bit flipped. Hide when that orientation asks for it.
-    /// SwiftUI can drop first responder during the rotation, so a keep
-    /// preference puts the field back once the animation has settled.
+    /// The window's portrait bit flipped. The switch for the new orientation
+    /// either dismisses the keyboard or makes the command field first responder.
     private func orientationChanged(toPortrait portrait: Bool) {
         guard portrait == KeyboardHidePreferences.interfaceIsPortrait() else { return }
-        keyboardOrientationToken += 1
-        let token = keyboardOrientationToken
         if keyboardPrefs.hidesKeyboard(isPortrait: portrait) {
-            commandFocused = false
-            return
-        }
-        restoreHeldKeyboard()
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(400))
-            guard token == keyboardOrientationToken else { return }
-            restoreHeldKeyboard()
+            releaseCommandKeyboard()
+        } else {
+            showCommandKeyboardIfPreferred()
         }
     }
 
-    private func restoreHeldKeyboard() {
-        guard keyboardHeld else { return }
+    /// The switch for whichever orientation is on screen: portrait or landscape.
+    /// Off makes the command field first responder and keeps it there.
+    /// A swipe-away clears `keyboardHeld`, and that sticks until the next show.
+    private func showCommandKeyboardIfPreferred() {
+        guard session.atMenu == false else { return }
+        guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
+        keyboardOrientationToken += 1
+        let token = keyboardOrientationToken
+        keyboardHeld = true
+        commandFocused = true
+        Task { @MainActor in
+            await Task.yield()
+            reassertCommandKeyboard(token: token)
+            try? await Task.sleep(for: .milliseconds(350))
+            reassertCommandKeyboard(token: token)
+        }
+    }
+
+    private func reassertCommandKeyboard(token: Int) {
+        guard token == keyboardOrientationToken else { return }
+        guard keyboardHeld, session.atMenu == false else { return }
         guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
         commandFocused = true
     }
@@ -1829,9 +1847,26 @@ struct TranscriptView: View {
                     .submitLabel(.send)
                     .focused($commandFocused)
                     .onSubmit { Task { await sendCommand() } }
+                    .onAppear {
+                        showCommandKeyboardIfPreferred()
+                    }
                     .onChange(of: commandFocused) { _, focused in
                         if focused {
                             keyboardHeld = true
+                            restoringKeyboard = false
+                            return
+                        }
+                        // A layout pass dropped the field. Put it back while this
+                        // orientation is set to keep the keyboard.
+                        guard keyboardHeld, restoringKeyboard == false, session.atMenu == false else { return }
+                        guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
+                        restoringKeyboard = true
+                        let token = keyboardOrientationToken
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(50))
+                            defer { restoringKeyboard = false }
+                            guard token == keyboardOrientationToken else { return }
+                            reassertCommandKeyboard(token: token)
                         }
                     }
                     .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
