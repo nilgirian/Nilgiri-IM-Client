@@ -1457,6 +1457,7 @@ private struct ColumnHeightKey: PreferenceKey {
 struct TranscriptView: View {
     @EnvironmentObject private var session: IMSession
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.launchSplashVisible) private var launchSplashVisible
     @FocusState private var commandFocused: Bool
     @StateObject private var keyboardPrefs = KeyboardHidePreferences()
     /// The command field should be first responder. Set when this orientation
@@ -1467,6 +1468,11 @@ struct TranscriptView: View {
     @State private var restoringKeyboard = false
     /// Bumped by the accessibility action. Each change opens the left card.
     @State private var settingsOpenRequest = false
+    /// The left card has settled open. The command keyboard stays down until it closes.
+    @State private var keyboardSettingsOpen = false
+    /// Launch cover. Starts up so the first frame cannot focus the command
+    /// field; `adoptLaunchSplash` copies the parent flag in on appear.
+    @State private var launchSplashUp = true
     /// True when the latest text is within `nearBottomSlack` of the viewport.
     /// Written only when that flips.
     @State private var nearBottom = true
@@ -1589,7 +1595,13 @@ struct TranscriptView: View {
             .preferredColorScheme(.dark)
             .toolbar(.hidden, for: .navigationBar)
             .overlay {
-                KeyboardSettingsDrawer(preferences: keyboardPrefs, openRequest: $settingsOpenRequest)
+                KeyboardSettingsDrawer(
+                    preferences: keyboardPrefs,
+                    openRequest: $settingsOpenRequest,
+                    onOpenChange: { open in
+                        keyboardSettingsCardChanged(open: open)
+                    }
+                )
             }
             .background {
                 WindowPortraitProbe { portrait in
@@ -1606,6 +1618,12 @@ struct TranscriptView: View {
             .onChange(of: keyboardPrefs.hideInLandscape) { _, _ in
                 guard KeyboardHidePreferences.interfaceIsPortrait() == false else { return }
                 applyKeyboardPreference()
+            }
+            .onAppear {
+                adoptLaunchSplash(launchSplashVisible)
+            }
+            .onChange(of: launchSplashVisible) { _, visible in
+                adoptLaunchSplash(visible)
             }
             .onChange(of: linesScrollSignal) { _, _ in
                 guard session.pendingResumeReveal == false, nearBottom == false else { return }
@@ -1722,7 +1740,8 @@ struct TranscriptView: View {
         releaseCommandKeyboard()
     }
 
-    /// The player swiped the keyboard away, or left the command field for the menu.
+    /// The player swiped the keyboard away, left the command field for the menu,
+    /// or opened the settings card.
     private func releaseCommandKeyboard() {
         keyboardOrientationToken += 1
         restoringKeyboard = false
@@ -1751,10 +1770,42 @@ struct TranscriptView: View {
         }
     }
 
+    /// Launch cover is up, or the left settings card is open. The command
+    /// field must not take first responder until both are clear.
+    private var commandKeyboardPaused: Bool {
+        launchSplashUp || keyboardSettingsOpen
+    }
+
+    /// Copies the launch cover into `launchSplashUp`. While it is up the
+    /// command field resigns; when it drops, the orientation's hide switch
+    /// decides whether the field becomes first responder.
+    private func adoptLaunchSplash(_ visible: Bool) {
+        launchSplashUp = visible
+        if visible {
+            commandFocused = false
+        } else {
+            showCommandKeyboardIfPreferred()
+        }
+    }
+
+    /// The left card settled open or closed. Open dismisses the keyboard.
+    /// Closed makes the command field first responder only when this
+    /// orientation's hide switch is off.
+    private func keyboardSettingsCardChanged(open: Bool) {
+        keyboardSettingsOpen = open
+        if open {
+            releaseCommandKeyboard()
+        } else {
+            showCommandKeyboardIfPreferred()
+        }
+    }
+
     /// The switch for whichever orientation is on screen: portrait or landscape.
     /// Off makes the command field first responder and keeps it there.
     /// A swipe-away clears `keyboardHeld`, and that sticks until the next show.
+    /// The launch splash and an open settings card are not a show.
     private func showCommandKeyboardIfPreferred() {
+        guard commandKeyboardPaused == false else { return }
         guard session.atMenu == false else { return }
         guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
         keyboardOrientationToken += 1
@@ -1771,6 +1822,7 @@ struct TranscriptView: View {
 
     private func reassertCommandKeyboard(token: Int) {
         guard token == keyboardOrientationToken else { return }
+        guard commandKeyboardPaused == false else { return }
         guard keyboardHeld, session.atMenu == false else { return }
         guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
         commandFocused = true
@@ -1851,6 +1903,12 @@ struct TranscriptView: View {
                         showCommandKeyboardIfPreferred()
                     }
                     .onChange(of: commandFocused) { _, focused in
+                        if commandKeyboardPaused {
+                            if focused {
+                                commandFocused = false
+                            }
+                            return
+                        }
                         if focused {
                             keyboardHeld = true
                             restoringKeyboard = false

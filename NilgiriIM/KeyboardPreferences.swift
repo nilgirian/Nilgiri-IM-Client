@@ -102,6 +102,9 @@ struct KeyboardSettingsDrawer: View {
     @ObservedObject var preferences: KeyboardHidePreferences
     /// Toggled by the accessibility action. Each change opens the card.
     @Binding var openRequest: Bool
+    /// The card settled open or closed. Not called during the drag, so a swipe
+    /// that slides back shut does not dismiss the keyboard and bring it back.
+    var onOpenChange: (Bool) -> Void
 
     /// Dark grey, see-through, so the log shows behind the card.
     private static let menuGrey = Color(white: 0.22).opacity(0.55)
@@ -109,6 +112,8 @@ struct KeyboardSettingsDrawer: View {
     @State private var travel: CGFloat = 0
     @State private var dragOrigin: CGFloat?
     @State private var ignoreDrag = false
+    /// Last settled open bit already reported through `onOpenChange`.
+    @State private var cardOpen = false
 
     var body: some View {
         GeometryReader { geo in
@@ -130,9 +135,7 @@ struct KeyboardSettingsDrawer: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .contentShape(Rectangle())
                             .onTapGesture {
-                                withAnimation(.easeOut(duration: 0.22)) {
-                                    travel = 0
-                                }
+                                settleCard(open: false, width: width)
                             }
                             .simultaneousGesture(pan(width: width, edge: edge, fromEdgeOnly: false))
                     }
@@ -162,9 +165,7 @@ struct KeyboardSettingsDrawer: View {
             }
             .coordinateSpace(name: Self.space)
             .onChange(of: openRequest) { _, _ in
-                withAnimation(.easeOut(duration: 0.22)) {
-                    travel = width
-                }
+                settleCard(open: true, width: width)
             }
         }
         .ignoresSafeArea()
@@ -248,9 +249,18 @@ struct KeyboardSettingsDrawer: View {
                 ignoreDrag = false
                 guard let origin else { return }
                 let predicted = origin + value.predictedEndTranslation.width
-                withAnimation(.easeOut(duration: 0.22)) {
-                    travel = predicted > width * 0.45 ? width : 0
-                }
+                settleCard(open: predicted > width * 0.45, width: width)
             }
+    }
+
+    /// Snaps the card fully open or fully away, and reports that edge once.
+    /// Mid-drag `travel` is not an open: the finger can still slide it shut.
+    private func settleCard(open: Bool, width: CGFloat) {
+        withAnimation(.easeOut(duration: 0.22)) {
+            travel = open ? width : 0
+        }
+        guard open != cardOpen else { return }
+        cardOpen = open
+        onOpenChange(open)
     }
 }
