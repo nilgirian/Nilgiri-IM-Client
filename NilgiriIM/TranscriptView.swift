@@ -2298,18 +2298,56 @@ struct TranscriptView: View {
 
     /// Same frost as the input bar (`Chrome.barBackground`), extended
     /// into the top safe area the way the input bar extends into the bottom.
+    /// The opponent row is part of this chrome, so the log's top inset grows
+    /// with it and the lines still scroll underneath.
     private var topBar: some View {
-        sessionHeader
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity)
-            .background(Chrome.barBackground, ignoresSafeAreaEdges: .top)
-            .anchorPreference(key: TopBarBoundsKey.self, value: .bounds) { $0 }
-            .background {
-                GeometryReader { proxy in
-                    Color.clear.preference(key: TopBarHeightKey.self, value: proxy.size.height)
-                }
+        VStack(spacing: 0) {
+            sessionHeader
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity)
+            if session.atMenu == false, let opponent = session.opponent {
+                opponentBar(opponent)
             }
+        }
+        .frame(maxWidth: .infinity)
+        .background(Chrome.barBackground, ignoresSafeAreaEdges: .top)
+        .anchorPreference(key: TopBarBoundsKey.self, value: .bounds) { $0 }
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: TopBarHeightKey.self, value: proxy.size.height)
+            }
+        }
+    }
+
+    /// The fight line, under the player prompt. The scrollback keeps the original.
+    private func opponentBar(_ opponent: OpponentStatus.Snapshot) -> some View {
+        VStack(spacing: 2) {
+            Text("[\(opponent.phrase)]")
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .minimumScaleFactor(0.7)
+            Text("(\(opponent.vitalsLabel))")
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .foregroundStyle(.yellow)
+                .multilineTextAlignment(.center)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .frame(maxWidth: .infinity)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.white.opacity(0.16))
+                .frame(height: 1)
+                .padding(.horizontal, 12)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Opponent \(opponent.phrase), \(opponent.vitalsLabel)")
     }
 
     private func sendCommand() async {

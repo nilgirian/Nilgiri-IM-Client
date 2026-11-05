@@ -331,6 +331,15 @@ enum HMVPrompt {
             ) != nil
         }
 
+        /// `fighting` in the prompt's extra words. A downed flag is not a fight.
+        var isFighting: Bool {
+            guard let condition else { return false }
+            return condition.range(
+                of: #"\bfighting\b"#,
+                options: [.regularExpression, .caseInsensitive]
+            ) != nil
+        }
+
         static func parse(_ raw: String) -> Vitals? {
             let parts = raw.split(separator: ",", omittingEmptySubsequences: false)
             guard parts.count >= 3,
@@ -397,6 +406,27 @@ enum HMVPrompt {
         // Prompt plus its separator, or only a color code. A newline is a blank line.
         if remainder.contains(where: \.isNewline) { return (text, vitals) }
         return ("", vitals)
+    }
+
+    /// End of the last prompt in the CSI-stripped line, UTF-16. Nil when `raw`
+    /// has no prompt. Opponent lines are measured in that same index space.
+    /// `strip` is unchanged: this does not remove anything from the transcript.
+    static func lastPromptPlainEnd(_ raw: String) -> Int? {
+        let plain = mudPlainText(raw)
+        let ns = plain as NSString
+        let matches = promptExpression.matches(in: plain, range: NSRange(location: 0, length: ns.length))
+        var end: Int?
+        for match in matches {
+            guard match.numberOfRanges >= 4,
+                  let hpRange = Range(match.range(at: 1), in: plain),
+                  let manaRange = Range(match.range(at: 2), in: plain),
+                  let movesRange = Range(match.range(at: 3), in: plain),
+                  Int(plain[hpRange]) != nil,
+                  Int(plain[manaRange]) != nil,
+                  Int(plain[movesRange]) != nil else { continue }
+            end = match.range.location + match.range.length
+        }
+        return end
     }
 
     /// `Sorry, you are dead.` and `You are DEAD!!`. A longer line that only
@@ -530,19 +560,13 @@ enum HMVPrompt {
     }()
 
     /// Plain text plus the original index of each plain character.
+    /// CSI skipping matches `mudPlainText`, so prompt and opponent ends compare.
     private static func strippingANSI(_ raw: String) -> (String, [String.Index]) {
         var plain = ""
         var map: [String.Index] = []
         var index = raw.startIndex
         while index < raw.endIndex {
-            let next = raw.index(after: index)
-            if raw[index] == "\u{001B}", next < raw.endIndex, raw[next] == "[" {
-                var cursor = raw.index(after: next)
-                while cursor < raw.endIndex {
-                    let character = raw[cursor]
-                    cursor = raw.index(after: cursor)
-                    if character.isLetter { break }
-                }
+            if let cursor = mudEndOfCSI(raw, from: index) {
                 index = cursor
                 continue
             }
@@ -568,6 +592,126 @@ enum HMVPrompt {
         let upper = raw.index(after: map[end - 1])
         return lower..<upper
     }
+}
+
+/// CSI sequences removed. Prompt ends and opponent ends are both measured here.
+fileprivate func mudPlainText(_ raw: String) -> String {
+    var plain = ""
+    var index = raw.startIndex
+    while index < raw.endIndex {
+        if let cursor = mudEndOfCSI(raw, from: index) {
+            index = cursor
+            continue
+        }
+        plain.append(raw[index])
+        index = raw.index(after: index)
+    }
+    return plain
+}
+
+/// The index just after a CSI sequence starting at `index`, if one is there.
+fileprivate func mudEndOfCSI(_ raw: String, from index: String.Index) -> String.Index? {
+    guard raw[index] == "\u{001B}" else { return nil }
+    let bracket = raw.index(after: index)
+    guard bracket < raw.endIndex, raw[bracket] == "[" else { return nil }
+    var cursor = raw.index(after: bracket)
+    while cursor < raw.endIndex {
+        let character = raw[cursor]
+        cursor = raw.index(after: cursor)
+        if character.isLetter { return cursor }
+    }
+    return cursor
+}
+
+/// A fight line naming the opponent and their pools, for example
+/// `[Fluffy the baby dragon is in excellent condition] (141/141h 150/150m 280/280v)`.
+/// The bracket is a condition sentence (`is`, `has`, or `looks`). ANSI around
+/// the token is ignored. Nothing here is removed from the transcript.
+enum OpponentStatus {
+    struct Snapshot: Equatable {
+        var phrase: String
+        var hp: Int
+        var hpMax: Int
+        var mana: Int
+        var manaMax: Int
+        var moves: Int
+        var movesMax: Int
+
+        var vitalsLabel: String {
+            "\(hp)/\(hpMax)h \(mana)/\(manaMax)m \(moves)/\(movesMax)v"
+        }
+    }
+
+    struct Hit {
+        var snapshot: Snapshot
+        /// End of the token in the CSI-stripped line, UTF-16, same space as a prompt end.
+        var plainEnd: Int
+    }
+
+    /// The last condition token in `raw`. A bracket that is not a condition,
+    /// or a pool list that is not `h` `m` `v`, is left alone.
+    static func parse(_ raw: String) -> Hit? {
+        let plain = mudPlainText(raw)
+        let ns = plain as NSString
+        let matches = expression.matches(in: plain, range: NSRange(location: 0, length: ns.length))
+        var found: Hit?
+        for match in matches {
+            guard let snapshot = snapshot(from: match, in: plain) else { continue }
+            found = Hit(
+                snapshot: snapshot,
+                plainEnd: match.range.location + match.range.length
+            )
+        }
+        return found
+    }
+
+    private static func snapshot(from match: NSTextCheckingResult, in plain: String) -> Snapshot? {
+        guard match.numberOfRanges >= 8,
+              let phraseRange = Range(match.range(at: 1), in: plain),
+              let hpRange = Range(match.range(at: 2), in: plain),
+              let hpMaxRange = Range(match.range(at: 3), in: plain),
+              let manaRange = Range(match.range(at: 4), in: plain),
+              let manaMaxRange = Range(match.range(at: 5), in: plain),
+              let movesRange = Range(match.range(at: 6), in: plain),
+              let movesMaxRange = Range(match.range(at: 7), in: plain),
+              let hp = Int(plain[hpRange]),
+              let hpMax = Int(plain[hpMaxRange]),
+              let mana = Int(plain[manaRange]),
+              let manaMax = Int(plain[manaMaxRange]),
+              let moves = Int(plain[movesRange]),
+              let movesMax = Int(plain[movesMaxRange]) else { return nil }
+        let phrase = plain[phraseRange].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard phrase.isEmpty == false, phrase.count <= 180 else { return nil }
+        guard phrase.contains(where: { $0 == " " || $0 == "\t" }) else { return nil }
+        let phraseNS = phrase as NSString
+        guard conditionVerb.firstMatch(
+            in: phrase,
+            range: NSRange(location: 0, length: phraseNS.length)
+        ) != nil else { return nil }
+        return Snapshot(
+            phrase: phrase,
+            hp: hp,
+            hpMax: hpMax,
+            mana: mana,
+            manaMax: manaMax,
+            moves: moves,
+            movesMax: movesMax
+        )
+    }
+
+    /// `[phrase] (cur/maxh cur/maxm cur/maxv)`, spaces optional around the slash
+    /// and before each letter. The three pools stay separated by whitespace.
+    private static let expression: NSRegularExpression = {
+        let pattern = #"\[([^\[\]\r\n]+)\]\s*\(\s*(-?\d+)\s*/\s*(-?\d+)\s*h\s+(-?\d+)\s*/\s*(-?\d+)\s*m\s+(-?\d+)\s*/\s*(-?\d+)\s*v\s*\)"#
+        return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }()
+
+    /// Condition sentences from the fight line: "is in excellent condition",
+    /// "has a few scratches", "looks pretty hurt".
+    private static let conditionVerb: NSRegularExpression = {
+        let pattern = #"\b(is|has|looks)\b"#
+        return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }()
 }
 
 /// One creation step's info block. `lines` is the plain `info`, unchanged.

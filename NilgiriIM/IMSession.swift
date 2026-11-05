@@ -28,6 +28,11 @@ final class IMSession: ObservableObject {
     /// Awards from lines that just arrived (`+87 XP!`, `LEVEL!`), in order.
     /// Replacing a saved transcript does not set it. The line text stays.
     @Published private(set) var progressPulse: ProgressPulse?
+    /// Opponent condition under the player bar while the latest prompt says
+    /// `fighting`. Nil when that fight ends, the character is dead, the welcome
+    /// menu is up, or no opponent line has arrived. The server line stays in
+    /// the transcript.
+    @Published private(set) var opponent: OpponentStatus.Snapshot?
     @Published var lines: [LineDTO] = []
     @Published var status = "Parked on the IM server when this app is in the background."
     /// Set for one login, resume, reconnect, or creation attempt. Nil hides the alert.
@@ -124,6 +129,12 @@ final class IMSession: ObservableObject {
     /// `+87 XP!` / `LEVEL!` collected from this live batch. Cleared on commit.
     private var liveProgress: [String] = []
     private var progressSerial = 0
+    /// Latest opponent line in the scan. Held until a prompt, death, or the menu ends the fight.
+    private var pendingOpponent: OpponentStatus.Snapshot?
+    /// True when this scan's latest fight signal is still a fight.
+    private var pendingFighting = false
+    /// A prompt, an opponent line, a death, or a full transcript replace needs a commit.
+    private var fightStateDirty = false
     private let defaults = UserDefaults.standard
 
     private enum StoreKey {
@@ -559,6 +570,7 @@ final class IMSession: ObservableObject {
             character = nil
             atMenu = false
             menuBusy = false
+            hideOpponentBar()
             clearSessionSecrets()
             clearDisconnectMarker()
             clearShownDisconnect()
@@ -907,6 +919,7 @@ final class IMSession: ObservableObject {
         lastSeq = 0
         atMenu = false
         menuBusy = false
+        hideOpponentBar()
         token = nil
         sessionId = nil
         character = nil
@@ -1021,6 +1034,8 @@ final class IMSession: ObservableObject {
         serverDisconnectedAt: Int64? = nil,
         trustCursor: Bool = true
     ) {
+        // The replacement is the whole fight, not a continuation of the previous one.
+        beginOpponentScan()
         // Another character's saved cursor is not a gap in this transcript.
         let seenSeq = trustCursor ? lastSeq : 0
         var shown: [LineDTO] = []
@@ -1251,8 +1266,10 @@ final class IMSession: ObservableObject {
 
     /// Drops the color question and a line that is only an HMV prompt.
     /// A prompt fused with other text keeps that text, including when the
-    /// count is negative. The newest prompt in the batch is remembered for
-    /// the header. `live` is false while replacing a buffer, so an old death
+    /// count is negative. An opponent condition line is not a prompt: it stays
+    /// in the text and is also remembered for the bar under the header.
+    /// The newest prompt in the batch is remembered for the header.
+    /// `live` is false while replacing a buffer, so an old death
     /// or experience line in that buffer does not flash.
     private func presentable(_ line: LineDTO, live: Bool) -> LineDTO? {
         guard shouldShow(line) else { return nil }
@@ -1260,6 +1277,7 @@ final class IMSession: ObservableObject {
         if let found = stripped.vitals {
             pendingVitals = found
         }
+        noteFight(on: line.text, prompt: stripped.vitals)
         noteDeath(on: line, live: live, prompt: stripped.vitals)
         noteProgress(stripped.text, live: live)
         guard stripped.text.isEmpty == false else { return nil }
@@ -1267,10 +1285,83 @@ final class IMSession: ObservableObject {
         return LineDTO(seq: line.seq, at: line.at, kind: line.kind, text: stripped.text)
     }
 
+    /// Opponent text is not rewritten. The bar is on only while the latest
+    /// prompt says `fighting` and an opponent line is in hand. A prompt that
+    /// finishes after the opponent line and does not say `fighting` drops both.
+    /// An opponent line after an older prompt only stores the condition; it
+    /// does not by itself start or end the fight.
+    private func noteFight(on raw: String, prompt: HMVPrompt.Vitals?) {
+        let opponentHit = OpponentStatus.parse(raw)
+        let promptPlainEnd = HMVPrompt.lastPromptPlainEnd(raw)
+        let promptIsLater: Bool = {
+            guard let promptPlainEnd, let opponentHit else { return prompt != nil }
+            return promptPlainEnd >= opponentHit.plainEnd
+        }()
+        if let opponentHit, promptIsLater == false {
+            pendingOpponent = opponentHit.snapshot
+            if prompt?.isFighting == true {
+                pendingFighting = true
+            }
+            fightStateDirty = true
+            return
+        }
+        guard let prompt else { return }
+        fightStateDirty = true
+        if prompt.isFighting {
+            pendingFighting = true
+            if let opponentHit {
+                pendingOpponent = opponentHit.snapshot
+            }
+        } else {
+            pendingFighting = false
+            pendingOpponent = nil
+        }
+    }
+
+    /// A new transcript is its own fight. Commit publishes whatever the lines decide.
+    private func beginOpponentScan() {
+        pendingOpponent = nil
+        pendingFighting = false
+        fightStateDirty = true
+    }
+
+    /// Death. The published bar drops at the next commit, so a later line in
+    /// the same batch can still be a new fight.
+    private func endFightInScan() {
+        pendingOpponent = nil
+        pendingFighting = false
+        fightStateDirty = true
+    }
+
+    private func hideOpponentBar() {
+        pendingOpponent = nil
+        pendingFighting = false
+        fightStateDirty = false
+        if opponent != nil {
+            opponent = nil
+        }
+    }
+
+    private func commitOpponent() {
+        guard fightStateDirty else { return }
+        fightStateDirty = false
+        if atMenu || vitals?.isDead == true {
+            pendingOpponent = nil
+            pendingFighting = false
+        }
+        // A condition line can arrive before the prompt that says fighting.
+        // Keep it, and publish only once that prompt is the latest one.
+        let shown = pendingFighting ? pendingOpponent : nil
+        if opponent != shown {
+            opponent = shown
+        }
+    }
+
     /// Death is a header flag. The overlay waits until the batch commits, and
     /// the stored line is not rewritten.
     private func noteDeath(on line: LineDTO, live: Bool, prompt: HMVPrompt.Vitals?) {
         if HMVPrompt.announcesDeath(line.text) {
+            endFightInScan()
             if var base = pendingVitals ?? vitals, base.isDead == false {
                 base.condition = "DEAD"
                 pendingVitals = base
@@ -1280,8 +1371,11 @@ final class IMSession: ObservableObject {
             }
             return
         }
-        if live, prompt?.isDead == true {
-            liveDeathInBatch = true
+        if prompt?.isDead == true {
+            endFightInScan()
+            if live {
+                liveDeathInBatch = true
+            }
         }
     }
 
@@ -1323,6 +1417,7 @@ final class IMSession: ObservableObject {
                 }
             }
         }
+        commitOpponent()
         // Flash when this batch died and no later prompt shows them alive.
         // No header yet still counts: the sentence is the death.
         let stillDead = vitals?.isDead ?? true
@@ -1348,6 +1443,7 @@ final class IMSession: ObservableObject {
         guard let held = defaults.string(forKey: StoreKey.hmvName),
               namesEqual(held, next) == false else { return }
         vitals = nil
+        hideOpponentBar()
         defaults.removeObject(forKey: StoreKey.hmv)
         defaults.removeObject(forKey: StoreKey.hmvName)
     }
@@ -1397,13 +1493,13 @@ final class IMSession: ObservableObject {
     /// `menu` wins when both fields arrive. `state` is `menu` or `playing`.
     private func applyArrivedMenu(menu: Bool?, state: String?, whenAbsent: MenuWhenAbsent) {
         if let menu {
-            atMenu = menu
+            setAtMenu(menu)
             return
         }
         if let state {
             switch state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             case "menu":
-                atMenu = true
+                setAtMenu(true)
                 return
             case "playing":
                 atMenu = false
@@ -1414,11 +1510,19 @@ final class IMSession: ObservableObject {
         }
         switch whenAbsent {
         case .menu:
-            atMenu = true
+            setAtMenu(true)
         case .playing:
             atMenu = false
         case .keep:
             break
+        }
+    }
+
+    /// The welcome menu is not a fight. Leaving it does not invent an opponent.
+    private func setAtMenu(_ menu: Bool) {
+        atMenu = menu
+        if menu {
+            hideOpponentBar()
         }
     }
 
@@ -1509,6 +1613,7 @@ final class IMSession: ObservableObject {
         liveDeathInBatch = false
         liveProgress = []
         progressPulse = nil
+        hideOpponentBar()
         atMenu = false
         menuBusy = false
         menuExit = false
@@ -1538,6 +1643,7 @@ final class IMSession: ObservableObject {
         lastSeq = 0
         atMenu = false
         menuBusy = false
+        hideOpponentBar()
         command = ""
         parked = false
         token = nil
