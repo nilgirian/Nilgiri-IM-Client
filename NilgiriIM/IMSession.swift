@@ -1257,11 +1257,11 @@ final class IMSession: ObservableObject {
     private func presentable(_ line: LineDTO, live: Bool) -> LineDTO? {
         guard shouldShow(line) else { return nil }
         let stripped = HMVPrompt.strip(line.text)
-        let announcedIncap = HMVPrompt.announcesIncapacitated(line.text)
+        let announced = HMVPrompt.announcedAlarm(line.text)
         if let found = stripped.vitals {
-            pendingVitals = mergingIncapacitated(found, announced: announcedIncap)
-        } else if announcedIncap, var base = pendingVitals ?? vitals, base.isDead == false {
-            base.condition = "INCAPACITATED"
+            pendingVitals = mergingDowned(found, announced: announced)
+        } else if let announced, var base = pendingVitals ?? vitals, base.isDead == false {
+            base.condition = announced
             pendingVitals = base
         }
         noteDeath(on: line, live: live, prompt: stripped.vitals)
@@ -1304,24 +1304,23 @@ final class IMSession: ObservableObject {
         progressPulse = ProgressPulse(id: progressSerial, messages: notices)
     }
 
-    /// The incapacitated sentence is not in the prompt. Keep `INCAPACITATED`
+    /// A stun or incapacitated sentence is not in the prompt. Keep that label
     /// on the latest counts until the prompt names another downed state, or
     /// hit points come back above zero. Fighting and a bare prompt keep the
-    /// alarm. The sentence stays in the transcript.
-    private func mergingIncapacitated(
+    /// alarm. The newest sentence wins. The sentence stays in the transcript.
+    private func mergingDowned(
         _ prompt: HMVPrompt.Vitals,
-        announced: Bool
+        announced: String?
     ) -> HMVPrompt.Vitals {
         if prompt.isDead { return prompt }
         if prompt.alarm != nil { return prompt }
         let prior = pendingVitals ?? vitals
-        let holding = announced || prior?.isIncapacitated == true
-        guard holding else { return prompt }
-        if announced == false, let prior, prompt.hp > prior.hp, prompt.hp > 0 {
+        guard let label = announced ?? prior?.heldDownedLabel else { return prompt }
+        if announced == nil, let prior, prompt.hp > prior.hp, prompt.hp > 0 {
             return prompt
         }
         var copy = prompt
-        copy.condition = "INCAPACITATED"
+        copy.condition = label
         return copy
     }
 

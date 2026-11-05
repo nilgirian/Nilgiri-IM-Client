@@ -331,10 +331,14 @@ enum HMVPrompt {
             ) != nil
         }
 
-        /// The prompt, or a condition forced from the incapacitated sentence.
-        var isIncapacitated: Bool {
-            guard let condition else { return false }
-            return condition.range(of: "incap", options: .caseInsensitive) != nil
+        /// `INCAPACITATED` or `STUNNED`, including a label forced from a sentence.
+        /// Other alarms, fighting, and resting are not held across a bare prompt.
+        var heldDownedLabel: String? {
+            guard let condition else { return nil }
+            let folded = condition.lowercased()
+            if folded.contains("incap") { return "INCAPACITATED" }
+            if folded.contains("stun") { return "STUNNED" }
+            return nil
         }
 
         static func parse(_ raw: String) -> Vitals? {
@@ -462,13 +466,23 @@ enum HMVPrompt {
         return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
     }()
 
-    /// `You are incapacitated and will slowly die if not aided.`
-    /// The comma before "if" is optional. Extra words on that same line are
-    /// not this sentence. A prompt fused onto the line is ignored, and the
-    /// sentence itself is left in the transcript.
-    static func announcesIncapacitated(_ raw: String) -> Bool {
+    /// Status-bar label for a downed sentence the prompt did not carry.
+    /// The last matching line wins. A prompt fused onto the text is ignored,
+    /// and the sentence itself is left in the transcript.
+    ///
+    /// Incapacitated: `You are incapacitated and will slowly die if not aided.`
+    /// Stunned: `You are stunned, but will probably regain consciousness again.`
+    /// The comma is optional. Trailing `.` and `!` are optional. Extra words
+    /// on that same line are not the sentence.
+    static func announcedAlarm(_ raw: String) -> String? {
         let (plain, _) = strippingANSI(strip(raw).text)
-        return plain.split(whereSeparator: \.isNewline).contains { isIncapacitatedSentence($0) }
+        var label: String?
+        for line in plain.split(whereSeparator: \.isNewline) {
+            if let found = downedSentence(line) {
+                label = found
+            }
+        }
+        return label
     }
 
     /// The condition words, or nil when the prompt had none.
@@ -477,7 +491,8 @@ enum HMVPrompt {
         return text.isEmpty ? nil : String(text)
     }
 
-    private static func isIncapacitatedSentence(_ raw: Substring) -> Bool {
+    /// One visible line, commas removed, case folded, trailing `.`/`!` dropped.
+    private static func downedSentence(_ raw: Substring) -> String? {
         var folded = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         while let last = folded.last, last == "." || last == "!" {
             folded.removeLast()
@@ -487,7 +502,14 @@ enum HMVPrompt {
             .replacingOccurrences(of: ",", with: "")
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
-        return collapsed == "you are incapacitated and will slowly die if not aided"
+        switch collapsed {
+        case "you are incapacitated and will slowly die if not aided":
+            return "INCAPACITATED"
+        case "you are stunned but will probably regain consciousness again":
+            return "STUNNED"
+        default:
+            return nil
+        }
     }
 
     /// Spaces and tabs after the prompt. Color codes between `>` and those
