@@ -100,11 +100,6 @@ final class IMSession: ObservableObject {
     private var parkWaiters: [CheckedContinuation<Void, Never>] = []
     /// Prompt parsed from the batch currently being applied. Committed once.
     private var pendingVitals: HMVPrompt.Vitals?
-    /// When the scene last became active. The resume instant for a disconnect
-    /// that happened before that return.
-    private var foregroundedAt: Date?
-    /// A disconnect-to-resume gap shorter than this is not marked.
-    private static let minimumDisconnectGap: TimeInterval = 60
     private let defaults = UserDefaults.standard
 
     private enum StoreKey {
@@ -575,7 +570,6 @@ final class IMSession: ObservableObject {
     }
 
     func sceneBecameActive() async {
-        foregroundedAt = Date()
         guard token != nil, sessionId != nil else { return }
         // Returning to the app is one reconnect attempt, not a poll tick.
         outageLatched = false
@@ -1143,16 +1137,11 @@ final class IMSession: ObservableObject {
     }
 
     /// Places one local separator after the last server line the user had already
-    /// seen, when the disconnect-to-resume gap is at least 60 seconds. A long
-    /// resume with no backlog draws it at the end of the transcript. A long
-    /// resume with backlog draws it between the last line already seen and the
-    /// new lines. A shorter return draws nothing and drops the marker, so a
-    /// later poll does not add the row once the clock passes 60 seconds. The
-    /// device clock is the fallback when the server omits `disconnectedAt`.
-    /// The same gap is not drawn twice (`alreadyShown`, and `shownDisconnectMs`
-    /// for a server instant). The stamp is an absolute `Date`, formatted later
-    /// in `TimeZone.current`. The separator is not a server seq, so `lastSeq`
-    /// stays the since cursor.
+    /// seen. A login or since `disconnectedAt` newer than the last separator is
+    /// enough — the app does not also need to have watched the drop. The device
+    /// clock is the fallback when the field is absent. The stamp is an absolute
+    /// `Date`, formatted later in `TimeZone.current`. The separator is not a
+    /// server seq, so `lastSeq` stays the since cursor.
     private func applyingDisconnectSeparator(
         _ source: [LineDTO],
         seenSeq: Int64 = 0,
@@ -1167,55 +1156,34 @@ final class IMSession: ObservableObject {
         } else if let reportedMs, isNewerServerInstant(reportedMs), seenSeq > 0 {
             // Server restart or a drop this process never observed. Remember the
             // instant so a later line can still land under the same gap.
-            // A separator already stored for this seq is that gap drawn from the
-            // device clock while the since body had no backlog. Do not add another.
-            let drewThisSeq = source.contains {
-                $0.localID?.hasPrefix("separator-\(seenSeq)-") == true
-            }
-            if drewThisSeq == false {
-                defaults.set(Double(reportedMs) / 1000, forKey: StoreKey.disconnectAt)
-                defaults.set(String(seenSeq), forKey: StoreKey.disconnectSeq)
-                defaults.set(character ?? name, forKey: StoreKey.disconnectName)
-                defaults.set(String(reportedMs), forKey: StoreKey.disconnectServerMs)
-            }
+            defaults.set(Double(reportedMs) / 1000, forKey: StoreKey.disconnectAt)
+            defaults.set(String(seenSeq), forKey: StoreKey.disconnectSeq)
+            defaults.set(character ?? name, forKey: StoreKey.disconnectName)
+            defaults.set(String(reportedMs), forKey: StoreKey.disconnectServerMs)
         }
         guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return source }
         let disconnectSeq = Int64(defaults.string(forKey: StoreKey.disconnectSeq) ?? "") ?? 0
+        let hasNewLine = source.contains { $0.isServerLine && $0.seq > disconnectSeq }
+        let hasAnchor = source.contains { $0.isServerLine && $0.seq <= disconnectSeq }
+        // Device-only gaps wait for a line after the drop. A newer server instant
+        // is drawn as soon as the lines the user had seen are on screen.
+        if hasNewLine == false {
+            guard storedServerDisconnectMs() != nil, hasAnchor else { return source }
+        }
         // Both instants are absolute. The device clock is the fallback when the
         // server omits `disconnectedAt`. Display formats either one in TimeZone.current.
         let deviceDate = Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
         let serverMs = storedServerDisconnectMs()
         let disconnected = serverMs.map(DisconnectSeparator.date(epochMilliseconds:)) ?? deviceDate
-        // Prefer the foreground return when it is after this drop, so a slow
-        // since does not stretch a short resume past 60 seconds. A drop while
-        // already in front is measured to this call.
-        let resumeAt: Date
-        if let foregroundedAt, foregroundedAt >= disconnected {
-            resumeAt = foregroundedAt
-        } else {
-            resumeAt = Date()
-        }
-        if resumeAt.timeIntervalSince(disconnected) < Self.minimumDisconnectGap {
-            if inForeground {
-                let resumeMs = Int64((resumeAt.timeIntervalSince1970 * 1000.0).rounded())
-                let atMs = serverMs ?? Int64((disconnected.timeIntervalSince1970 * 1000.0).rounded())
-                defaults.set(String(max(atMs, resumeMs)), forKey: StoreKey.shownDisconnectMs)
-                clearDisconnectMarker()
-            }
-            return source
-        }
         let stamp = DisconnectSeparator.stamp(at: disconnected)
         var next = source
         let afterSeen = next.lastIndex(where: { $0.isServerLine && $0.seq <= disconnectSeq })
-        var insertAt = afterSeen.map { $0 + 1 } ?? 0
-        // Separators already on this boundary are earlier pauses with no server
-        // line between them. A later resume still gets its own row after those.
-        // The same stamp is the same gap and is not drawn again.
-        while next.indices.contains(insertAt), next[insertAt].isSeparator, next[insertAt].text != stamp {
-            insertAt += 1
-        }
+        let insertAt = afterSeen.map { $0 + 1 } ?? 0
+        // One row for this gap. A separator already at the insert point, or the same
+        // stamp already in the transcript, means the device clock and the server
+        // instant must not each add a line.
         let alreadyShown = next.contains { $0.isSeparator && $0.text == stamp }
-        if alreadyShown {
+        if (next.indices.contains(insertAt) && next[insertAt].isSeparator) || alreadyShown {
             if let serverMs { defaults.set(String(serverMs), forKey: StoreKey.shownDisconnectMs) }
             clearDisconnectMarker()
             return next
@@ -1232,7 +1200,7 @@ final class IMSession: ObservableObject {
             ),
             at: insertAt
         )
-        defaults.set(String(atMs), forKey: StoreKey.shownDisconnectMs)
+        if let serverMs { defaults.set(String(serverMs), forKey: StoreKey.shownDisconnectMs) }
         clearDisconnectMarker()
         return next
     }
