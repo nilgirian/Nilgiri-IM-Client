@@ -3639,12 +3639,14 @@ private struct SkillActionStack: View {
         lightTokens[index] = token
         withAnimation(.easeOut(duration: 0.08)) {
             litSlots.insert(index)
+            return
         }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             guard lightTokens[index] == token else { return }
             withAnimation(.easeOut(duration: 0.15)) {
                 litSlots.remove(index)
+                return
             }
         }
     }
