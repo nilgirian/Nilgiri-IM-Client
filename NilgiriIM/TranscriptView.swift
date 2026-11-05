@@ -538,6 +538,9 @@ private final class TranscriptTextView: UITextView {
     /// The menu does not: its clearance is the bottom content inset. A keyboard
     /// frame must not publish SwiftUI state from here.
     var onViewportHeightChange: (() -> Void)?
+    /// Width is about to change. Rotation reports that as a scroll; the pin
+    /// has to be held before `super` so the scroll does not drop it.
+    var onWidthWillChange: (() -> Void)?
     /// Recompute bar insets after a real size change. Must not publish SwiftUI state.
     var onChromeLayout: (() -> Void)?
     /// The live bottom inset was cleared and written back. Pin if still stuck.
@@ -676,6 +679,10 @@ private final class TranscriptTextView: UITextView {
     }
 
     override func layoutSubviews() {
+        let width = bounds.width
+        if width > 1, laidWidth > 1, abs(width - laidWidth) >= 0.5 {
+            onWidthWillChange?()
+        }
         super.layoutSubviews()
         let repaired = enforceChromeInsets()
         // Keyboard animation changes the height every frame. That is not a
@@ -684,7 +691,6 @@ private final class TranscriptTextView: UITextView {
         // not change this height; the bottom inset clears it.
         var structural = false
         var boundsChanged = false
-        let width = bounds.width
         let contentHeight = contentSize.height
         if width > 1, abs(width - laidWidth) >= 0.5 {
             laidWidth = width
@@ -805,6 +811,9 @@ private struct TranscriptLog: UIViewRepresentable {
         view.onViewportHeightChange = { [weak coordinator = context.coordinator] in
             coordinator?.viewportResized()
         }
+        view.onWidthWillChange = { [weak coordinator = context.coordinator] in
+            coordinator?.holdBottomPin(for: 0.6)
+        }
         view.onChromeLayout = { [weak coordinator = context.coordinator] in
             coordinator?.refreshChromeInsets(pinIfStuck: false)
         }
@@ -864,7 +873,7 @@ private struct TranscriptLog: UIViewRepresentable {
             coordinator.scrollToken = scrollToken
             coordinator.nearBottom = true
             coordinator.stickToBottom = true
-            coordinator.holdUntil = Date().addingTimeInterval(0.25)
+            coordinator.extendBottomHold(by: 0.25)
             coordinator.scrollToBottom(animated: false)
         }
         coordinator.applyIfPossible()
@@ -925,34 +934,70 @@ private struct TranscriptLog: UIViewRepresentable {
         private var inChrome = false
         private var pinning = false
         /// Keyboard frame from the last ended animation, in screen coordinates.
-        /// Nil until a keyboard has been shown. Not the layout guide: that
-        /// guide clears this text view's bottom content inset.
+        /// Nil until a keyboard has been shown, and nil again once it hides.
+        /// Not the layout guide: that guide clears this text view's bottom
+        /// content inset. A portrait docked rect left in place after a
+        /// landscape dismiss keeps the last line a keyboard-height above the bar.
         private var keyboardEndFrame: CGRect?
-        private var keyboardObserver: NSObjectProtocol?
+        /// Set when the keyboard is leaving. A later frame-change from the
+        /// rotation must not put the docked rect back into the bottom inset.
+        private var keyboardDismissed = false
+        /// The reader was on the bottom at the start of a resize or keyboard
+        /// animation. A finger drag clears it. The scroll view reports both
+        /// as scrolls, so the pin is put back when the keyboard animation ends.
+        private var bottomPinHeld = false
+        private var keyboardObservers: [NSObjectProtocol] = []
 
         override init() {
             super.init()
-            keyboardObserver = NotificationCenter.default.addObserver(
-                forName: UIResponder.keyboardWillChangeFrameNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] note in
-                self?.keyboardWillChange(note)
+            let center = NotificationCenter.default
+            let names = [
+                UIResponder.keyboardWillChangeFrameNotification,
+                UIResponder.keyboardWillShowNotification,
+                UIResponder.keyboardWillHideNotification
+            ]
+            for name in names {
+                keyboardObservers.append(
+                    center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                        self?.keyboardWillChange(note)
+                    }
+                )
             }
+            keyboardObservers.append(
+                center.addObserver(
+                    forName: UIResponder.keyboardDidHideNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.keyboardDidHide()
+                }
+            )
         }
 
         deinit {
-            if let keyboardObserver {
-                NotificationCenter.default.removeObserver(keyboardObserver)
+            let center = NotificationCenter.default
+            for observer in keyboardObservers {
+                center.removeObserver(observer)
             }
         }
 
         /// One follow-up after the keyboard animation, not one per frame.
         /// The bar moves with the keyboard safe area. The bottom inset gains
         /// the keyboard only when that ended frame still overlaps the log, and
-        /// the overlap stays latched until the animation ends.
+        /// the overlap stays latched until the animation ends. Hiding clears
+        /// the frame so a portrait keyboard does not stay in the landscape inset.
         private func keyboardWillChange(_ note: Notification) {
+            if note.name == UIResponder.keyboardWillHideNotification {
+                keyboardDismissed = true
+            } else if note.name == UIResponder.keyboardWillShowNotification {
+                keyboardDismissed = false
+            } else if keyboardDismissed {
+                return
+            }
             let duration = note.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double ?? 0.25
+            // Outlast the animation so a resize scroll cannot drop the pin
+            // before the resting offset is known.
+            holdBottomPin(for: duration + 0.75)
             if let textView {
                 keyboardOverlapLatch = extraBelowBar(for: textView, latched: false)
             }
@@ -960,15 +1005,91 @@ private struct TranscriptLog: UIViewRepresentable {
             keyboardToken += 1
             let token = keyboardToken
             let end = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
-            let wasStuck = stickToBottom && revealing == false && revealPending == false
             DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
                 guard let coordinator = self, token == coordinator.keyboardToken else { return }
-                coordinator.keyboardOverlapLatch = nil
-                coordinator.keyboardAnimationUntil = .distantPast
-                coordinator.keyboardEndFrame = end
-                coordinator.refreshChromeInsets(pinIfStuck: false)
-                guard wasStuck, coordinator.stickToBottom, coordinator.revealing == false,
+                coordinator.finishKeyboardAnimation(end: end)
+            }
+        }
+
+        /// The keyboard is gone. End the suppression window now: the rotation
+        /// notification's duration can still be running, and that was blocking
+        /// the pin after the landscape insets settled.
+        private func keyboardDidHide() {
+            keyboardDismissed = true
+            keyboardToken += 1
+            finishKeyboardAnimation(end: nil)
+        }
+
+        private func finishKeyboardAnimation(end: CGRect?) {
+            keyboardOverlapLatch = nil
+            keyboardAnimationUntil = .distantPast
+            if keyboardDismissed {
+                keyboardEndFrame = nil
+            } else {
+                keyboardEndFrame = end
+            }
+            restoreHeldBottomPin()
+            let pin = stickToBottom && revealing == false && revealPending == false
+            refreshChromeInsets(pinIfStuck: pin)
+            pinRestingBottomAfterLayout()
+        }
+
+        /// Width change or keyboard animation. Does not pull a reader who has
+        /// scrolled up, and does not fight a finger that is already down.
+        func holdBottomPin(for duration: TimeInterval) {
+            guard revealing == false, revealPending == false else { return }
+            guard let textView,
+                  textView.isTracking == false,
+                  textView.isDragging == false,
+                  textView.isDecelerating == false else { return }
+            guard stickToBottom || nearBottom else { return }
+            bottomPinHeld = true
+            extendBottomHold(by: duration)
+        }
+
+        func extendBottomHold(by duration: TimeInterval) {
+            let until = Date().addingTimeInterval(duration)
+            if holdUntil < until {
+                holdUntil = until
+            }
+        }
+
+        private func restoreHeldBottomPin() {
+            let held = bottomPinHeld
+            bottomPinHeld = false
+            guard held, revealing == false, revealPending == false else { return }
+            guard let textView,
+                  textView.isTracking == false,
+                  textView.isDragging == false,
+                  textView.isDecelerating == false else { return }
+            // A resize scroll may already have published "not at the bottom".
+            // Put that back so the new-lines chip does not appear on a pin.
+            stickToBottom = true
+            if nearBottom == false {
+                emitNear(true)
+            }
+        }
+
+        /// Scroll once with the insets just written, then once more after the
+        /// next layout. Rotation often ends the keyboard animation before the
+        /// landscape column and the reflowed text have both settled.
+        private func pinRestingBottomAfterLayout() {
+            guard stickToBottom, revealing == false, revealPending == false else { return }
+            guard let textView,
+                  textView.isTracking == false,
+                  textView.isDragging == false,
+                  textView.isDecelerating == false else { return }
+            scrollToBottom(animated: false)
+            let token = keyboardToken
+            DispatchQueue.main.async { [weak self] in
+                guard let coordinator = self, token == coordinator.keyboardToken else { return }
+                guard coordinator.stickToBottom, coordinator.revealing == false,
                       coordinator.revealPending == false else { return }
+                guard let textView = coordinator.textView,
+                      textView.isTracking == false,
+                      textView.isDragging == false,
+                      textView.isDecelerating == false else { return }
+                coordinator.refreshChromeInsets(pinIfStuck: true)
                 coordinator.scrollToBottom(animated: false)
             }
         }
@@ -1106,9 +1227,10 @@ private struct TranscriptLog: UIViewRepresentable {
             if flipped, wasAtBottom {
                 // Rotation keeps reporting scroll events while the text
                 // restyles. Hold the bottom pin across that animation.
+                // A longer hold from the keyboard dismiss must not be shortened.
                 stickToBottom = true
                 nearBottom = true
-                holdUntil = Date().addingTimeInterval(0.6)
+                extendBottomHold(by: 0.6)
             }
             portraitEnlarged = portrait
             guard let edit = store.update(
@@ -1182,7 +1304,7 @@ private struct TranscriptLog: UIViewRepresentable {
             textView.enforceChromeInsets()
             let y = maxOffset(of: textView)
             stickToBottom = true
-            holdUntil = Date().addingTimeInterval(0.25)
+            extendBottomHold(by: 0.25)
             setBottomOffset(y, on: textView, animated: animated)
             // ensureLayout can grow the used rect after the first assignment.
             let settled = maxOffset(of: textView)
@@ -1287,7 +1409,7 @@ private struct TranscriptLog: UIViewRepresentable {
             }
             guard pinBottom else { return }
             stickToBottom = true
-            holdUntil = Date().addingTimeInterval(0.25)
+            extendBottomHold(by: 0.25)
             emitNear(true)
             if deferred {
                 scrollToBottom(animated: false)
@@ -1354,6 +1476,7 @@ private struct TranscriptLog: UIViewRepresentable {
         }
 
         func scrollViewWillBeginDragging(_: UIScrollView) {
+            bottomPinHeld = false
             holdUntil = .distantPast
             if revealing {
                 revealToken += 1
@@ -1369,6 +1492,7 @@ private struct TranscriptLog: UIViewRepresentable {
             lastOffsetY = offsetY
             // Bounds and content-size changes call this too. Only a real offset
             // change is the reader moving; a keyboard frame must not flip the flag.
+            // Rotation and the dismiss arm `holdUntil` before this runs.
             guard programmatic == 0, moved else { return }
             let near: Bool
             if Date() < holdUntil {
@@ -1377,6 +1501,9 @@ private struct TranscriptLog: UIViewRepresentable {
                 near = distanceFromBottom(of: textView) <= nearBottomSlack
             }
             emitNear(near)
+            if near == false {
+                bottomPinHeld = false
+            }
         }
 
         func textView(
