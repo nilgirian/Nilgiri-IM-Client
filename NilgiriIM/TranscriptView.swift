@@ -1895,8 +1895,8 @@ private struct CommandLineField: UIViewRepresentable {
     }
 }
 
-/// Death sentence, centered in the top two-thirds. The red is translucent
-/// so the log shows through, and the flash does not take taps.
+/// Death sentence, horizontally centered in the middle of the top two-thirds.
+/// The red is translucent so the log shows through, and the flash does not take taps.
 private struct DeathFlash: View {
     var opacity: Double
 
@@ -1910,8 +1910,11 @@ private struct DeathFlash: View {
                 .lineLimit(3)
                 .minimumScaleFactor(0.4)
                 .padding(.horizontal, 12)
-                .frame(width: proxy.size.width, height: proxy.size.height * 2 / 3)
-                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+                .frame(width: proxy.size.width)
+                .position(
+                    x: proxy.size.width / 2,
+                    y: proxy.size.height * (1.0 / 3.0)
+                )
                 .opacity(opacity)
         }
         .allowsHitTesting(false)
@@ -1936,8 +1939,11 @@ private struct AwardFlash: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.4)
                 .padding(.horizontal, 12)
-                .frame(width: proxy.size.width, height: proxy.size.height * 2 / 3)
-                .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+                .frame(width: proxy.size.width)
+                .position(
+                    x: proxy.size.width / 2,
+                    y: proxy.size.height * (1.0 / 3.0)
+                )
                 .opacity(opacity)
         }
         .allowsHitTesting(false)
