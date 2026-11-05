@@ -19,7 +19,9 @@ final class IMSession: ObservableObject {
     @Published var token: String?
     @Published var sessionId: String?
     @Published var character: String?
-    /// Last HMV prompt. Kept across catch-up and relaunch until a newer prompt arrives.
+    /// Last HMV prompt that is still current. A newer prompt replaces it outright.
+    /// A saved or catch-up DEAD is not current across login, resume, or leaving
+    /// the welcome menu; a live line has to say dead again.
     /// A negative count and a downed condition live here, not in the line text.
     @Published private(set) var vitals: HMVPrompt.Vitals?
     /// Bumps when a line that just arrived says the character died.
@@ -121,6 +123,24 @@ final class IMSession: ObservableObject {
     /// Cleared on commit. The overlay runs only when the batch still ends dead,
     /// so a later prompt in the same catch-up does not flash.
     private var liveDeathInBatch = false
+    /// Login, resume, or creation is applying its backlog. A stream line in
+    /// this window can still confirm death. The backlog itself cannot.
+    /// Depth covers a poll that overlaps that attempt.
+    private var reentryDepth = 0
+    /// A live prompt or death sentence adopted DEAD during re-entry.
+    private var reentrySawLiveDeath = false
+    /// Bumps when a live line adopts DEAD. The welcome menu records the value
+    /// as it is shown, so leaving the menu can tell a new death from an old one.
+    private var liveDeathEpoch = 0
+    /// `liveDeathEpoch` when the welcome menu was entered.
+    private var menuDeathEpoch = 0
+    /// False until the first login or since body in this process is applied.
+    /// Death inside that first backlog is history, same as a replaced buffer.
+    private var didApplyEntryBacklog = false
+    /// Seq of the line that last changed the header. Catch-up can hand the
+    /// death lines over again after `<2h 100m 94v>` has already arrived.
+    /// An older seq must not put those counts, or DEAD, back.
+    private var headerSeq: Int64 = 0
     /// `+87 XP!` / `LEVEL!` collected from this live batch. Cleared on commit.
     private var liveProgress: [String] = []
     private var progressSerial = 0
@@ -617,7 +637,22 @@ final class IMSession: ObservableObject {
 
     func catchUp() async {
         guard token != nil, sessionId != nil else { return }
-        switch await fetchSince() {
+        // Launch resume can fail before any line is applied. The next poll
+        // is still that backlog: a death in it must not stick on the bar.
+        let staleBacklog = didApplyEntryBacklog == false
+        if staleBacklog {
+            beginReentry()
+        }
+        let outcome = await fetchSince(adoptDeath: staleBacklog == false)
+        if staleBacklog {
+            switch outcome {
+            case .ready, .detached, .closed:
+                endReentry()
+            default:
+                cancelReentry()
+            }
+        }
+        switch outcome {
         case .ready:
             didAutoLogin = false
             outageLatched = false
@@ -665,6 +700,7 @@ final class IMSession: ObservableObject {
         if includeSince {
             body["since"] = NSNumber(value: lastSeq)
         }
+        beginReentry()
         do {
             let data = try JSONSerialization.data(withJSONObject: body)
             var req = URLRequest(url: url("/v1/login"))
@@ -674,6 +710,7 @@ final class IMSession: ObservableObject {
             let (respData, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse else {
                 status = "Login failed."
+                cancelReentry()
                 return
             }
             if let kind = OutageKind.http(status: http.statusCode, data: respData) {
@@ -681,6 +718,7 @@ final class IMSession: ObservableObject {
                 // This was not a rejected login, so the one automatic re-login stays armed.
                 didAutoLogin = false
                 reportOutage(kind)
+                cancelReentry()
                 return
             }
             if http.statusCode == 401 {
@@ -692,6 +730,7 @@ final class IMSession: ObservableObject {
                 menuBusy = false
                 stopLive()
                 token = nil
+                cancelReentry()
                 return
             }
             if http.statusCode != 200 {
@@ -701,6 +740,7 @@ final class IMSession: ObservableObject {
                 atMenu = false
                 menuBusy = false
                 token = nil
+                cancelReentry()
                 return
             }
             let login = try JSONDecoder().decode(LoginResponse.self, from: respData)
@@ -731,7 +771,12 @@ final class IMSession: ObservableObject {
                 cancelResumeReveal()
             }
             if switching == false && login.resumed == true && includeSince {
-                append(login.lines ?? [], animatedScroll: true, serverDisconnectedAt: serverDisconnectedAt)
+                append(
+                    login.lines ?? [],
+                    animatedScroll: true,
+                    serverDisconnectedAt: serverDisconnectedAt,
+                    adoptDeath: false
+                )
             } else {
                 replaceTranscript(
                     login.lines ?? [],
@@ -744,12 +789,15 @@ final class IMSession: ObservableObject {
                     persistCursor()
                 }
             }
+            // Before the next await, so a replayed DEAD is gone before the bar paints.
+            endReentry()
             persistAccount()
             if switching {
                 resetServerBadge()
             }
             await settleAfterResume(announcement: arrivalAnnouncement(login.character, resumed: login.resumed))
         } catch {
+            cancelReentry()
             if let kind = OutageKind.transport(error) {
                 didAutoLogin = false
                 reportOutage(kind)
@@ -763,7 +811,15 @@ final class IMSession: ObservableObject {
     /// A detached restore (`closed` with `resumed`) has already placed the divider.
     /// The caller logs in next and must not wipe that transcript.
     private func resumeDirect() async -> ResumeOutcome {
-        let outcome = await fetchSince()
+        beginReentry()
+        let outcome = await fetchSince(adoptDeath: false)
+        switch outcome {
+        case .ready, .detached, .closed:
+            // The since body is history. DEAD in it is not a new death.
+            endReentry()
+        default:
+            cancelReentry()
+        }
         guard outcome == .ready else { return outcome }
         // Linkdead resume is already in the game. A session left on the menu
         // shows the panel and does not send 1.
@@ -777,7 +833,10 @@ final class IMSession: ObservableObject {
         return .ready
     }
 
-    private func fetchSince() async -> ResumeOutcome {
+    /// `adoptDeath` is false for the login and launch backlog. The steady
+    /// poll keeps the default, so a death that arrives while playing still
+    /// updates the header when the stream is down.
+    private func fetchSince(adoptDeath: Bool = true) async -> ResumeOutcome {
         guard let token else { return .rejected }
         let seq = lines.isEmpty ? Int64(0) : lastSeq
         guard let requestURL = sessionURL("/since/\(seq)") else { return .rejected }
@@ -803,7 +862,12 @@ final class IMSession: ObservableObject {
                         serverDisconnectedAt: since.disconnectedAt
                     )
                 } else {
-                    append(since.lines, animatedScroll: true, serverDisconnectedAt: since.disconnectedAt)
+                    append(
+                        since.lines,
+                        animatedScroll: true,
+                        serverDisconnectedAt: since.disconnectedAt,
+                        adoptDeath: adoptDeath
+                    )
                 }
                 applyArrivedMenu(menu: since.menu, state: since.state, whenAbsent: .keep)
                 if since.closed {
@@ -1029,7 +1093,7 @@ final class IMSession: ObservableObject {
             if line.seq > maxSeq {
                 maxSeq = line.seq
             }
-            guard let shownLine = presentable(line, live: false) else { continue }
+            guard let shownLine = presentable(line, live: false, adoptDeath: false) else { continue }
             shown.append(shownLine)
         }
         commitVitals()
@@ -1051,14 +1115,27 @@ final class IMSession: ObservableObject {
     private func append(
         _ incoming: [LineDTO],
         animatedScroll: Bool = false,
-        serverDisconnectedAt: Int64? = nil
+        serverDisconnectedAt: Int64? = nil,
+        adoptDeath: Bool = true
     ) {
         let seenSeq = lastSeq
         var next = lines
-        for line in incoming where line.seq > lastSeq {
-            lastSeq = line.seq
-            guard let shownLine = presentable(line, live: true) else { continue }
-            next.append(shownLine)
+        for line in incoming {
+            // A prompt-only update can reuse a seq the scroll already showed,
+            // or a later poll can repeat the death lines. Header changes still
+            // run; the scroll does not gain a second copy.
+            let fresh = line.seq > lastSeq
+            if fresh {
+                lastSeq = line.seq
+            }
+            guard let shownLine = presentable(
+                line,
+                live: fresh,
+                adoptDeath: fresh && adoptDeath
+            ) else { continue }
+            if fresh {
+                next.append(shownLine)
+            }
         }
         commitVitals()
         publishLines(
@@ -1254,38 +1331,114 @@ final class IMSession: ObservableObject {
     /// count is negative. The newest prompt in the batch is remembered for
     /// the header. `live` is false while replacing a buffer, so an old death
     /// or experience line in that buffer does not flash.
-    private func presentable(_ line: LineDTO, live: Bool) -> LineDTO? {
+    /// `adoptDeath` is false for a login, resume, or full-buffer replay.
+    /// Those lines must not put DEAD back on the header.
+    private func presentable(_ line: LineDTO, live: Bool, adoptDeath: Bool = true) -> LineDTO? {
         guard shouldShow(line) else { return nil }
         let stripped = HMVPrompt.strip(line.text)
         let announced = HMVPrompt.announcedAlarm(line.text)
-        if let found = stripped.vitals {
-            pendingVitals = mergingDowned(found, announced: announced)
-        } else if let announced, var base = pendingVitals ?? vitals, base.isDead == false {
-            base.condition = announced
-            pendingVitals = base
+        if line.seq >= headerSeq {
+            if let found = stripped.vitals {
+                // Stun and incapacitated merge onto the prompt first. A dead
+                // prompt from a login or resume backlog is then dropped, and a
+                // living prompt replaces every count, including an old DEAD.
+                let merged = mergingDowned(found, announced: announced)
+                if let header = adoptingHeaderPrompt(merged, adoptDeath: adoptDeath) {
+                    acceptHeader(from: line, header)
+                    if header.isDead {
+                        noteLiveDeathAdopted()
+                    }
+                } else {
+                    acceptHeader(from: line, nil)
+                }
+            } else if let announced, var base = pendingVitals ?? vitals, base.isDead == false {
+                base.condition = announced
+                acceptHeader(from: line, base)
+            }
         }
-        noteDeath(on: line, live: live, prompt: stripped.vitals)
+        noteDeath(on: line, live: live, prompt: stripped.vitals, adoptDeath: adoptDeath)
         noteProgress(stripped.text, live: live)
         guard stripped.text.isEmpty == false else { return nil }
         guard stripped.text != line.text else { return line }
         return LineDTO(seq: line.seq, at: line.at, kind: line.kind, text: stripped.text)
     }
 
+    /// A prompt that is not dead replaces the header completely.
+    /// Prior DEAD counts are not copied onto the new numbers.
+    /// A condition that is not DEAD is kept as this prompt stated it
+    /// (fighting, stun, incapacitated). A dead prompt is current only
+    /// for a live batch. A login or resume backlog passes `adoptDeath: false`.
+    private func adoptingHeaderPrompt(
+        _ found: HMVPrompt.Vitals,
+        adoptDeath: Bool
+    ) -> HMVPrompt.Vitals? {
+        if found.isDead {
+            guard adoptDeath else { return nil }
+            return found
+        }
+        return HMVPrompt.Vitals(
+            hp: found.hp,
+            mana: found.mana,
+            moves: found.moves,
+            condition: found.condition
+        )
+    }
+
+    /// Takes this line as the header only when it is not older than the
+    /// prompt already showing. Nil clears a backlog death without copying
+    /// its counts forward, and only when that sentence is strictly newer
+    /// than the prompt so `<2h 100m 94v>` is not thrown away.
+    private func acceptHeader(from line: LineDTO, _ next: HMVPrompt.Vitals?) {
+        if next == nil {
+            guard line.seq > headerSeq else { return }
+        } else {
+            guard line.seq >= headerSeq else { return }
+        }
+        headerSeq = line.seq
+        pendingVitals = next
+    }
+
     /// Death is a header flag. The overlay waits until the batch commits, and
-    /// the stored line is not rewritten.
-    private func noteDeath(on line: LineDTO, live: Bool, prompt: HMVPrompt.Vitals?) {
+    /// the stored line is not rewritten. A login or resume backlog does not
+    /// set the flag or start the overlay. A live line still does. A sentence
+    /// older than the current prompt does not touch the header: that is how
+    /// `<2h 100m 94v>` survives a catch-up that replays the death.
+    private func noteDeath(
+        on line: LineDTO,
+        live: Bool,
+        prompt: HMVPrompt.Vitals?,
+        adoptDeath: Bool = true
+    ) {
         if HMVPrompt.announcesDeath(line.text) {
-            if var base = pendingVitals ?? vitals, base.isDead == false {
-                base.condition = "DEAD"
-                pendingVitals = base
-            }
-            if live {
-                liveDeathInBatch = true
+            guard line.seq >= headerSeq else { return }
+            if adoptDeath {
+                if var base = pendingVitals ?? vitals, base.isDead == false {
+                    base.condition = "DEAD"
+                    acceptHeader(from: line, base)
+                } else {
+                    headerSeq = line.seq
+                }
+                noteLiveDeathAdopted()
+                if live {
+                    liveDeathInBatch = true
+                }
+            } else {
+                // The counts sitting with this sentence are the old death.
+                // Do not keep them, and do not erase a newer prompt.
+                acceptHeader(from: line, nil)
             }
             return
         }
-        if live, prompt?.isDead == true {
+        if live, adoptDeath, prompt?.isDead == true {
             liveDeathInBatch = true
+        }
+    }
+
+    /// A live line, not a saved prompt or a backlog, confirmed DEAD.
+    private func noteLiveDeathAdopted() {
+        liveDeathEpoch += 1
+        if reentryDepth > 0 {
+            reentrySawLiveDeath = true
         }
     }
 
@@ -1338,6 +1491,8 @@ final class IMSession: ObservableObject {
         liveDeathInBatch = false
         if let found = pendingVitals {
             pendingVitals = nil
+            // `found` is already the whole prompt. A living one does not
+            // inherit a previous DEAD condition or the old negative count.
             if vitals != found {
                 vitals = found
                 defaults.set(found.stored, forKey: StoreKey.hmv)
@@ -1362,7 +1517,54 @@ final class IMSession: ObservableObject {
               let found = HMVPrompt.Vitals.parse(raw) else { return }
         let owner = character ?? name
         guard owner.isEmpty == false, namesEqual(held, owner) else { return }
+        // Relaunch is not a live death. Drop the saved DEAD counts so the
+        // bar does not keep `-9h DEAD` while wear commands have no prompt yet.
+        // Stun and incapacitated still restore; those alarms are separate.
+        guard found.isDead == false else {
+            defaults.removeObject(forKey: StoreKey.hmv)
+            defaults.removeObject(forKey: StoreKey.hmvName)
+            return
+        }
         vitals = found
+    }
+
+    /// Login, resume, or creation is about to apply its backlog.
+    private func beginReentry() {
+        if reentryDepth == 0 {
+            reentrySawLiveDeath = false
+        }
+        reentryDepth += 1
+    }
+
+    /// The backlog has been applied. A DEAD header that this entry did not
+    /// confirm live is dropped, counts included, before the next await paints.
+    /// An overlapping attempt must finish too before the header is cleared.
+    private func endReentry() {
+        guard reentryDepth > 0 else { return }
+        reentryDepth -= 1
+        guard reentryDepth == 0 else { return }
+        if reentrySawLiveDeath == false {
+            clearStaleDeath()
+        }
+        reentrySawLiveDeath = false
+        didApplyEntryBacklog = true
+    }
+
+    /// The attempt failed before a backlog was applied. Leave the header.
+    private func cancelReentry() {
+        guard reentryDepth > 0 else { return }
+        reentryDepth -= 1
+        guard reentryDepth == 0 else { return }
+        reentrySawLiveDeath = false
+    }
+
+    /// Removes a DEAD header and its saved copy. A living prompt is kept.
+    private func clearStaleDeath() {
+        guard vitals?.isDead == true else { return }
+        vitals = nil
+        pendingVitals = nil
+        defaults.removeObject(forKey: StoreKey.hmv)
+        defaults.removeObject(forKey: StoreKey.hmvName)
     }
 
     /// Another character's saved prompt is not this header.
@@ -1372,6 +1574,7 @@ final class IMSession: ObservableObject {
         guard let held = defaults.string(forKey: StoreKey.hmvName),
               namesEqual(held, next) == false else { return }
         vitals = nil
+        headerSeq = 0
         defaults.removeObject(forKey: StoreKey.hmv)
         defaults.removeObject(forKey: StoreKey.hmvName)
     }
@@ -1420,22 +1623,25 @@ final class IMSession: ObservableObject {
 
     /// `menu` wins when both fields arrive. `state` is `menu` or `playing`.
     private func applyArrivedMenu(menu: Bool?, state: String?, whenAbsent: MenuWhenAbsent) {
+        let wasMenu = atMenu
         if let menu {
             atMenu = menu
-            return
-        }
-        if let state {
+        } else if let state {
             switch state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             case "menu":
                 atMenu = true
-                return
             case "playing":
                 atMenu = false
-                return
             default:
-                break
+                applyAbsentMenu(whenAbsent)
             }
+        } else {
+            applyAbsentMenu(whenAbsent)
         }
+        noteMenuTransition(wasMenu: wasMenu)
+    }
+
+    private func applyAbsentMenu(_ whenAbsent: MenuWhenAbsent) {
         switch whenAbsent {
         case .menu:
             atMenu = true
@@ -1443,6 +1649,18 @@ final class IMSession: ObservableObject {
             atMenu = false
         case .keep:
             break
+        }
+    }
+
+    /// Entering the menu remembers which live death had already happened.
+    /// Leaving it drops a DEAD header from before the menu unless a live
+    /// line has said dead again since the menu was shown.
+    private func noteMenuTransition(wasMenu: Bool) {
+        if atMenu && wasMenu == false {
+            menuDeathEpoch = liveDeathEpoch
+        }
+        if wasMenu && atMenu == false && liveDeathEpoch == menuDeathEpoch {
+            clearStaleDeath()
         }
     }
 
@@ -1529,6 +1747,7 @@ final class IMSession: ObservableObject {
         lastSeq = 0
         pendingVitals = nil
         vitals = nil
+        headerSeq = 0
         deathBannerAt = nil
         liveDeathInBatch = false
         liveProgress = []
@@ -1743,12 +1962,14 @@ final class IMSession: ObservableObject {
         clearDisconnectMarker()
         clearShownDisconnect()
         cancelResumeReveal()
+        beginReentry()
         replaceTranscript(
             login.lines ?? [],
             animatedScroll: true,
             serverDisconnectedAt: nil,
             trustCursor: false
         )
+        endReentry()
         persistAccount()
         if switching {
             resetServerBadge()
