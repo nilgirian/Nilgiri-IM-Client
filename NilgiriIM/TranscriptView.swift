@@ -507,7 +507,9 @@ private enum TranscriptWord {
         guard storage.length > 0 else { return nil }
         let layout = textView.layoutManager
         guard layout.numberOfGlyphs > 0 else { return nil }
-        let origin = textView.textContainerOrigin
+        // UITextView has no textContainerOrigin (that is AppKit). The container
+        // sits at the inset; line fragment padding on this view is zero.
+        let origin = CGPoint(x: textView.textContainerInset.left, y: textView.textContainerInset.top)
         let point = CGPoint(x: viewPoint.x - origin.x, y: viewPoint.y - origin.y)
         let glyph = layout.glyphIndex(
             for: point,
