@@ -28,7 +28,7 @@ enum Ansi {
         /// Break at the column, including inside a word.
         case columns
         /// Say, gossip, and the other communication lines, portrait or landscape.
-        /// A word of fewer than 11 letters that would cross the column moves
+        /// A word of fewer than 13 letters that would cross the column moves
         /// onto the next line whole, and every line after the first is indented
         /// two spaces.
         case communication
@@ -481,7 +481,7 @@ enum Ansi {
 
     /// Communication lines. A word is the visible columns up to the next
     /// space, tab, or newline; ANSI is copied and takes no column. Fewer than
-    /// 11 letters means that run is shorter than 11 columns. Such a word is
+    /// 13 letters means that run is shorter than 13 columns. Such a word is
     /// moved whole when it would cross the column and still fits on a
     /// continuation line (the line is two spaces shorter). A longer word
     /// still breaks at the column, so a long token does not leave a hole.
@@ -493,7 +493,7 @@ enum Ansi {
     ) -> (text: String, wrapBreaks: Set<Int>) {
         let width = max(columns, 1)
         let indent = min(2, width - 1)
-        let shortWord = 11
+        let shortWord = 13
         var out = ""
         var wrapBreaks = Set<Int>()
         var outCount = 0
