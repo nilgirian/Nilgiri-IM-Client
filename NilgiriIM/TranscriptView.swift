@@ -732,17 +732,13 @@ private final class TranscriptTextView: UITextView {
     private var laidWidth: CGFloat = -1
     private var laidContentHeight: CGFloat = -1
     private var laidBoundsHeight: CGFloat = -1
-    /// The log on screen. The command field asks it whether a quick tap
-    /// should be refused before the field resigns.
+    /// The log on screen. The command field asks it whether a selection
+    /// press is taking focus.
     private static weak var installed: TranscriptTextView?
-    /// Touch-down time for the finger that might be a hilite tap.
-    private var quickTapDownTime: TimeInterval?
-    private var quickTapFingerDown = false
-    /// End time of a short tap, so a first-responder steal in the same turn
-    /// is still refused after `touchesEnded`.
-    private var quickTapEndedAt: TimeInterval?
-    /// Just under the selection long-press. A shorter hold is a hilite tap.
-    private var quickTapCeiling: TimeInterval = 0.3
+    /// `CACurrentMediaTime` when the finger went down. Compared only with
+    /// itself, never with `UITouch.timestamp`.
+    private var fingerDownAt: TimeInterval?
+    private var fingerIsDown = false
 
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         let storage = NSTextStorage()
@@ -807,7 +803,6 @@ private final class TranscriptTextView: UITextView {
         super.didMoveToWindow()
         if window != nil {
             Self.installed = self
-            refreshQuickTapCeiling()
         } else if Self.installed === self {
             Self.installed = nil
         }
@@ -815,11 +810,10 @@ private final class TranscriptTextView: UITextView {
         onChromeLayout?()
     }
 
-    /// A quick tap hilites a word. While this orientation leaves the keyboard
-    /// up, that tap must not take first responder: the command field would
-    /// resign and the keyboard would drop. A long press still becomes first
-    /// responder, so a selection in the log ends editing. Hide-on falls
-    /// through, so that tap takes first responder and the keyboard goes.
+    /// A tap must not take first responder while the command field is up and
+    /// this orientation leaves the keyboard up. Handing first responder to a
+    /// non-editable text view removes the keyboard with no slide. A long
+    /// press still falls through, and so does hide-on.
     override func becomeFirstResponder() -> Bool {
         if keepsCommandFieldForQuickTap() {
             return false
@@ -828,76 +822,78 @@ private final class TranscriptTextView: UITextView {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if let touch = touches.first {
-            noteQuickTapTouch(touch)
-        }
+        noteFingerDown()
         super.touchesBegan(touches, with: event)
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        noteQuickTapEnded(at: touches.first?.timestamp ?? CACurrentMediaTime())
+        noteFingerUp()
         super.touchesEnded(touches, with: event)
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        noteQuickTapEnded(at: touches.first?.timestamp ?? CACurrentMediaTime())
+        noteFingerUp()
         super.touchesCancelled(touches, with: event)
     }
 
-    /// True when this touch is a hilite tap and the command field is up.
-    /// Hide-on is never true: that tap is allowed to take first responder.
-    func keepsCommandFieldForQuickTap() -> Bool {
+    /// Hide is off, and this touch is not a selection press. The command
+    /// field should stay first responder. A plain tap does not have to be
+    /// classified first: the previous guard missed the resign when that
+    /// classification was false.
+    static func logTapShouldKeepCommandField() -> Bool {
         guard KeyboardHidePreferences.hidesKeyboardForCurrentInterface() == false else { return false }
-        guard quickTapIsCurrent() else { return false }
+        if installed?.selectionPressIsTakingFocus() == true {
+            return false
+        }
+        return true
+    }
+
+    /// The command field is still up, so a link under a tap is opened here.
+    /// Refusing first responder can skip the system's link action.
+    func keepsCommandFieldForQuickTap() -> Bool {
+        guard Self.logTapShouldKeepCommandField() else { return false }
         guard let window else { return false }
         return Self.commandFieldIsFirstResponder(in: window)
     }
 
-    static func quickTapKeepsCommandField() -> Bool {
-        installed?.keepsCommandFieldForQuickTap() ?? false
-    }
-
-    func noteQuickTapTouch(_ touch: UITouch) {
-        refreshQuickTapCeiling()
-        if quickTapFingerDown == false {
-            quickTapDownTime = touch.timestamp
-            quickTapFingerDown = true
-            quickTapEndedAt = nil
+    func noteFingerDown() {
+        if window != nil {
+            Self.installed = self
+        }
+        if fingerIsDown == false {
+            fingerDownAt = CACurrentMediaTime()
+            fingerIsDown = true
         }
     }
 
-    private func noteQuickTapEnded(at time: TimeInterval) {
-        guard quickTapFingerDown else { return }
-        let began = quickTapDownTime ?? time
-        quickTapFingerDown = false
-        if time - began < quickTapCeiling {
-            quickTapEndedAt = time
-        } else {
-            quickTapEndedAt = nil
-        }
+    private func noteFingerUp() {
+        fingerIsDown = false
+        fingerDownAt = nil
     }
 
-    /// Finger still down, short of a selection, or the lift was a moment ago.
-    /// The steal from a tap runs in that same turn, sometimes after
-    /// `touchesEnded`. A later swipe is outside this window.
-    private func quickTapIsCurrent() -> Bool {
+    /// The selection long press has begun, or the finger has been down long
+    /// enough that it is about to. A short tap stays false.
+    func selectionPressIsTakingFocus() -> Bool {
         let now = CACurrentMediaTime()
-        if quickTapFingerDown {
-            guard let began = quickTapDownTime else { return false }
-            return now - began < quickTapCeiling
+        var sawLongPress = false
+        for case let press as UILongPressGestureRecognizer in gestureRecognizers ?? [] {
+            sawLongPress = true
+            switch press.state {
+            case .began, .changed:
+                return true
+            case .possible:
+                let threshold = max(0.2, press.minimumPressDuration - 0.02)
+                if fingerIsDown, let down = fingerDownAt, now - down >= threshold {
+                    return true
+                }
+            default:
+                break
+            }
         }
-        guard let ended = quickTapEndedAt else { return false }
-        return now - ended < 0.05
-    }
-
-    /// Selection starts on a long press. The ceiling sits just under that
-    /// delay so the press can still take first responder.
-    private func refreshQuickTapCeiling() {
-        let durations = (gestureRecognizers ?? []).compactMap { recognizer -> TimeInterval? in
-            (recognizer as? UILongPressGestureRecognizer)?.minimumPressDuration
+        if sawLongPress == false, fingerIsDown, let down = fingerDownAt, now - down >= 0.45 {
+            return true
         }
-        guard let minimum = durations.min(), minimum > 0.2 else { return }
-        quickTapCeiling = max(0.25, minimum - 0.08)
+        return false
     }
 
     private static func commandFieldIsFirstResponder(in root: UIView) -> Bool {
@@ -968,6 +964,9 @@ private final class TranscriptTextView: UITextView {
     }
 
     override func layoutSubviews() {
+        if window != nil {
+            Self.installed = self
+        }
         let width = bounds.width
         if width > 1, laidWidth > 1, abs(width - laidWidth) >= 0.5 {
             onWidthWillChange?()
@@ -1969,9 +1968,9 @@ private struct TranscriptLog: UIViewRepresentable {
             publishHilite(anchor.word)
         }
 
-        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive _: UITouch) -> Bool {
             if gestureRecognizer === wordTap {
-                textView?.noteQuickTapTouch(touch)
+                textView?.noteFingerDown()
             }
             return true
         }
@@ -2268,16 +2267,27 @@ private struct LogGlobalFrameKey: PreferenceKey {
 }
 
 /// The command line, as opposed to a password field. A log tap uses the
-/// class to see which field is first responder.
-private final class CommandTextField: UITextField {}
+/// class to see which field is first responder, and refuses to resign while
+/// this orientation leaves the keyboard up.
+private final class CommandTextField: UITextField {
+    /// True when a log tap must leave this field first responder.
+    var shouldRemainFirstResponder: (() -> Bool)?
+
+    override func resignFirstResponder() -> Bool {
+        if shouldRemainFirstResponder?() == true {
+            return false
+        }
+        return super.resignFirstResponder()
+    }
+}
 
 /// Command line. A stock SwiftUI field resigns on Return and again when focus
 /// is written `true` while it is already first responder, so the keyboard
 /// drops and comes back. This field becomes first responder only on the
 /// transition into focus. Return resigns only when this orientation hides
 /// the keyboard. A long-press selection in the log, a swipe-down, and a
-/// hide-on send still end editing. A quick tap on the log does not, when
-/// this orientation leaves the keyboard up.
+/// hide-on send still end editing. A tap on the log does not, when this
+/// orientation leaves the keyboard up.
 ///
 /// Traits are set once. `textInputMode` is not overridden, and
 /// `becomeFirstResponder` is not called from `updateUIView`: doing either
@@ -2345,6 +2355,14 @@ private struct CommandLineField: UIViewRepresentable {
         coordinator.dismissOnSubmit = dismissOnSubmit
         coordinator.isFocused = $isFocused
         coordinator.textChanged = { text = $0 }
+        if let command = field as? CommandTextField {
+            // Live hide switch, not `dismissOnSubmit`: that flag can be a
+            // frame behind the drawer. A swipe clears `wantsFocus` first.
+            command.shouldRemainFirstResponder = { [weak coordinator] in
+                guard let coordinator, coordinator.wantsFocus else { return false }
+                return TranscriptTextView.logTapShouldKeepCommandField()
+            }
+        }
         // A programmatic clear (send) must not restart the input session.
         // Marked text is an in-progress composition; replacing it drops characters.
         if field.markedTextRange == nil, field.text != text {
@@ -2390,15 +2408,12 @@ private struct CommandLineField: UIViewRepresentable {
             textChanged(field.text ?? "")
         }
 
-        /// Hide-off: a quick tap on the log must not resign. Returning false
-        /// leaves this field first responder, so the keyboard never starts
-        /// to hide. A long-press selection, a swipe-down, and a hide-on send
-        /// still resign. Those are outside the quick-tap window, or they
-        /// have already cleared `wantsFocus`.
+        /// Hide-off: any log tap must not resign. Returning false leaves this
+        /// field first responder, so the keyboard never starts to hide. A
+        /// long-press selection still resigns. A swipe-down clears
+        /// `wantsFocus` before it resigns. Hide-on fails the keep check.
         func textFieldShouldEndEditing(_: UITextField) -> Bool {
-            if wantsFocus,
-               dismissOnSubmit == false,
-               TranscriptTextView.quickTapKeepsCommandField() {
+            if wantsFocus, TranscriptTextView.logTapShouldKeepCommandField() {
                 return false
             }
             return true
@@ -2852,13 +2867,13 @@ struct TranscriptView: View {
     private func playDeathFlash() {
         deathTask?.cancel()
         deathShown = true
-        withAnimation(.none) {
+        _ = withAnimation(.none) {
             deathOpacity = 1
         }
         deathTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(2))
             guard Task.isCancelled == false else { return }
-            withAnimation(.easeOut(duration: 0.8)) {
+            _ = withAnimation(.easeOut(duration: 0.8)) {
                 deathOpacity = 0
             }
             try? await Task.sleep(for: .milliseconds(800))
@@ -2886,12 +2901,12 @@ struct TranscriptView: View {
                 let message = awardQueue.messages.removeFirst()
                 awardText = message
                 awardShown = true
-                withAnimation(.none) {
+                _ = withAnimation(.none) {
                     awardOpacity = 1
                 }
                 try? await Task.sleep(for: .seconds(2))
                 if Task.isCancelled || generation != awardQueue.generation { return }
-                withAnimation(.easeOut(duration: 0.8)) {
+                _ = withAnimation(.easeOut(duration: 0.8)) {
                     awardOpacity = 0
                 }
                 try? await Task.sleep(for: .milliseconds(800))
@@ -3529,14 +3544,14 @@ private struct ActionPanel: View {
     private func light(_ command: String) {
         let token = (lightTokens[command] ?? 0) + 1
         lightTokens[command] = token
-        withAnimation(.easeOut(duration: 0.08)) {
-            litCommands.insert(command)
+        _ = withAnimation(.easeOut(duration: 0.08)) {
+            _ = litCommands.insert(command)
         }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
             guard lightTokens[command] == token else { return }
-            withAnimation(.easeOut(duration: 0.15)) {
-                litCommands.remove(command)
+            _ = withAnimation(.easeOut(duration: 0.15)) {
+                _ = litCommands.remove(command)
             }
         }
     }
