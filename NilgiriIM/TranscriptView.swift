@@ -2096,6 +2096,18 @@ private struct ColumnHeightKey: PreferenceKey {
     }
 }
 
+/// Global frame of the log between the bars. The right-edge swipe strip is
+/// only this tall, so it does not take taps from the name bar or Send.
+private struct LogGlobalFrameKey: PreferenceKey {
+    static var defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        let next = nextValue()
+        if next.width > 1, next.height > 1 {
+            value = next
+        }
+    }
+}
+
 /// Command line. A stock SwiftUI field resigns on Return and again when focus
 /// is written `true` while it is already first responder, so the keyboard
 /// drops and comes back. This field becomes first responder only on the
@@ -2362,6 +2374,13 @@ struct TranscriptView: View {
     @State private var settingsOpenRequest = false
     /// The left card has settled open. The command keyboard stays down until it closes.
     @State private var keyboardSettingsOpen = false
+    @StateObject private var actionSlots = ActionSlotStore()
+    /// Bumped by the accessibility action. Each change opens the right card.
+    @State private var actionSlotsOpenRequest = false
+    /// The right card has settled open. The command keyboard stays down until it closes.
+    @State private var actionSlotsOpen = false
+    /// Global frame of the log between the bars. The right-edge strip reads it.
+    @State private var logGlobalFrame: CGRect = .zero
     /// Launch cover. Starts up so the first frame cannot focus the command
     /// field; `adoptLaunchSplash` copies the parent flag in on appear.
     @State private var launchSplashUp = true
@@ -2445,6 +2464,19 @@ struct TranscriptView: View {
                                 .padding(.bottom, 8)
                         }
                     }
+                    .background {
+                        GeometryReader { proxy in
+                            Color.clear.preference(
+                                key: LogGlobalFrameKey.self,
+                                value: proxy.frame(in: .global)
+                            )
+                        }
+                        .allowsHitTesting(false)
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        skillActionButtons
+                    }
+                    .clipped()
                     Group {
                         if session.atMenu {
                             GameMenuPanel()
@@ -2493,6 +2525,14 @@ struct TranscriptView: View {
                 guard value > 1, abs(value - columnHeight) > 0.5 else { return }
                 columnHeight = value
             }
+            .onPreferenceChange(LogGlobalFrameKey.self) { frame in
+                guard frame.width > 1, frame.height > 1 else { return }
+                guard abs(frame.minX - logGlobalFrame.minX) > 0.5
+                    || abs(frame.minY - logGlobalFrame.minY) > 0.5
+                    || abs(frame.width - logGlobalFrame.width) > 0.5
+                    || abs(frame.height - logGlobalFrame.height) > 0.5 else { return }
+                logGlobalFrame = frame
+            }
             .preferredColorScheme(.dark)
             .toolbar(.hidden, for: .navigationBar)
             .overlay {
@@ -2505,6 +2545,16 @@ struct TranscriptView: View {
                     },
                     onOpenChange: { open in
                         keyboardSettingsCardChanged(open: open)
+                    }
+                )
+            }
+            .overlay {
+                ActionSlotsDrawer(
+                    store: actionSlots,
+                    openRequest: $actionSlotsOpenRequest,
+                    logFrame: logGlobalFrame,
+                    onOpenChange: { open in
+                        actionSlotsCardChanged(open: open)
                     }
                 )
             }
@@ -2527,6 +2577,9 @@ struct TranscriptView: View {
             }
             .accessibilityAction(named: Text("Keyboard settings")) {
                 settingsOpenRequest.toggle()
+            }
+            .accessibilityAction(named: Text("Action buttons")) {
+                actionSlotsOpenRequest.toggle()
             }
             .onChange(of: keyboardPrefs.hideInPortrait) { _, _ in
                 guard KeyboardHidePreferences.interfaceIsPortrait() else { return }
@@ -2763,7 +2816,7 @@ struct TranscriptView: View {
     }
 
     /// The player swiped the keyboard away, left the command field for the menu,
-    /// or opened the settings card.
+    /// or opened a side card.
     private func releaseCommandKeyboard() {
         keyboardOrientationToken += 1
         restoringKeyboard = false
@@ -2792,10 +2845,10 @@ struct TranscriptView: View {
         }
     }
 
-    /// Launch cover is up, or the left settings card is open. The command
-    /// field must not take first responder until both are clear.
+    /// Launch cover is up, or a side card is open. The command
+    /// field must not take first responder until those are clear.
     private var commandKeyboardPaused: Bool {
-        launchSplashUp || keyboardSettingsOpen
+        launchSplashUp || keyboardSettingsOpen || actionSlotsOpen
     }
 
     /// Copies the launch cover into `launchSplashUp`. While it is up the
@@ -2822,10 +2875,20 @@ struct TranscriptView: View {
         }
     }
 
+    /// The right card settled open or closed. Same keyboard rule as the left card.
+    private func actionSlotsCardChanged(open: Bool) {
+        actionSlotsOpen = open
+        if open {
+            releaseCommandKeyboard()
+        } else {
+            showCommandKeyboardIfPreferred()
+        }
+    }
+
     /// The switch for whichever orientation is on screen: portrait or landscape.
     /// Off makes the command field first responder and keeps it there.
     /// A swipe-away clears `keyboardHeld`, and that sticks until the next show.
-    /// The launch splash and an open settings card are not a show.
+    /// The launch splash and an open side card are not a show.
     private func showCommandKeyboardIfPreferred() {
         guard commandKeyboardPaused == false else { return }
         guard session.atMenu == false else { return }
@@ -2876,6 +2939,36 @@ struct TranscriptView: View {
         await session.send()
         if session.command.isEmpty {
             session.command = draft
+        }
+    }
+
+    /// The slot's verb, plus the hilited word when there is one.
+    /// A blank slot does not send. The welcome menu is not a target.
+    private func sendSkill(_ action: SkillAction) async {
+        guard session.atMenu == false else { return }
+        guard let text = action.command(target: session.hilitedWord) else { return }
+        await sendDirection(text)
+    }
+
+    /// Assigned skills, packed to the bottom of the log, just above the command
+    /// bar. The trailing gap stays clear of the right-edge swipe strip: that
+    /// strip overlaps the safe area by at most 24 points.
+    @ViewBuilder
+    private var skillActionButtons: some View {
+        if session.atMenu == false {
+            VStack(alignment: .trailing, spacing: 0) {
+                HStack(alignment: .bottom, spacing: 0) {
+                    SkillActionStack(slots: actionSlots.slots, target: session.hilitedWord) { action in
+                        Task { await sendSkill(action) }
+                    }
+                    Color.clear
+                        .frame(width: 28, height: 1)
+                        .allowsHitTesting(false)
+                }
+                Color.clear
+                    .frame(width: 1, height: 8)
+                    .allowsHitTesting(false)
+            }
         }
     }
 
@@ -3264,6 +3357,95 @@ private struct ActionPanel: View {
             guard lightTokens[command] == token else { return }
             withAnimation(.easeOut(duration: 0.15)) {
                 litCommands.remove(command)
+            }
+        }
+    }
+}
+
+/// Assigned skills, stacked above the command bar. Blank slots are absent.
+/// The letter is a bold system face. The plate is the bar frost, and a tap
+/// lights it the same way a compass letter does: white for a quarter second.
+private struct SkillActionStack: View {
+    var slots: [SkillAction]
+    /// Hilited word, spoken with the verb. The tap reads `hilitedWord` itself.
+    var target: String?
+    var send: (SkillAction) -> Void
+
+    /// Slots whose letters are lit. A second tap of the same slot restarts a quarter second.
+    @State private var litSlots: Set<Int> = []
+    /// Per-slot generation so an earlier timer cannot put the light out early.
+    @State private var lightTokens: [Int: Int] = [:]
+
+    private struct Row: Identifiable {
+        let index: Int
+        let action: SkillAction
+        let letter: String
+        var id: Int { index }
+    }
+
+    private var rows: [Row] {
+        var packed: [Row] = []
+        for (index, action) in slots.enumerated() {
+            guard let letter = action.letter else { continue }
+            packed.append(Row(index: index, action: action, letter: letter))
+        }
+        return packed
+    }
+
+    var body: some View {
+        let packed = rows
+        if packed.isEmpty == false {
+            ViewThatFits(in: .vertical) {
+                column(packed, side: 44, spacing: 4, fontSize: 17)
+                column(packed, side: 36, spacing: 2, fontSize: 15)
+                column(packed, side: 32, spacing: 2, fontSize: 14)
+            }
+        }
+    }
+
+    private func column(
+        _ packed: [Row],
+        side: CGFloat,
+        spacing: CGFloat,
+        fontSize: CGFloat
+    ) -> some View {
+        VStack(spacing: spacing) {
+            ForEach(packed) { row in
+                let lit = litSlots.contains(row.index)
+                Button {
+                    light(row.index)
+                    send(row.action)
+                } label: {
+                    Text(verbatim: row.letter)
+                        .font(.system(size: fontSize, weight: .bold))
+                        .foregroundStyle(lit ? Color.white : ink)
+                        .frame(width: side, height: side)
+                        .background {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color.white.opacity(lit ? 0.42 : 0))
+                                .padding(3)
+                        }
+                        .background(Chrome.barBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(row.action.command(target: target) ?? row.action.rawValue)
+            }
+        }
+    }
+
+    /// Brighten this letter for a quarter second. The button still sends the action.
+    private func light(_ index: Int) {
+        let token = (lightTokens[index] ?? 0) + 1
+        lightTokens[index] = token
+        withAnimation(.easeOut(duration: 0.08)) {
+            litSlots.insert(index)
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard lightTokens[index] == token else { return }
+            withAnimation(.easeOut(duration: 0.15)) {
+                litSlots.remove(index)
             }
         }
     }
