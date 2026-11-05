@@ -331,6 +331,12 @@ enum HMVPrompt {
             ) != nil
         }
 
+        /// The prompt, or a condition forced from the incapacitated sentence.
+        var isIncapacitated: Bool {
+            guard let condition else { return false }
+            return condition.range(of: "incap", options: .caseInsensitive) != nil
+        }
+
         static func parse(_ raw: String) -> Vitals? {
             let parts = raw.split(separator: ",", omittingEmptySubsequences: false)
             guard parts.count >= 3,
@@ -456,10 +462,32 @@ enum HMVPrompt {
         return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
     }()
 
+    /// `You are incapacitated and will slowly die if not aided.`
+    /// The comma before "if" is optional. Extra words on that same line are
+    /// not this sentence. A prompt fused onto the line is ignored, and the
+    /// sentence itself is left in the transcript.
+    static func announcesIncapacitated(_ raw: String) -> Bool {
+        let (plain, _) = strippingANSI(strip(raw).text)
+        return plain.split(whereSeparator: \.isNewline).contains { isIncapacitatedSentence($0) }
+    }
+
     /// The condition words, or nil when the prompt had none.
     private static func conditionText(_ raw: Substring) -> String? {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : String(text)
+    }
+
+    private static func isIncapacitatedSentence(_ raw: Substring) -> Bool {
+        var folded = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while let last = folded.last, last == "." || last == "!" {
+            folded.removeLast()
+        }
+        folded = folded.trimmingCharacters(in: .whitespacesAndNewlines)
+        let collapsed = folded
+            .replacingOccurrences(of: ",", with: "")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        return collapsed == "you are incapacitated and will slowly die if not aided"
     }
 
     /// Spaces and tabs after the prompt. Color codes between `>` and those
