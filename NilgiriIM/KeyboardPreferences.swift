@@ -2,8 +2,10 @@ import SwiftUI
 import UIKit
 
 /// Whether sending a command, or turning the window, dismisses the keyboard.
+/// Also whether the input line keeps the last command as grey placeholder text.
 /// Missing keys keep the device default. iPhone hides in landscape only.
-/// iPad keeps the keyboard up in both orientations. Moving a switch writes the key.
+/// iPad keeps the keyboard up in both orientations. Keep last command defaults off.
+/// Moving a switch writes the key.
 final class KeyboardHidePreferences: ObservableObject {
     @Published var hideInPortrait: Bool {
         didSet { UserDefaults.standard.set(hideInPortrait, forKey: Key.portrait) }
@@ -13,9 +15,16 @@ final class KeyboardHidePreferences: ObservableObject {
         didSet { UserDefaults.standard.set(hideInLandscape, forKey: Key.landscape) }
     }
 
+    /// Grey placeholder of the last command sent from the input line.
+    /// Return on an empty field sends that text. Off leaves the placeholder blank.
+    @Published var keepLastCommand: Bool {
+        didSet { UserDefaults.standard.set(keepLastCommand, forKey: Key.keepLastCommand) }
+    }
+
     private enum Key {
         static let portrait = "im.hideKeyboardPortrait"
         static let landscape = "im.hideKeyboardLandscape"
+        static let keepLastCommand = "im.keepLastCommand"
     }
 
     init() {
@@ -23,6 +32,7 @@ final class KeyboardHidePreferences: ObservableObject {
         let phone = UIDevice.current.userInterfaceIdiom == .phone
         hideInPortrait = Self.stored(defaults, Key.portrait, fallback: false)
         hideInLandscape = Self.stored(defaults, Key.landscape, fallback: phone)
+        keepLastCommand = Self.stored(defaults, Key.keepLastCommand, fallback: false)
     }
 
     func hidesKeyboard(isPortrait: Bool) -> Bool {
@@ -107,9 +117,9 @@ struct WindowPortraitProbe: UIViewRepresentable {
 }
 
 /// Dark grey card on the left edge. A rightward swipe from that edge opens it.
-/// Portrait and landscape keyboard switches stay at the top. Report issues,
-/// the newbie guide, and About Nilgiri IM open in Safari. Unlink, while the
-/// player is in the game, sits at the bottom of the card.
+/// Portrait and landscape keyboard switches, and Keep last command, stay at
+/// the top. Report issues, the newbie guide, and About Nilgiri IM open in
+/// Safari. Unlink, while the player is in the game, sits at the bottom of the card.
 struct KeyboardSettingsDrawer: View {
     @ObservedObject var preferences: KeyboardHidePreferences
     /// Toggled by the accessibility action. Each change opens the card.
@@ -212,6 +222,7 @@ struct KeyboardSettingsDrawer: View {
                     .foregroundStyle(Color(white: 0.62))
                 Toggle("Hide keyboard in portrait mode", isOn: $preferences.hideInPortrait)
                 Toggle("Hide keyboard in landscape mode", isOn: $preferences.hideInLandscape)
+                Toggle("Keep last command", isOn: $preferences.keepLastCommand)
                 VStack(alignment: .leading, spacing: 12) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("To report issues, take a screenshot and you should have an option to \"Share Beta Feedback\" or use this link to")

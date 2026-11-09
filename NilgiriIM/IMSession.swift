@@ -444,13 +444,23 @@ final class IMSession: ObservableObject {
         cancelCharacterCreation()
     }
 
-    func send() async {
-        // The welcome menu is the panel. A typed line would answer it.
+    /// Posts the command line. `fallback` is sent only when the field is blank,
+    /// and it is not written into the field, so a repeated command can stay
+    /// a grey placeholder. The welcome menu is the panel; a typed line would
+    /// answer it.
+    func send(fallback: String? = nil) async {
         guard atMenu == false else { return }
         menuExit = false
-        let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let typed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = typed.isEmpty
+            ? (fallback?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+            : typed
         guard text.isEmpty == false else { return }
-        command = ""
+        // Already blank when repeating a placeholder. Leaving `command` alone
+        // avoids a field update that would restart the keyboard session.
+        if command.isEmpty == false {
+            command = ""
+        }
         do {
             let data = try await post("/input", ["text": text])
             noteMenuFlag(data)
