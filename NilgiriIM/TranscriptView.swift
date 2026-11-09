@@ -3151,7 +3151,11 @@ struct TranscriptView: View {
         if session.atMenu == false {
             VStack(alignment: .trailing, spacing: 0) {
                 HStack(alignment: .bottom, spacing: 0) {
-                    SkillActionStack(slots: actionSlots.slots, target: session.hilitedWord) { action in
+                    SkillActionStack(
+                        slots: actionSlots.slots,
+                        target: session.hilitedWord,
+                        hideLabels: keyboardPrefs.hideHotButtonLabels
+                    ) { action in
                         Task { await sendSkill(action) }
                     }
                     Color.clear
@@ -3189,7 +3193,7 @@ struct TranscriptView: View {
     private var inputBar: some View {
         VStack(spacing: 0) {
             if actionPanelShown {
-                ActionPanel { command in
+                ActionPanel(hideLabels: keyboardPrefs.hideHotButtonLabels) { command in
                     Task { await sendDirection(command) }
                 }
                 Rectangle()
@@ -3489,8 +3493,11 @@ private struct GameMenuPanel: View {
 
 /// One row of compass commands on the input bar's frost. Each tap posts the
 /// full direction through `session.send()`, the same as typing it. The pressed
-/// letter stays lit for a quarter second, then returns to ink.
+/// letter stays lit for a quarter second, then returns to ink. Hiding labels
+/// drops the letter only; the plate still lights and the tap still sends.
 private struct ActionPanel: View {
+    /// The letter is invisible. The row, the press light, and the tap stay.
+    var hideLabels: Bool
     var send: (String) -> Void
 
     private struct Direction: Identifiable {
@@ -3517,9 +3524,13 @@ private struct ActionPanel: View {
         HStack(spacing: 0) {
             ForEach(Self.directions) { direction in
                 let lit = litCommands.contains(direction.command)
-                Button(direction.label) {
+                Button {
                     light(direction.command)
                     send(direction.command)
+                } label: {
+                    // Opacity stops at the letter. The press light is on the button.
+                    Text(verbatim: direction.label)
+                        .opacity(hideLabels ? 0 : 1)
                 }
                 .buttonStyle(.plain)
                 .font(.system(.body, design: .monospaced))
@@ -3564,10 +3575,13 @@ private struct ActionPanel: View {
 /// Assigned skills, stacked above the command bar. Blank slots are absent.
 /// The letter is a bold system face. The plate is the bar frost, and a tap
 /// lights it the same way a compass letter does: white for a quarter second.
+/// A hidden label leaves that plate and the light in place.
 private struct SkillActionStack: View {
     var slots: [SkillAction]
     /// Hilited word, spoken with the verb. The tap reads `hilitedWord` itself.
     var target: String?
+    /// The letter is invisible. The frost plate and the press light stay.
+    var hideLabels: Bool
     var send: (SkillAction) -> Void
 
     /// Slots whose letters are lit. A second tap of the same slot restarts a quarter second.
@@ -3618,6 +3632,8 @@ private struct SkillActionStack: View {
                     Text(verbatim: row.letter)
                         .font(.system(size: fontSize, weight: .bold))
                         .foregroundStyle(lit ? Color.white : ink)
+                        // Opacity stops at the letter. The frost and the press light sit outside it.
+                        .opacity(hideLabels ? 0 : 1)
                         .frame(width: side, height: side)
                         .background {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
