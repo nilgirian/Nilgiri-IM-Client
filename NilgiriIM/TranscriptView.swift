@@ -3189,7 +3189,7 @@ struct TranscriptView: View {
     private var inputBar: some View {
         VStack(spacing: 0) {
             if actionPanelShown {
-                ActionPanel { command in
+                ActionPanel(exits: session.roomExits) { command in
                     Task { await sendDirection(command) }
                 }
                 Rectangle()
@@ -3490,7 +3490,11 @@ private struct GameMenuPanel: View {
 /// One row of compass commands on the input bar's frost. Each tap posts the
 /// full direction through `session.send()`, the same as typing it. The pressed
 /// letter stays lit for a quarter second, then returns to ink.
+/// Until an exits listing arrives, every letter is shown. After that, an open
+/// exit shows its letter, a closed door is grey and does not send, and a
+/// direction with no exit keeps a blank slot.
 private struct ActionPanel: View {
+    var exits: RoomExitListing?
     var send: (String) -> Void
 
     private struct Direction: Identifiable {
@@ -3516,28 +3520,49 @@ private struct ActionPanel: View {
     var body: some View {
         HStack(spacing: 0) {
             ForEach(Self.directions) { direction in
-                let lit = litCommands.contains(direction.command)
-                Button(direction.label) {
-                    light(direction.command)
-                    send(direction.command)
-                }
-                .buttonStyle(.plain)
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(lit ? Color.white : ink)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 10)
-                .background {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color.white.opacity(lit ? 0.42 : 0))
-                        .padding(.horizontal, 3)
-                        .padding(.vertical, 3)
-                }
-                .contentShape(Rectangle())
-                .accessibilityLabel(direction.command)
+                directionButton(direction)
             }
         }
         .padding(.horizontal, 4)
         .padding(.top, 4)
+    }
+
+    /// The slot width stays `maxWidth: .infinity` for every direction, so a
+    /// blank keeps the same place as a letter.
+    private func directionButton(_ direction: Direction) -> some View {
+        let known = exits != nil
+        let door = exits?.door(for: direction.command)
+        let showsLetter = known == false || door != nil
+        let usable = known == false || door == .open
+        let lit = usable && litCommands.contains(direction.command)
+        return Button(direction.label) {
+            guard usable else { return }
+            light(direction.command)
+            send(direction.command)
+        }
+        .buttonStyle(.plain)
+        .disabled(usable == false)
+        .font(.system(.body, design: .monospaced))
+        .foregroundStyle(letterInk(closed: door == .closed, lit: lit))
+        .opacity(showsLetter ? 1 : 0)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(lit ? 0.42 : 0))
+                .padding(.horizontal, 3)
+                .padding(.vertical, 3)
+        }
+        .contentShape(Rectangle())
+        .accessibilityLabel(direction.command)
+        .accessibilityHidden(showsLetter == false)
+    }
+
+    /// Closed doors stay readable and grey. A lit open letter is white.
+    private func letterInk(closed: Bool, lit: Bool) -> Color {
+        if lit { return .white }
+        if closed { return ink.opacity(0.38) }
+        return ink
     }
 
     /// Brighten this letter for a quarter second. The button still sends the command.
