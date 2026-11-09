@@ -940,6 +940,11 @@ private final class TranscriptTextView: UITextView {
     /// Link colour, selection tint, and the hilite wash. The glyphs themselves
     /// are recoloured when the document store rebuilds.
     func applyMatrixChrome(enabled: Bool) {
+        // Assigning `linkTextAttributes` or `tintColor` invalidates TextKit 1
+        // layout (`allowsNonContiguousLayout`). SwiftUI calls updateUIView after
+        // the splash, on scroll (`onNearBottom`), and when the command field
+        // changes; doing this every time blanks the log and makes scrolling jump.
+        guard let rules, rules.matrixEnabled != enabled else { return }
         let ink = MatrixShade.display(UIColor(white: 0.78, alpha: 1), enabled: enabled)
         tintColor = ink
         let link = MatrixShade.display(
@@ -951,7 +956,6 @@ private final class TranscriptTextView: UITextView {
             .underlineStyle: NSUnderlineStyle.single.rawValue,
             .underlineColor: link
         ]
-        guard let rules, rules.matrixEnabled != enabled else { return }
         rules.matrixEnabled = enabled
         setNeedsDisplay()
     }
