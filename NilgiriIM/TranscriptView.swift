@@ -252,6 +252,7 @@ private final class TranscriptDocumentStore {
     private(set) var markers: [DocMarker] = []
 
     private var fontSize: CGFloat = -1
+    private var matrix = false
     private var enlargeCommunication = false
     /// Columns used when a portrait communication line is drawn larger.
     /// Normal lines stay at 80. A scroll frame does not change this.
@@ -291,6 +292,7 @@ private final class TranscriptDocumentStore {
         fontSize: CGFloat,
         width: CGFloat,
         enlargeCommunication: Bool,
+        matrix: Bool,
         carry: ColourCarryCache
     ) -> TranscriptEdit? {
         carry.prepare(lines)
@@ -300,12 +302,14 @@ private final class TranscriptDocumentStore {
         if sameStorage(lines, held),
            abs(self.fontSize - fontSize) < 0.01,
            self.enlargeCommunication == enlargeCommunication,
-           self.communicationColumns == columns {
+           self.communicationColumns == columns,
+           self.matrix == matrix {
             return nil
         }
         let styleChanged = abs(self.fontSize - fontSize) >= 0.01
             || self.enlargeCommunication != enlargeCommunication
             || self.communicationColumns != columns
+            || self.matrix != matrix
         let signatures = lines.map(signature)
         let lineIDs = lines.map(\.id)
         var index = 0
@@ -334,6 +338,7 @@ private final class TranscriptDocumentStore {
             width: width,
             communicationColumns: columns,
             enlargeCommunication: enlargeCommunication,
+            matrix: matrix,
             carry: carry,
             signatures: signatures,
             lineIDs: lineIDs
@@ -370,6 +375,7 @@ private final class TranscriptDocumentStore {
         width: CGFloat,
         communicationColumns: Int,
         enlargeCommunication: Bool,
+        matrix: Bool,
         carry: ColourCarryCache,
         signatures: [Int],
         lineIDs: [String]
@@ -378,6 +384,7 @@ private final class TranscriptDocumentStore {
         self.slotWidth = width
         self.communicationColumns = communicationColumns
         self.enlargeCommunication = enlargeCommunication
+        self.matrix = matrix
         if index == 0 {
             working = NSMutableAttributedString()
             markers = []
@@ -417,7 +424,7 @@ private final class TranscriptDocumentStore {
             let stamp = line.disconnectAt.map { DisconnectSeparator.stamp(at: $0) } ?? line.text
             working.append(NSAttributedString(string: stamp, attributes: [
                 .font: UIFont.preferredFont(forTextStyle: .caption1),
-                .foregroundColor: UIColor.secondaryLabel,
+                .foregroundColor: MatrixShade.display(.secondaryLabel, enabled: matrix),
                 .paragraphStyle: separatorParagraph
             ]))
             lastMudFontSize = fontSize
@@ -436,7 +443,8 @@ private final class TranscriptDocumentStore {
                 fontSize: size,
                 columns: columns(forDisplaySize: size, base: fontSize),
                 initial: carry.startState(for: line.id),
-                wrap: wrap
+                wrap: wrap,
+                matrix: matrix
             ))
             if piece.length > 0 {
                 piece.addAttribute(
@@ -480,7 +488,10 @@ private final class TranscriptDocumentStore {
         let font: UIFont = separator
             ? .preferredFont(forTextStyle: .caption1)
             : .monospacedSystemFont(ofSize: fontSize, weight: .regular)
-        let color: UIColor = separator ? .secondaryLabel : UIColor(white: 0.78, alpha: 1)
+        let color = MatrixShade.display(
+            separator ? .secondaryLabel : UIColor(white: 0.78, alpha: 1),
+            enabled: matrix
+        )
         return NSAttributedString(string: "\n", attributes: [
             .font: font,
             .foregroundColor: color,
@@ -634,6 +645,8 @@ private enum TranscriptLinkOpener {
 private final class TranscriptLayoutManager: NSLayoutManager {
     var separatorRanges: [NSRange] = []
     private(set) var hiliteRange: NSRange?
+    /// Matrix Mode. The yellow wash becomes a green of similar brightness.
+    var matrixEnabled = false
     private var drawingRules = false
     private static let hiliteFill = UIColor(red: 0.98, green: 0.80, blue: 0.22, alpha: 0.45)
 
@@ -659,7 +672,7 @@ private final class TranscriptLayoutManager: NSLayoutManager {
         let glyphs = glyphRange(forCharacterRange: range, actualCharacterRange: nil)
         let overlap = NSIntersectionRange(glyphs, glyphsToShow)
         guard overlap.length > 0 else { return }
-        Self.hiliteFill.setFill()
+        MatrixShade.display(Self.hiliteFill, enabled: matrixEnabled).setFill()
         enumerateEnclosingRects(
             forGlyphRange: overlap,
             withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
@@ -700,7 +713,7 @@ private final class TranscriptLayoutManager: NSLayoutManager {
             }
         }
         guard path.isEmpty == false else { return }
-        UIColor.secondaryLabel.setStroke()
+        MatrixShade.display(.secondaryLabel, enabled: matrixEnabled).setStroke()
         path.lineWidth = 1
         path.stroke()
     }
@@ -924,6 +937,25 @@ private final class TranscriptTextView: UITextView {
         layoutManager as? TranscriptLayoutManager
     }
 
+    /// Link colour, selection tint, and the hilite wash. The glyphs themselves
+    /// are recoloured when the document store rebuilds.
+    func applyMatrixChrome(enabled: Bool) {
+        let ink = MatrixShade.display(UIColor(white: 0.78, alpha: 1), enabled: enabled)
+        tintColor = ink
+        let link = MatrixShade.display(
+            UIColor(red: 0.55, green: 0.82, blue: 1, alpha: 1),
+            enabled: enabled
+        )
+        linkTextAttributes = [
+            .foregroundColor: link,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .underlineColor: link
+        ]
+        guard let rules, rules.matrixEnabled != enabled else { return }
+        rules.matrixEnabled = enabled
+        setNeedsDisplay()
+    }
+
     /// TextKit 1 lays glyphs out on demand (`allowsNonContiguousLayout`).
     /// `contentSize` is then only the estimate, short of a wrapped +6pt line,
     /// and the next row (the disconnect stamp) is placed on top of that line.
@@ -1088,6 +1120,8 @@ private struct TranscriptLog: UIViewRepresentable {
     /// White launch cover. While it is up the log is not hit-testable, so a
     /// scroll under it is layout, and the bottom pin is put back when it ends.
     var launchSplashVisible: Bool
+    /// Matrix Mode. A change restyles colours already in the log.
+    var matrix: Bool
     var onNearBottom: (Bool) -> Void
     var onRevealFinished: (String) -> Void
     /// Hilited word, or nil when the hilite clears. The line text is not edited.
@@ -1167,6 +1201,7 @@ private struct TranscriptLog: UIViewRepresentable {
         coordinator.lines = lines
         let splashEnded = coordinator.launchSplashVisible && launchSplashVisible == false
         coordinator.launchSplashVisible = launchSplashVisible
+        coordinator.matrix = matrix
         if splashEnded {
             // Arm the hold before text or insets move the offset. Those
             // callbacks look like a reader scroll once the cover flag drops.
@@ -1231,6 +1266,7 @@ private struct TranscriptLog: UIViewRepresentable {
         /// Starts covered. `makeUIView` copies the real flag before the first
         /// layout, so a launch scroll is not treated as the reader leaving.
         var launchSplashVisible = true
+        var matrix = false
         var nearBottom = true
         var stickToBottom = true
         var holdUntil = Date.distantPast
@@ -1609,11 +1645,13 @@ private struct TranscriptLog: UIViewRepresentable {
                 extendBottomHold(by: 0.6)
             }
             portraitEnlarged = portrait
+            textView.applyMatrixChrome(enabled: matrix)
             guard let edit = store.update(
                 lines: lines,
                 fontSize: font,
                 width: textView.bounds.width,
                 enlargeCommunication: portrait,
+                matrix: matrix,
                 carry: carry
             ) else { return }
             apply(edit, to: textView)
@@ -2297,6 +2335,8 @@ private struct CommandLineField: UIViewRepresentable {
     @Binding var isFocused: Bool
     /// Hide switch for the orientation on screen. Return dismisses only then.
     var dismissOnSubmit: Bool
+    /// Matrix Mode. The field's ink follows it without rewriting the command.
+    var matrix: Bool
     var onSubmit: () -> Void
 
     func makeUIView(context: Context) -> UITextField {
@@ -2306,8 +2346,6 @@ private struct CommandLineField: UIViewRepresentable {
             ofSize: UIFont.preferredFont(forTextStyle: .body).pointSize,
             weight: .regular
         )
-        field.textColor = UIColor(white: 0.78, alpha: 1)
-        field.tintColor = field.textColor
         field.backgroundColor = .clear
         field.borderStyle = .none
         field.keyboardType = .asciiCapable
@@ -2316,11 +2354,8 @@ private struct CommandLineField: UIViewRepresentable {
         field.spellCheckingType = .no
         field.autocapitalizationType = .none
         field.keyboardAppearance = .dark
-        field.attributedPlaceholder = NSAttributedString(
-            string: "command",
-            attributes: [.foregroundColor: UIColor(white: 0.78, alpha: 0.45)]
-        )
         field.accessibilityLabel = "command"
+        applyInk(field, enabled: matrix)
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         field.setContentHuggingPriority(.defaultLow, for: .horizontal)
         field.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -2353,6 +2388,10 @@ private struct CommandLineField: UIViewRepresentable {
         let coordinator = context.coordinator
         coordinator.onSubmit = onSubmit
         coordinator.dismissOnSubmit = dismissOnSubmit
+        if coordinator.matrix != matrix {
+            coordinator.matrix = matrix
+            applyInk(field, enabled: matrix)
+        }
         coordinator.isFocused = $isFocused
         coordinator.textChanged = { text = $0 }
         if let command = field as? CommandTextField {
@@ -2394,11 +2433,24 @@ private struct CommandLineField: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
+    /// Ink and the placeholder tint. The placeholder string stays "command".
+    private func applyInk(_ field: UITextField, enabled: Bool) {
+        let ink = MatrixShade.display(UIColor(white: 0.78, alpha: 1), enabled: enabled)
+        let faint = MatrixShade.display(UIColor(white: 0.78, alpha: 0.45), enabled: enabled)
+        field.textColor = ink
+        field.tintColor = ink
+        field.attributedPlaceholder = NSAttributedString(
+            string: "command",
+            attributes: [.foregroundColor: faint]
+        )
+    }
+
     final class Coordinator: NSObject, UITextFieldDelegate {
         var onSubmit: () -> Void = {}
         var textChanged: (String) -> Void = { _ in }
         var isFocused: Binding<Bool> = .constant(false)
         var dismissOnSubmit = false
+        var matrix: Bool?
         var wantsFocus = false
         var applyingText = false
         var becoming = false
@@ -2487,6 +2539,7 @@ private struct CommandLineField: UIViewRepresentable {
 /// Death sentence, horizontally centered in the middle of the top two-thirds.
 /// The red is translucent so the log shows through, and the flash does not take taps.
 private struct DeathFlash: View {
+    @ObservedObject private var matrixMode = MatrixMode.shared
     var opacity: Double
 
     var body: some View {
@@ -2495,7 +2548,7 @@ private struct DeathFlash: View {
             Text("YOU ARE DEAD!")
                 .font(.system(size: size, weight: .bold))
                 .multilineTextAlignment(.center)
-                .foregroundStyle(Color.red.opacity(0.7))
+                .foregroundStyle(MatrixShade.display(Color.red.opacity(0.7), enabled: matrixMode.enabled))
                 .lineLimit(3)
                 .minimumScaleFactor(0.4)
                 .padding(.horizontal, 12)
@@ -2515,6 +2568,7 @@ private struct DeathFlash: View {
 /// `+87 XP!` or `LEVEL!`. Matches `DeathFlash` except the color is yellow.
 /// The flash does not take taps.
 private struct AwardFlash: View {
+    @ObservedObject private var matrixMode = MatrixMode.shared
     var message: String
     var opacity: Double
 
@@ -2524,7 +2578,7 @@ private struct AwardFlash: View {
             Text(message)
                 .font(.system(size: size, weight: .bold))
                 .multilineTextAlignment(.center)
-                .foregroundStyle(Color.yellow.opacity(0.7))
+                .foregroundStyle(MatrixShade.display(Color.yellow.opacity(0.7), enabled: matrixMode.enabled))
                 .lineLimit(1)
                 .minimumScaleFactor(0.4)
                 .padding(.horizontal, 12)
@@ -2557,6 +2611,7 @@ struct TranscriptView: View {
     /// this flag; the command field reads it and resigns only when it drops.
     @State private var commandFocused = false
     @StateObject private var keyboardPrefs = KeyboardHidePreferences()
+    @StateObject private var matrixMode = MatrixMode.shared
     /// The command field should be first responder. Set when this orientation
     /// keeps the keyboard, cleared when the player swipes it away or a switch hides it.
     @State private var keyboardHeld = false
@@ -2629,6 +2684,7 @@ struct TranscriptView: View {
                     revealPending: session.pendingResumeReveal,
                     resumeSeparatorID: session.resumeSeparatorID,
                     launchSplashVisible: launchSplashVisible,
+                    matrix: matrixMode.enabled,
                     onNearBottom: { near in
                         if nearBottom != near {
                             nearBottom = near
@@ -2731,6 +2787,7 @@ struct TranscriptView: View {
             .overlay {
                 KeyboardSettingsDrawer(
                     preferences: keyboardPrefs,
+                    matrixMode: matrixMode,
                     openRequest: $settingsOpenRequest,
                     showsUnlink: session.atMenu == false,
                     onUnlink: {
@@ -2842,11 +2899,12 @@ struct TranscriptView: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(session.character ?? "IM")
                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundStyle(Color.primary.matrix)
                 .lineLimit(1)
             if let label = session.vitals?.label {
                 Text(label)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.yellow)
+                    .foregroundStyle(Color.yellow.matrix)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                     .layoutPriority(1)
@@ -2854,7 +2912,7 @@ struct TranscriptView: View {
             if let alarm = session.vitals?.alarm {
                 Text(alarm)
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Color.red.matrix)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
                     .layoutPriority(2)
@@ -3173,7 +3231,7 @@ struct TranscriptView: View {
         } label: {
             Text("↓ New lines")
                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                .foregroundStyle(ink)
+                .foregroundStyle(ink.matrix)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
                 .background(Chrome.barBackground, in: Capsule())
@@ -3199,7 +3257,7 @@ struct TranscriptView: View {
             HStack(spacing: 0) {
                 Text(">")
                     .font(.system(.body, design: .monospaced))
-                    .foregroundStyle(ink)
+                    .foregroundStyle(ink.matrix)
                     .padding(.trailing, 8)
                 // One line tall, same as the Say/Send targets, so the bar does not
                 // take the height proposed to this safe-area inset. Focus is not
@@ -3210,6 +3268,7 @@ struct TranscriptView: View {
                     dismissOnSubmit: keyboardPrefs.hidesKeyboard(
                         isPortrait: KeyboardHidePreferences.interfaceIsPortrait()
                     ),
+                    matrix: matrixMode.enabled,
                     onSubmit: { Task { await sendCommand() } }
                 )
                     .onAppear {
@@ -3280,7 +3339,7 @@ struct TranscriptView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(ink)
+        .foregroundStyle(ink.matrix)
         .disabled(commandIsBlank)
         .accessibilityLabel(label)
     }
@@ -3294,6 +3353,7 @@ struct TranscriptView: View {
 /// so the last lines stay above the buttons.
 private struct GameMenuPanel: View {
     @EnvironmentObject private var session: IMSession
+    @ObservedObject private var matrixMode = MatrixMode.shared
     @State private var changingPassword = false
     @State private var currentPassword = ""
     @State private var newPassword = ""
@@ -3314,7 +3374,7 @@ private struct GameMenuPanel: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .foregroundStyle(ink)
+        .foregroundStyle(MatrixShade.display(ink, enabled: matrixMode.enabled))
         .background(Chrome.barBackground, ignoresSafeAreaEdges: .bottom)
         .anchorPreference(key: BottomBarBoundsKey.self, value: .bounds) { $0 }
         .background {
@@ -3329,6 +3389,7 @@ private struct GameMenuPanel: View {
                     Button("Done") {
                         resignPasswordFocus()
                     }
+                    .matrixAccentText()
                 }
             }
         }
@@ -3349,6 +3410,7 @@ private struct GameMenuPanel: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(Color(white: 0.28))
+            .matrixProminentText()
             Button("Change password") {
                 passwordError = nil
                 changingPassword = true
@@ -3402,7 +3464,7 @@ private struct GameMenuPanel: View {
             }
             if let passwordError, passwordError.isEmpty == false {
                 Text(verbatim: passwordError)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Color.red.matrix)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -3423,6 +3485,7 @@ private struct GameMenuPanel: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color(white: 0.28))
+                .matrixProminentText()
                 .disabled(passwordBusy || currentPassword.isEmpty || newPassword.isEmpty || confirmPassword.isEmpty)
             }
         }
@@ -3491,6 +3554,7 @@ private struct GameMenuPanel: View {
 /// full direction through `session.send()`, the same as typing it. The pressed
 /// letter stays lit for a quarter second, then returns to ink.
 private struct ActionPanel: View {
+    @ObservedObject private var matrixMode = MatrixMode.shared
     var send: (String) -> Void
 
     private struct Direction: Identifiable {
@@ -3523,7 +3587,7 @@ private struct ActionPanel: View {
                 }
                 .buttonStyle(.plain)
                 .font(.system(.body, design: .monospaced))
-                .foregroundStyle(lit ? Color.white : ink)
+                .foregroundStyle(MatrixShade.display(lit ? Color.white : ink, enabled: matrixMode.enabled))
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)
                 .background {
@@ -3565,6 +3629,7 @@ private struct ActionPanel: View {
 /// The letter is a bold system face. The plate is the bar frost, and a tap
 /// lights it the same way a compass letter does: white for a quarter second.
 private struct SkillActionStack: View {
+    @ObservedObject private var matrixMode = MatrixMode.shared
     var slots: [SkillAction]
     /// Hilited word, spoken with the verb. The tap reads `hilitedWord` itself.
     var target: String?
@@ -3617,7 +3682,7 @@ private struct SkillActionStack: View {
                 } label: {
                     Text(verbatim: row.letter)
                         .font(.system(size: fontSize, weight: .bold))
-                        .foregroundStyle(lit ? Color.white : ink)
+                        .foregroundStyle(MatrixShade.display(lit ? Color.white : ink, enabled: matrixMode.enabled))
                         .frame(width: side, height: side)
                         .background {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)

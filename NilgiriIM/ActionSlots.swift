@@ -93,6 +93,7 @@ final class ActionSlotStore: ObservableObject {
 /// and the name bar keep their taps.
 struct ActionSlotsDrawer: View {
     @ObservedObject var store: ActionSlotStore
+    @ObservedObject private var matrixMode = MatrixMode.shared
     /// Toggled by the accessibility action. Each change opens the card.
     @Binding var openRequest: Bool
     /// Global frame of the log between the bars. Empty until the first layout.
@@ -193,13 +194,13 @@ struct ActionSlotsDrawer: View {
             VStack(alignment: .leading, spacing: 22) {
                 Text("Actions")
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.62))
+                    .foregroundStyle(MatrixShade.display(Color(white: 0.62), enabled: matrixMode.enabled))
                 ForEach(0..<ActionSlotStore.count, id: \.self) { index in
                     slotRow(index)
                 }
             }
             .font(.system(size: 17))
-            .foregroundStyle(Color(white: 0.92))
+            .foregroundStyle(MatrixShade.display(Color(white: 0.92), enabled: matrixMode.enabled))
             .padding(.trailing, insets.right + 20)
             .padding(.leading, 18)
             .padding(.top, insets.top + 24)
@@ -242,7 +243,7 @@ struct ActionSlotsDrawer: View {
             }
             .pickerStyle(.menu)
             .labelsHidden()
-            .tint(Color(white: 0.78))
+            .tint(MatrixShade.display(Color(white: 0.78), enabled: matrixMode.enabled))
         }
     }
 

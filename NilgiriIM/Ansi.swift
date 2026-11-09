@@ -35,8 +35,15 @@ enum Ansi {
     }
 
     /// `initial` defaults to a reset terminal, so `text(_:fontSize:columns:)` is unchanged.
-    static func text(_ raw: String, fontSize: CGFloat, columns: Int, initial: State = .initial) -> Text {
-        swiftText(runs(raw, columns: columns, initial: initial), fontSize: fontSize)
+    /// `matrix` recolours the paint only. The characters are still `raw`.
+    static func text(
+        _ raw: String,
+        fontSize: CGFloat,
+        columns: Int,
+        initial: State = .initial,
+        matrix: Bool = MatrixMode.shared.enabled
+    ) -> Text {
+        swiftText(runs(raw, columns: columns, initial: initial), fontSize: fontSize, matrix: matrix)
     }
 
     /// The same characters, colours, and links as `text`, for the selectable transcript.
@@ -46,22 +53,24 @@ enum Ansi {
         fontSize: CGFloat,
         columns: Int,
         initial: State = .initial,
-        wrap: Wrap = .columns
+        wrap: Wrap = .columns,
+        matrix: Bool = MatrixMode.shared.enabled
     ) -> NSAttributedString {
         let pieces = runs(raw, columns: columns, initial: initial, wrap: wrap)
         let result = NSMutableAttributedString()
         for piece in pieces {
+            let painted = paint(piece.link == nil ? piece.uiColor : linkUI, matrix: matrix)
             var attributes: [NSAttributedString.Key: Any] = [
                 .font: UIFont.monospacedSystemFont(
                     ofSize: fontSize,
                     weight: piece.bold ? .bold : .regular
                 ),
-                .foregroundColor: piece.link == nil ? piece.uiColor : linkUI
+                .foregroundColor: painted
             ]
             if let link = piece.link {
                 attributes[.link] = link
                 attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
-                attributes[.underlineColor] = linkUI
+                attributes[.underlineColor] = painted
             }
             result.append(NSAttributedString(string: piece.text, attributes: attributes))
         }
@@ -175,7 +184,7 @@ enum Ansi {
         return produced
     }
 
-    private static func swiftText(_ pieces: [Run], fontSize: CGFloat) -> Text {
+    private static func swiftText(_ pieces: [Run], fontSize: CGFloat, matrix: Bool) -> Text {
         var result = Text("")
         for piece in pieces {
             if let link = piece.link {
@@ -185,14 +194,14 @@ enum Ansi {
                     weight: piece.bold ? .bold : .regular,
                     design: .monospaced
                 )
-                attr.foregroundColor = linkInk
+                attr.foregroundColor = paint(linkInk, matrix: matrix)
                 attr.underlineStyle = .single
                 attr.link = link
                 result = result + Text(attr)
             } else {
                 var text = Text(piece.text)
                     .font(.system(size: fontSize, design: .monospaced))
-                    .foregroundColor(piece.color)
+                    .foregroundColor(paint(piece.color, matrix: matrix))
                 if piece.bold {
                     text = text.bold()
                 }
@@ -320,6 +329,15 @@ enum Ansi {
         }
         index = cursor
         return .sequence(sgr: isSGR ? params : nil)
+    }
+
+    /// Matrix Mode changes the painted colour only. The run text is untouched.
+    private static func paint(_ color: UIColor, matrix: Bool) -> UIColor {
+        MatrixShade.display(color, enabled: matrix)
+    }
+
+    private static func paint(_ color: Color, matrix: Bool) -> Color {
+        MatrixShade.display(color, enabled: matrix)
     }
 
     private static let linkDetector: NSDataDetector? = {
