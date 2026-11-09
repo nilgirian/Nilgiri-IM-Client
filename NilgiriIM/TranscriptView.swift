@@ -2568,6 +2568,7 @@ struct TranscriptView: View {
     /// The left card has settled open. The command keyboard stays down until it closes.
     @State private var keyboardSettingsOpen = false
     @StateObject private var actionSlots = ActionSlotStore()
+    @StateObject private var actionShortcuts = ActionShortcutStore()
     /// Bumped by the accessibility action. Each change opens the right card.
     @State private var actionSlotsOpenRequest = false
     /// The right card has settled open. The command keyboard stays down until it closes.
@@ -2744,10 +2745,15 @@ struct TranscriptView: View {
             .overlay {
                 ActionSlotsDrawer(
                     store: actionSlots,
+                    shortcutStore: actionShortcuts,
                     openRequest: $actionSlotsOpenRequest,
                     logFrame: logGlobalFrame,
+                    hilitedWord: session.hilitedWord,
                     onOpenChange: { open in
                         actionSlotsCardChanged(open: open)
+                    },
+                    onSend: { text in
+                        Task { await sendShortcut(text) }
                     }
                 )
             }
@@ -3141,6 +3147,15 @@ struct TranscriptView: View {
         guard session.atMenu == false else { return }
         guard let text = action.command(target: session.hilitedWord) else { return }
         await sendDirection(text)
+    }
+
+    /// A shortcut the drawer already joined with the hilite, when there was one.
+    /// The welcome menu is not a target. The transcript text is not edited.
+    private func sendShortcut(_ text: String) async {
+        guard session.atMenu == false else { return }
+        let command = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard command.isEmpty == false else { return }
+        await sendDirection(command)
     }
 
     /// Assigned skills, packed to the bottom of the log, just above the command
