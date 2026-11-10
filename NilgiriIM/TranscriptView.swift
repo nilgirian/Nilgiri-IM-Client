@@ -45,7 +45,7 @@ private func transcriptIsPortrait(_ view: UIView) -> Bool {
 private enum CommunicationLine {
     static let portraitBoost: CGFloat = 4
 
-    private static let kinds: Set<String> = [
+    fileprivate static let kinds: Set<String> = [
         "say", "says",
         "ask", "asks",
         "exclaim", "exclaims",
@@ -110,6 +110,30 @@ private enum CommunicationLine {
             index = raw.index(after: index)
         }
         return out
+    }
+}
+
+/// Outgoing speech and channel commands. Display lines use `CommunicationLine`;
+/// this looks at the first word (or `'` / `:` shortcut) of what was typed.
+private enum CommunicationCommand {
+    /// Channel names already recognised for enlarged communication lines,
+    /// plus verbs that classification does not list as a typed command.
+    private static let verbs: Set<String> = CommunicationLine.kinds.union([
+        "reply", "chat", "auction", "grats", "ooc", "gtell", "gsay", "emote"
+    ])
+
+    static func isOutgoing(_ command: String) -> Bool {
+        let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.isEmpty == false else { return false }
+        if text.hasPrefix("'") || text.hasPrefix(":") { return true }
+        let word = String(text.prefix { $0.isWhitespace == false }).lowercased()
+        if verbs.contains(word) { return true }
+        let matches = verbs.filter { $0.hasPrefix(word) }
+        guard matches.count == 1 else { return false }
+        // Two letters are enough when unique among these verbs, except `go`,
+        // which is movement and only a prefix of `gossip`.
+        if word.count >= 3 { return true }
+        return word.count == 2 && word != "go"
     }
 }
 
@@ -2579,10 +2603,11 @@ struct TranscriptView: View {
     /// this flag; the command field reads it and resigns only when it drops.
     @State private var commandFocused = false
     @StateObject private var keyboardPrefs = KeyboardHidePreferences()
-    /// Last line posted from the input bar (Return, Send, or Say), whether or
-    /// not the switch is on. Compass directions and action slots do not
-    /// replace it. Shown greyed out, and repeated from an empty field, only
-    /// while Keep last command is on. Kept for this play screen, not on disk.
+    /// Last non-communication line posted from the input bar (Return or Send).
+    /// Speech, channels, and the Say button leave this unchanged. Compass
+    /// directions and action slots do not replace it. Shown greyed out, and
+    /// repeated from an empty field, only while Keep last command is on.
+    /// Kept for this play screen, not on disk.
     @State private var lastCommand = ""
     /// The command field should be first responder. Set when this orientation
     /// keeps the keyboard, cleared when the player swipes it away or a switch hides it.
@@ -2990,7 +3015,7 @@ struct TranscriptView: View {
             await session.send(fallback: lastCommand)
             return
         }
-        lastCommand = typed
+        rememberLastCommand(typed)
         await session.send()
     }
 
@@ -3006,7 +3031,6 @@ struct TranscriptView: View {
         if said == false {
             session.command = outgoing
         }
-        lastCommand = outgoing
         if keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false {
             keepCommandKeyboard()
         }
@@ -3162,6 +3186,14 @@ struct TranscriptView: View {
         let folded = text.lowercased()
         return folded == "say" || folded.hasPrefix("say ")
     }
+
+    /// Remembers a typed Send/Return line unless it is speech or a channel.
+    /// The Say button never calls this.
+    private func rememberLastCommand(_ text: String) {
+        guard CommunicationCommand.isOutgoing(text) == false else { return }
+        lastCommand = text
+    }
+
 
     /// Blank after the same trim `send()` uses. Whitespace is not a command.
     private var typedCommandIsBlank: Bool {
