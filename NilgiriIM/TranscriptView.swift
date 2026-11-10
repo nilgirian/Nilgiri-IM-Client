@@ -3669,13 +3669,14 @@ private struct GameMenuPanel: View {
     }
 }
 
-/// One row of compass commands on the input bar's frost. Each tap posts the
-/// full direction through `session.send()`, the same as typing it. The pressed
-/// letter stays lit for a quarter second, then returns to ink. Hiding labels
-/// drops the letter only; the plate still lights and the tap still sends.
-/// Until an exits listing arrives, every letter is shown. After that, an open
-/// exit shows its letter, a closed door is grey and does not send, and a
-/// direction with no exit keeps a blank slot.
+/// One row of compass commands on the input bar's frost. Each letter's plate
+/// is `Chrome.hotButtonPlate`, the same lighter wash as an action button.
+/// Each tap posts the full direction through `session.send()`, the same as
+/// typing it. The pressed letter stays lit for a quarter second, then returns
+/// to ink. Hiding labels drops the letter only; the plate still lights and
+/// the tap still sends. Until an exits listing arrives, every letter is shown.
+/// After that, an open exit shows its letter, a closed door is grey and does
+/// not send, and a direction with no exit keeps a blank slot.
 private struct ActionPanel: View {
     @ObservedObject private var matrixMode = MatrixMode.shared
     /// The letter is invisible. The row, the press light, and the tap stay.
@@ -3739,7 +3740,7 @@ private struct ActionPanel: View {
         .padding(.vertical, 10)
         .background {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color.white.opacity(lit ? 0.42 : 0))
+                .fill(lit ? Chrome.hotButtonFlash : Chrome.hotButtonPlate)
                 .padding(.horizontal, 3)
                 .padding(.vertical, 3)
         }
@@ -3784,12 +3785,13 @@ private struct ActionPanel: View {
 
 /// Hot buttons, stacked above the command bar in list order. Every entry is
 /// drawn, including one whose icon is empty. The glyph is a bold monospaced
-/// face, at most two characters. The plate is the bar frost, and a tap lights
-/// it the same way a compass letter does: white for a quarter second. A hidden
-/// label, or an empty icon, leaves that plate and the light in place.
-/// Spacing shrinks before the plate does, so six fit in the log in either
-/// orientation. The log ends where the input bar begins, so the plates stay
-/// above the direction buttons.
+/// face, at most two characters. The plate is the bar frost plus
+/// `Chrome.hotButtonPlate`, and a tap lights it the same way a compass letter
+/// does: the shared flash, white for a quarter second. A hidden label, or an
+/// empty icon, leaves that plate and the light in place. Spacing shrinks
+/// before the plate does, so six fit in the log in either orientation. The
+/// log ends where the input bar begins, so the plates stay above the
+/// direction buttons.
 private struct HotButtonStack: View {
     @ObservedObject private var matrixMode = MatrixMode.shared
     var buttons: [HotButton]
@@ -3866,9 +3868,10 @@ private struct HotButtonStack: View {
                         .frame(width: metrics.side, height: metrics.side)
                         .background {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(Color.white.opacity(lit ? 0.42 : 0))
+                                .fill(lit ? Chrome.hotButtonFlash : Color.clear)
                                 .padding(3)
                         }
+                        .background(Chrome.hotButtonPlate, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         .background(Chrome.barBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                         .contentShape(Rectangle())
                 }
