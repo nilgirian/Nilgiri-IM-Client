@@ -2679,8 +2679,7 @@ struct TranscriptView: View {
     @State private var settingsOpenRequest = false
     /// The left card has settled open. The command keyboard stays down until it closes.
     @State private var keyboardSettingsOpen = false
-    @StateObject private var hotButtons = HotButtonStore()
-    @StateObject private var actionShortcuts = ActionShortcutStore()
+    @StateObject private var menu = ActionMenuStore()
     /// Bumped by the accessibility action. Each change opens the right card.
     @State private var actionSlotsOpenRequest = false
     /// The right card has settled open. The command keyboard stays down until it closes.
@@ -2858,8 +2857,7 @@ struct TranscriptView: View {
             }
             .overlay {
                 ActionSlotsDrawer(
-                    shortcutStore: actionShortcuts,
-                    hotButtons: hotButtons,
+                    menu: menu,
                     openRequest: $actionSlotsOpenRequest,
                     logFrame: logGlobalFrame,
                     hilitedWord: session.hilitedWord,
@@ -3318,7 +3316,7 @@ struct TranscriptView: View {
             VStack(alignment: .trailing, spacing: 0) {
                 HStack(alignment: .bottom, spacing: 0) {
                     HotButtonStack(
-                        buttons: hotButtons.buttons,
+                        buttons: menu.buttons,
                         target: session.hilitedWord,
                         hideLabels: keyboardPrefs.hideHotButtonLabels,
                         maxHeight: room

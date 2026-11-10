@@ -27,68 +27,9 @@ struct ActionShortcut: Identifiable, Equatable {
     }
 }
 
-/// The shortcut list on the right-edge card. Missing storage seeds one row,
-/// `get all corpse`. An empty array is a list the player cleared, so the
-/// seed is not put back. At most ten rows are kept.
-final class ActionShortcutStore: ObservableObject {
-    static let limit = 10
-    static let seedText = "get all corpse"
 
-    @Published private(set) var shortcuts: [ActionShortcut] {
-        didSet { save() }
-    }
-
-    private enum Key {
-        static let shortcuts = "im.actionShortcuts"
-    }
-
-    init() {
-        let defaults = UserDefaults.standard
-        if let stored = defaults.stringArray(forKey: Key.shortcuts) {
-            shortcuts = stored.prefix(Self.limit).map { ActionShortcut(text: $0) }
-        } else {
-            shortcuts = [ActionShortcut(text: Self.seedText)]
-            defaults.set([Self.seedText], forKey: Key.shortcuts)
-        }
-    }
-
-    var canAdd: Bool { shortcuts.count < Self.limit }
-
-    /// A blank row at the end. Nil when the list is already full.
-    @discardableResult
-    func addBlank() -> UUID? {
-        guard canAdd else { return nil }
-        let item = ActionShortcut(text: "")
-        shortcuts.append(item)
-        return item.id
-    }
-
-    func update(id: UUID, text: String) {
-        guard let index = shortcuts.firstIndex(where: { $0.id == id }) else { return }
-        guard shortcuts[index].text != text else { return }
-        shortcuts[index].text = text
-    }
-
-    func remove(id: UUID) {
-        guard let index = shortcuts.firstIndex(where: { $0.id == id }) else { return }
-        shortcuts.remove(at: index)
-    }
-
-    func move(from: Int, to: Int) {
-        guard shortcuts.indices.contains(from), shortcuts.indices.contains(to), from != to else { return }
-        let item = shortcuts.remove(at: from)
-        shortcuts.insert(item, at: to)
-    }
-
-    private func save() {
-        let capped = shortcuts.prefix(Self.limit).map(\.text)
-        UserDefaults.standard.set(capped, forKey: Key.shortcuts)
-    }
-}
-
-/// One play-screen hot button. `text` is the action, copied from the shortcut
-/// the player dropped and never rewritten. `icon` is 0, 1, or 2 characters.
-/// Empty means the plate is drawn with no glyph.
+/// One play-screen hot button. `text` is the action as the player left it.
+/// `icon` is 0, 1, or 2 characters. Empty means the plate is drawn with no glyph.
 struct HotButton: Identifiable, Equatable {
     let id: UUID
     var text: String
@@ -119,18 +60,23 @@ struct HotButton: Identifiable, Equatable {
     }
 }
 
-/// The hot buttons, in the order the play screen draws them. At most six.
-/// Missing `im.hotButtons` seeds hit [H], look [L], flee [F]. An empty array
-/// is a list the player cleared, so the seed is not put back. The old slot
-/// key is not read: this list replaces those three pull-downs.
-final class HotButtonStore: ObservableObject {
-    static let limit = 6
+/// Actions and hot buttons together. An action text lives in one list only.
+/// Every change goes through `apply`, which drops duplicate keys, caps hot
+/// buttons at six, and takes those keys out of Actions.
+final class ActionMenuStore: ObservableObject {
+    static let shortcutLimit = 10
+    static let hotLimit = 6
+    static let seedText = "get all corpse"
 
-    @Published private(set) var buttons: [HotButton] {
-        didSet { save() }
-    }
+    @Published private(set) var shortcuts: [ActionShortcut] = []
+    @Published private(set) var buttons: [HotButton] = []
+
+    /// Icon last used for a key during this launch. Moving back to Hot
+    /// Buttons restores it. Not written to disk.
+    private var rememberedIcons: [String: String] = [:]
 
     private enum Key {
+        static let shortcuts = "im.actionShortcuts"
         static let buttons = "im.hotButtons"
     }
 
@@ -139,7 +85,7 @@ final class HotButtonStore: ObservableObject {
         var icon: String
     }
 
-    private static let seed: [HotButton] = [
+    private static let hotSeed: [HotButton] = [
         HotButton(text: "hit", icon: "H"),
         HotButton(text: "look", icon: "L"),
         HotButton(text: "flee", icon: "F"),
@@ -147,71 +93,221 @@ final class HotButtonStore: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
+        let loadedButtons: [HotButton]
         if defaults.object(forKey: Key.buttons) == nil {
-            buttons = Self.seed
-            Self.write(Self.seed, defaults: defaults)
+            loadedButtons = Self.hotSeed
         } else {
-            buttons = Self.read(defaults)
+            loadedButtons = Self.readButtons(defaults)
         }
+        let loadedShortcuts: [ActionShortcut]
+        if let stored = defaults.stringArray(forKey: Key.shortcuts) {
+            loadedShortcuts = stored.map { ActionShortcut(text: $0) }
+        } else {
+            loadedShortcuts = [ActionShortcut(text: Self.seedText)]
+        }
+        apply(buttons: loadedButtons, shortcuts: loadedShortcuts)
+        saveShortcuts()
+        saveButtons()
     }
 
-    /// Same action twice is refused. Comparison trims both ends and leaves
-    /// the stored text alone, so `hit` and `hit ` are one action.
-    func canAccept(_ text: String) -> Bool {
-        guard buttons.count < Self.limit else { return false }
-        let key = Self.matchKey(text)
-        return buttons.contains { Self.matchKey($0.text) == key } == false
-    }
+    var canAdd: Bool { shortcuts.count < Self.shortcutLimit }
 
+    /// A blank row at the end of Actions. Nil when Actions is full, or when
+    /// a blank row is already in either list.
     @discardableResult
-    func insert(text: String, at index: Int) -> Bool {
-        guard canAccept(text) else { return false }
-        let item = HotButton(text: text, icon: HotButton.defaultIcon(for: text))
-        let clamped = min(max(0, index), buttons.count)
-        buttons.insert(item, at: clamped)
-        return true
+    func addBlank() -> UUID? {
+        guard canAdd else { return nil }
+        let key = Self.matchKey("")
+        if contains(key) { return nil }
+        let item = ActionShortcut(text: "")
+        var next = shortcuts
+        next.append(item)
+        apply(buttons: buttons, shortcuts: next)
+        return item.id
+    }
+
+    func updateShortcut(id: UUID, text: String) {
+        guard let index = shortcuts.firstIndex(where: { $0.id == id }) else { return }
+        guard shortcuts[index].text != text else { return }
+        let key = Self.matchKey(text)
+        let taken = shortcuts.contains { $0.id != id && Self.matchKey($0.text) == key }
+            || buttons.contains { Self.matchKey($0.text) == key }
+        guard taken == false else { return }
+        var next = shortcuts
+        next[index].text = text
+        apply(buttons: buttons, shortcuts: next)
+    }
+
+    /// Swipe-to-delete. The row is gone from both lists.
+    func removeShortcut(id: UUID) {
+        guard shortcuts.contains(where: { $0.id == id }) else { return }
+        apply(buttons: buttons, shortcuts: shortcuts.filter { $0.id != id })
+    }
+
+    func moveShortcut(from: Int, to: Int) {
+        guard shortcuts.indices.contains(from), shortcuts.indices.contains(to), from != to else { return }
+        var next = shortcuts
+        let item = next.remove(at: from)
+        next.insert(item, at: to)
+        apply(buttons: buttons, shortcuts: next)
     }
 
     func updateIcon(id: UUID, icon: String) {
         guard let index = buttons.firstIndex(where: { $0.id == id }) else { return }
         let clamped = HotButton.clampedIcon(icon)
         guard buttons[index].icon != clamped else { return }
-        buttons[index].icon = clamped
+        var next = buttons
+        next[index].icon = clamped
+        rememberedIcons[Self.matchKey(next[index].text)] = clamped
+        apply(buttons: next, shortcuts: shortcuts)
     }
 
-    func remove(id: UUID) {
-        guard let index = buttons.firstIndex(where: { $0.id == id }) else { return }
-        buttons.remove(at: index)
-    }
-
-    func move(from: Int, to: Int) {
+    func moveHotButton(from: Int, to: Int) {
         guard buttons.indices.contains(from), buttons.indices.contains(to), from != to else { return }
-        let item = buttons.remove(at: from)
-        buttons.insert(item, at: to)
+        var next = buttons
+        let item = next.remove(at: from)
+        next.insert(item, at: to)
+        apply(buttons: next, shortcuts: shortcuts)
     }
 
-    private static func matchKey(_ text: String) -> String {
+    /// Move an Actions row into Hot Buttons. Already there: leave the hot
+    /// button where a previous call put it, and drop the Actions copy.
+    /// Full and not already there: refuse, and the row stays in Actions.
+    @discardableResult
+    func moveToHotButtons(text: String, at index: Int, reposition: Bool) -> Bool {
+        let key = Self.matchKey(text)
+        if let existing = buttons.firstIndex(where: { Self.matchKey($0.text) == key }) {
+            var next = buttons
+            let item = next.remove(at: existing)
+            if reposition {
+                let dest = Self.destination(index, removing: existing, count: buttons.count)
+                next.insert(item, at: dest)
+            } else {
+                next.insert(item, at: min(existing, next.count))
+            }
+            apply(buttons: next, shortcuts: shortcuts)
+            return true
+        }
+        guard buttons.count < Self.hotLimit else { return false }
+        let stored = shortcuts.first(where: { Self.matchKey($0.text) == key })?.text ?? text
+        let icon = rememberedIcons[key] ?? HotButton.defaultIcon(for: stored)
+        var next = buttons
+        let dest = min(max(0, index), next.count)
+        next.insert(HotButton(text: stored, icon: icon), at: dest)
+        apply(buttons: next, shortcuts: shortcuts)
+        return true
+    }
+
+    /// Move a hot button back into Actions. Already only in Actions: move
+    /// that row when `reposition` is set. The stored words are not rewritten.
+    @discardableResult
+    func moveToActions(text: String, at index: Int, reposition: Bool) -> Bool {
+        let key = Self.matchKey(text)
+        var nextButtons = buttons
+        var carried: String?
+        if let existing = nextButtons.firstIndex(where: { Self.matchKey($0.text) == key }) {
+            let button = nextButtons.remove(at: existing)
+            carried = button.text
+            rememberedIcons[key] = button.icon
+        }
+        var nextShortcuts = shortcuts
+        if let existing = nextShortcuts.firstIndex(where: { Self.matchKey($0.text) == key }) {
+            let item = nextShortcuts.remove(at: existing)
+            if reposition {
+                let dest = Self.destination(index, removing: existing, count: shortcuts.count)
+                nextShortcuts.insert(item, at: dest)
+            } else {
+                nextShortcuts.insert(item, at: min(existing, nextShortcuts.count))
+            }
+            apply(buttons: nextButtons, shortcuts: nextShortcuts)
+            return true
+        }
+        let stored = carried ?? shortcuts.first(where: { Self.matchKey($0.text) == key })?.text ?? text
+        let dest = min(max(0, index), nextShortcuts.count)
+        nextShortcuts.insert(ActionShortcut(text: stored), at: dest)
+        apply(buttons: nextButtons, shortcuts: nextShortcuts)
+        return true
+    }
+
+    func moveToActions(id: UUID, at index: Int, reposition: Bool) -> Bool {
+        guard let button = buttons.first(where: { $0.id == id }) else { return false }
+        return moveToActions(text: button.text, at: index, reposition: reposition)
+    }
+
+    private func contains(_ key: String) -> Bool {
+        shortcuts.contains { Self.matchKey($0.text) == key }
+            || buttons.contains { Self.matchKey($0.text) == key }
+    }
+
+    /// Index in the array after `removing` has been taken out.
+    /// Index in the array after the row at `removing` has been taken out.
+    /// `index` is the slot in the array before that removal. `count` is the
+    /// old count, so an index of `count` means the end.
+    private static func destination(_ index: Int, removing: Int, count: Int) -> Int {
+        var dest = index
+        if removing < dest { dest -= 1 }
+        return min(max(0, dest), max(0, count - 1))
+    }
+
+    /// One write of both lists. Hot buttons keep the first of each key, at
+    /// most six. Actions lose any key that is a hot button, then their own
+    /// duplicates. The stored text of a kept row is not edited.
+    private func apply(buttons proposedButtons: [HotButton], shortcuts proposedShortcuts: [ActionShortcut]) {
+        let nextButtons = Self.uniqueButtons(proposedButtons)
+        let hotKeys = Set(nextButtons.map { Self.matchKey($0.text) })
+        var seen = Set<String>()
+        var nextShortcuts: [ActionShortcut] = []
+        for shortcut in proposedShortcuts {
+            let key = Self.matchKey(shortcut.text)
+            if hotKeys.contains(key) || seen.contains(key) { continue }
+            seen.insert(key)
+            nextShortcuts.append(shortcut)
+        }
+        if nextButtons != buttons {
+            buttons = nextButtons
+            saveButtons()
+        }
+        if nextShortcuts != shortcuts {
+            shortcuts = nextShortcuts
+            saveShortcuts()
+        }
+    }
+
+    private static func uniqueButtons(_ buttons: [HotButton]) -> [HotButton] {
+        var seen = Set<String>()
+        var result: [HotButton] = []
+        for button in buttons {
+            let key = matchKey(button.text)
+            if seen.contains(key) { continue }
+            seen.insert(key)
+            result.append(button)
+            if result.count == hotLimit { break }
+        }
+        return result
+    }
+
+    static func matchKey(_ text: String) -> String {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func save() {
-        Self.write(Array(buttons.prefix(Self.limit)), defaults: .standard)
+    private func saveShortcuts() {
+        UserDefaults.standard.set(shortcuts.map(\.text), forKey: Key.shortcuts)
     }
 
-    private static func write(_ buttons: [HotButton], defaults: UserDefaults) {
-        let records = buttons.prefix(Self.limit).map { Record(text: $0.text, icon: HotButton.clampedIcon($0.icon)) }
+    private func saveButtons() {
+        let records = buttons.map { Record(text: $0.text, icon: HotButton.clampedIcon($0.icon)) }
         guard let data = try? JSONEncoder().encode(records) else { return }
-        defaults.set(data, forKey: Key.buttons)
+        UserDefaults.standard.set(data, forKey: Key.buttons)
     }
 
     /// A present key that does not decode stays empty. That is not the
     /// missing-key case, so the seed is not written back over it.
-    private static func read(_ defaults: UserDefaults) -> [HotButton] {
+    private static func readButtons(_ defaults: UserDefaults) -> [HotButton] {
         guard let data = defaults.data(forKey: Key.buttons),
               let records = try? JSONDecoder().decode([Record].self, from: data) else {
             return []
         }
-        return records.prefix(Self.limit).map { HotButton(text: $0.text, icon: $0.icon) }
+        return records.map { HotButton(text: $0.text, icon: $0.icon) }
     }
 }
 
@@ -220,8 +316,7 @@ final class HotButtonStore: ObservableObject {
 /// the hot buttons. The strip is only as tall as the log, so Say, Send,
 /// and the name bar keep their taps.
 struct ActionSlotsDrawer: View {
-    @ObservedObject var shortcutStore: ActionShortcutStore
-    @ObservedObject var hotButtons: HotButtonStore
+    @ObservedObject var menu: ActionMenuStore
     @ObservedObject private var matrixMode = MatrixMode.shared
     /// Toggled by the accessibility action. Each change opens the card.
     @Binding var openRequest: Bool
@@ -267,6 +362,9 @@ struct ActionSlotsDrawer: View {
     @State private var editingID: UUID?
     /// Hot-button icon in inline edit. Nil shows every icon as a plate.
     @State private var editingIconID: UUID?
+    /// A system drop already placed this drag. The finger-up path must not
+    /// place it a second time.
+    @State private var dropClaimed = false
     /// Hold-and-drag. While set, the card's own pan stays put.
     @State private var held: HeldDrag?
     /// True from the long-press began until the finger lifts.
@@ -443,12 +541,12 @@ struct ActionSlotsDrawer: View {
             .background(Color(white: hotDropTargeted ? 0.34 : 0.18).opacity(0.94))
             .contentShape(Rectangle())
             .dropDestination(for: String.self) { items, _ in
-                acceptActionDrop(items, at: hotButtons.buttons.count)
+                acceptActionDrop(items, at: menu.buttons.count, reposition: false)
             } isTargeted: { targeted in
                 setHotDropTargeted(targeted)
             }
             .onDrop(of: [UTType.utf8PlainText, UTType.plainText], isTargeted: $hotDropTargeted) { providers in
-                loadActionDrop(providers, at: hotButtons.buttons.count)
+                loadActionDrop(providers, at: menu.buttons.count)
             }
             .accessibilityHidden(true)
     }
@@ -463,7 +561,7 @@ struct ActionSlotsDrawer: View {
     private var actionsHeader: some View {
         HStack(alignment: .center, spacing: 0) {
             sectionTitle("Actions")
-            if shortcutStore.canAdd {
+            if menu.canAdd {
                 Button(action: addShortcut) {
                     Text("+")
                         .font(.system(size: 22, weight: .medium, design: .monospaced))
@@ -488,9 +586,17 @@ struct ActionSlotsDrawer: View {
 
     private func shortcutRows(width: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(shortcutStore.shortcuts.enumerated()), id: \.element.id) { index, shortcut in
+            ForEach(Array(menu.shortcuts.enumerated()), id: \.element.id) { index, shortcut in
                 shortcutRow(index: index, shortcut: shortcut, width: width)
             }
+        }
+        .frame(maxWidth: .infinity, minHeight: Metrics.rowStride, alignment: .topLeading)
+        .contentShape(Rectangle())
+        .dropDestination(for: String.self) { items, location in
+            acceptActionReturn(items, at: indexForShortcutDrop(location.y))
+        } isTargeted: { _ in }
+        .onDrop(of: [UTType.utf8PlainText, UTType.plainText]) { providers in
+            loadActionReturn(providers, at: menu.shortcuts.count)
         }
     }
 
@@ -512,7 +618,7 @@ struct ActionSlotsDrawer: View {
                 if editingID == shortcut.id {
                     ShortcutEditor(
                         text: shortcut.text,
-                        onText: { shortcutStore.update(id: shortcut.id, text: $0) },
+                        onText: { menu.updateShortcut(id: shortcut.id, text: $0) },
                         onCommit: {
                             if editingID == shortcut.id {
                                 editingID = nil
@@ -555,7 +661,11 @@ struct ActionSlotsDrawer: View {
                         .accessibilityAction(named: Text("Move up")) { moveShortcut(shortcut.id, by: -1) }
                         .accessibilityAction(named: Text("Move down")) { moveShortcut(shortcut.id, by: 1) }
                         .accessibilityAction(named: Text("Add to hot buttons")) {
-                            hotButtons.insert(text: shortcut.text, at: hotButtons.buttons.count)
+                            menu.moveToHotButtons(
+                                text: shortcut.text,
+                                at: menu.buttons.count,
+                                reposition: true
+                            )
                         }
                 }
             }
@@ -583,7 +693,7 @@ struct ActionSlotsDrawer: View {
     /// the action row's `String` drop there.
     private var hotButtonRows: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(hotButtons.buttons.enumerated()), id: \.element.id) { index, button in
+            ForEach(Array(menu.buttons.enumerated()), id: \.element.id) { index, button in
                 hotButtonRow(index: index, button: button)
             }
         }
@@ -594,12 +704,12 @@ struct ActionSlotsDrawer: View {
         }
         .contentShape(Rectangle())
         .dropDestination(for: String.self) { items, location in
-            acceptActionDrop(items, at: indexForRowDrop(location.y))
+            acceptActionDrop(items, at: indexForRowDrop(location.y), reposition: true)
         } isTargeted: { targeted in
             setHotDropTargeted(targeted)
         }
         .onDrop(of: [UTType.utf8PlainText, UTType.plainText], isTargeted: $hotDropTargeted) { providers in
-            loadActionDrop(providers, at: hotButtons.buttons.count)
+            loadActionDrop(providers, at: menu.buttons.count)
         }
     }
 
@@ -607,7 +717,7 @@ struct ActionSlotsDrawer: View {
     /// Brighter while a drop is aimed at it.
     private var hotWellFill: Double {
         if hotDropTargeted || actionDragIntoHotButtons { return 0.12 }
-        if hotButtons.buttons.isEmpty { return 0.06 }
+        if menu.buttons.isEmpty { return 0.06 }
         return 0
     }
 
@@ -620,7 +730,7 @@ struct ActionSlotsDrawer: View {
                 IconEditor(
                     text: button.icon,
                     matrix: matrixMode.enabled,
-                    onText: { hotButtons.updateIcon(id: button.id, icon: $0) },
+                    onText: { menu.updateIcon(id: button.id, icon: $0) },
                     onCommit: {
                         if editingIconID == button.id {
                             editingIconID = nil
@@ -644,6 +754,8 @@ struct ActionSlotsDrawer: View {
         .overlay {
             if editingIconID != button.id {
                 ShortcutRowGestures(
+                    yieldsToSystemDrag: true,
+                    dragText: button.text,
                     onTap: { point in
                         guard point.x <= Metrics.iconHitWidth else { return }
                         editingID = nil
@@ -669,14 +781,16 @@ struct ActionSlotsDrawer: View {
         .accessibilityElement(children: editingIconID == button.id ? .contain : .ignore)
         .accessibilityLabel(trimmed.isEmpty ? "Empty hot button" : button.text)
         .accessibilityValue(button.icon.isEmpty ? "No icon" : "Icon \(button.icon)")
-        .accessibilityHint("Drag out of hot buttons to remove")
+        .accessibilityHint("Drag out of hot buttons to move it back to actions")
         .accessibilityAction(named: Text("Edit icon")) {
             editingID = nil
             editingIconID = button.id
         }
         .accessibilityAction(named: Text("Move up")) { moveHotButton(button.id, by: -1) }
         .accessibilityAction(named: Text("Move down")) { moveHotButton(button.id, by: 1) }
-        .accessibilityAction(named: Text("Remove")) { removeHotButton(button.id) }
+        .accessibilityAction(named: Text("Move to actions")) {
+            menu.moveToActions(id: button.id, at: menu.shortcuts.count, reposition: true)
+        }
     }
 
     private func iconPlate(_ icon: String) -> some View {
@@ -745,6 +859,7 @@ struct ActionSlotsDrawer: View {
             heldActive = false
             held = nil
             hotDropTargeted = false
+            dropClaimed = false
         }
         withAnimation(.easeOut(duration: 0.22)) {
             travel = open ? width : 0
@@ -755,7 +870,7 @@ struct ActionSlotsDrawer: View {
     }
 
     private func addShortcut() {
-        guard let id = shortcutStore.addBlank() else { return }
+        guard let id = menu.addBlank() else { return }
         editingIconID = nil
         editingID = id
     }
@@ -784,31 +899,18 @@ struct ActionSlotsDrawer: View {
                 held = nil
                 heldActive = false
             }
-            shortcutStore.remove(id: id)
+            menu.removeShortcut(id: id)
         }
     }
 
     private func moveShortcut(_ id: UUID, by delta: Int) {
-        guard let index = shortcutStore.shortcuts.firstIndex(where: { $0.id == id }) else { return }
-        shortcutStore.move(from: index, to: index + delta)
-    }
-
-    private func removeHotButton(_ id: UUID) {
-        if editingIconID == id {
-            editingIconID = nil
-        }
-        withAnimation(.easeOut(duration: 0.18)) {
-            if held?.id == id {
-                held = nil
-                heldActive = false
-            }
-            hotButtons.remove(id: id)
-        }
+        guard let index = menu.shortcuts.firstIndex(where: { $0.id == id }) else { return }
+        menu.moveShortcut(from: index, to: index + delta)
     }
 
     private func moveHotButton(_ id: UUID, by delta: Int) {
-        guard let index = hotButtons.buttons.firstIndex(where: { $0.id == id }) else { return }
-        hotButtons.move(from: index, to: index + delta)
+        guard let index = menu.buttons.firstIndex(where: { $0.id == id }) else { return }
+        menu.moveHotButton(from: index, to: index + delta)
     }
 
     private func beginDrag(_ id: UUID, list: DragList, location: CGPoint) {
@@ -816,11 +918,12 @@ struct ActionSlotsDrawer: View {
         let index: Int?
         switch list {
         case .actions:
-            index = shortcutStore.shortcuts.firstIndex(where: { $0.id == id })
+            index = menu.shortcuts.firstIndex(where: { $0.id == id })
         case .hotButtons:
-            index = hotButtons.buttons.firstIndex(where: { $0.id == id })
+            index = menu.buttons.firstIndex(where: { $0.id == id })
         }
         guard let index else { return }
+        dropClaimed = false
         heldActive = true
         held = HeldDrag(id: id, list: list, origin: index, translation: .zero, axis: nil, location: location)
     }
@@ -857,35 +960,42 @@ struct ActionSlotsDrawer: View {
             return
         }
         if committed, current.list == .actions, current.axis == .vertical,
-           let shortcut = shortcutStore.shortcuts.first(where: { $0.id == current.id }),
+           let shortcut = menu.shortcuts.first(where: { $0.id == current.id }),
            draggedDownIntoHotButtons(
                origin: current.origin,
                translationY: current.translation.height,
-               actionCount: shortcutStore.shortcuts.count
+               actionCount: menu.shortcuts.count
            ) {
-            // Copy. The action row stays in the Actions list.
+            // Move. A system drop may already have placed it; don't place it again.
             withAnimation(.easeOut(duration: 0.16)) {
                 held = nil
                 heldActive = false
-                hotButtons.insert(text: shortcut.text, at: hotButtons.buttons.count)
+                if dropClaimed == false {
+                    menu.moveToHotButtons(
+                        text: shortcut.text,
+                        at: menu.buttons.count,
+                        reposition: true
+                    )
+                }
+                dropClaimed = false
             }
             return
         }
         if committed, current.list == .actions, current.axis == .vertical,
-           let index = shortcutStore.shortcuts.firstIndex(where: { $0.id == current.id }) {
+           let index = menu.shortcuts.firstIndex(where: { $0.id == current.id }) {
             let target = verticalTravel(
                 origin: current.origin,
                 translationY: current.translation.height,
-                count: shortcutStore.shortcuts.count
+                count: menu.shortcuts.count
             ).target
             let dest = index + (target - current.origin)
-            if shortcutStore.shortcuts.indices.contains(dest), dest != index {
+            if menu.shortcuts.indices.contains(dest), dest != index {
                 var transaction = Transaction()
                 transaction.disablesAnimations = true
                 withTransaction(transaction) {
                     held = nil
                     heldActive = false
-                    shortcutStore.move(from: index, to: dest)
+                    menu.moveShortcut(from: index, to: dest)
                 }
                 return
             }
@@ -896,25 +1006,38 @@ struct ActionSlotsDrawer: View {
             if hotDragExited(
                 origin: current.origin,
                 translation: current.translation,
-                count: hotButtons.buttons.count
+                count: menu.buttons.count
             ) {
-                removeHotButton(current.id)
+                // Back to Actions. A drop on the Actions list may already
+                // have chosen the slot; otherwise append.
+                withAnimation(.easeOut(duration: 0.18)) {
+                    held = nil
+                    heldActive = false
+                    if dropClaimed == false {
+                        menu.moveToActions(
+                            id: current.id,
+                            at: menu.shortcuts.count,
+                            reposition: true
+                        )
+                    }
+                    dropClaimed = false
+                }
                 return
             }
-            if let index = hotButtons.buttons.firstIndex(where: { $0.id == current.id }) {
+            if let index = menu.buttons.firstIndex(where: { $0.id == current.id }) {
                 let target = verticalTravel(
                     origin: current.origin,
                     translationY: current.translation.height,
-                    count: hotButtons.buttons.count
+                    count: menu.buttons.count
                 ).target
                 let dest = index + (target - current.origin)
-                if hotButtons.buttons.indices.contains(dest), dest != index {
+                if menu.buttons.indices.contains(dest), dest != index {
                     var transaction = Transaction()
                     transaction.disablesAnimations = true
                     withTransaction(transaction) {
                         held = nil
                         heldActive = false
-                        hotButtons.move(from: index, to: dest)
+                        menu.moveHotButton(from: index, to: dest)
                     }
                     return
                 }
@@ -959,13 +1082,13 @@ struct ActionSlotsDrawer: View {
 
     private func actionRowOffset(index: Int) -> CGSize {
         guard let drag = held, drag.list == .actions, let axis = drag.axis else { return .zero }
-        let shortcuts = shortcutStore.shortcuts
+        let shortcuts = menu.shortcuts
         guard shortcuts.indices.contains(index) else { return .zero }
         if axis == .horizontal {
             guard shortcuts[index].id == drag.id else { return .zero }
             return CGSize(width: max(0, drag.translation.width), height: 0)
         }
-        // A copy heading into Hot Buttons leaves the action where it is.
+        // A move into Hot Buttons takes the row out of Actions on release.
         if actionDragIntoHotButtons {
             return .zero
         }
@@ -988,8 +1111,8 @@ struct ActionSlotsDrawer: View {
 
     private func actionRowOpacity(index: Int) -> Double {
         guard let drag = held, drag.list == .actions else { return 1 }
-        guard shortcutStore.shortcuts.indices.contains(index) else { return 1 }
-        guard shortcutStore.shortcuts[index].id == drag.id else { return 1 }
+        guard menu.shortcuts.indices.contains(index) else { return 1 }
+        guard menu.shortcuts[index].id == drag.id else { return 1 }
         if drag.axis == .horizontal {
             let progress = min(1, max(0, drag.translation.width / Metrics.deleteDistance))
             return 1 - 0.45 * progress
@@ -1001,7 +1124,7 @@ struct ActionSlotsDrawer: View {
     }
 
     private func hotRowOffset(index: Int) -> CGSize {
-        let buttons = hotButtons.buttons
+        let buttons = menu.buttons
         guard buttons.indices.contains(index) else { return .zero }
         if let drag = held, drag.list == .hotButtons {
             return hotDragOffset(index: index, drag: drag, count: buttons.count)
@@ -1010,7 +1133,7 @@ struct ActionSlotsDrawer: View {
     }
 
     private func hotDragOffset(index: Int, drag: HeldDrag, count: Int) -> CGSize {
-        let buttons = hotButtons.buttons
+        let buttons = menu.buttons
         guard buttons.indices.contains(index) else { return .zero }
         let exited = hotDragExited(origin: drag.origin, translation: drag.translation, count: count)
         if exited == false {
@@ -1041,12 +1164,12 @@ struct ActionSlotsDrawer: View {
 
     private func hotRowOpacity(index: Int) -> Double {
         guard let drag = held, drag.list == .hotButtons else { return 1 }
-        guard hotButtons.buttons.indices.contains(index) else { return 1 }
-        guard hotButtons.buttons[index].id == drag.id else { return 1 }
+        guard menu.buttons.indices.contains(index) else { return 1 }
+        guard menu.buttons[index].id == drag.id else { return 1 }
         if hotDragExited(
             origin: drag.origin,
             translation: drag.translation,
-            count: hotButtons.buttons.count
+            count: menu.buttons.count
         ) {
             return 0.7
         }
@@ -1060,7 +1183,7 @@ struct ActionSlotsDrawer: View {
         return draggedDownIntoHotButtons(
             origin: drag.origin,
             translationY: drag.translation.height,
-            actionCount: shortcutStore.shortcuts.count
+            actionCount: menu.shortcuts.count
         )
     }
 
@@ -1083,16 +1206,41 @@ struct ActionSlotsDrawer: View {
         return false
     }
 
-    /// `items` is the action text. Inserts a copy. Does not remove the action
-    /// row. Refuses a 7th and a duplicate.
-    private func acceptActionDrop(_ items: [String], at index: Int) -> Bool {
+    /// One move into Hot Buttons. A later handler for the same drag must not
+    /// insert a second row: `reposition` is false for that follow-up.
+    private func acceptActionDrop(_ items: [String], at index: Int, reposition: Bool) -> Bool {
         guard let text = items.first else { return false }
-        return hotButtons.insert(text: text, at: index)
+        dropClaimed = true
+        return menu.moveToHotButtons(text: text, at: index, reposition: reposition)
     }
 
-    /// Same bytes the action row's drag registers: `public.utf8-plain-text`
-    /// and `public.plain-text`. The load finishes after the drop is accepted.
+    private func acceptActionReturn(_ items: [String], at index: Int) -> Bool {
+        guard let text = items.first else { return false }
+        dropClaimed = true
+        return menu.moveToActions(text: text, at: index, reposition: true)
+    }
+
+    /// Same bytes the row's drag registers: `public.utf8-plain-text` and
+    /// `public.plain-text`. The load finishes after the drop is accepted, so
+    /// this pass does not move a row that is already in the destination.
     private func loadActionDrop(_ providers: [NSItemProvider], at index: Int) -> Bool {
+        dropClaimed = true
+        return loadTransferredText(providers) { text in
+            self.menu.moveToHotButtons(text: text, at: index, reposition: false)
+        }
+    }
+
+    private func loadActionReturn(_ providers: [NSItemProvider], at index: Int) -> Bool {
+        dropClaimed = true
+        return loadTransferredText(providers) { text in
+            self.menu.moveToActions(text: text, at: index, reposition: false)
+        }
+    }
+
+    private func loadTransferredText(
+        _ providers: [NSItemProvider],
+        place: @escaping (String) -> Bool
+    ) -> Bool {
         guard let provider = providers.first else { return false }
         let identifiers = [UTType.utf8PlainText.identifier, UTType.plainText.identifier]
         guard let type = identifiers.first(where: { provider.hasItemConformingToTypeIdentifier($0) }) else {
@@ -1101,7 +1249,7 @@ struct ActionSlotsDrawer: View {
         provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in
             guard let data, let text = String(data: data, encoding: .utf8) else { return }
             DispatchQueue.main.async {
-                _ = self.hotButtons.insert(text: text, at: index)
+                _ = place(text)
             }
         }
         return true
@@ -1110,7 +1258,14 @@ struct ActionSlotsDrawer: View {
     /// Midpoint of each row in the well. The well's local origin is the first
     /// row, including when that row is the empty minimum-height target.
     private func indexForRowDrop(_ localY: CGFloat) -> Int {
-        let count = hotButtons.buttons.count
+        indexForDrop(localY, count: menu.buttons.count)
+    }
+
+    private func indexForShortcutDrop(_ localY: CGFloat) -> Int {
+        indexForDrop(localY, count: menu.shortcuts.count)
+    }
+
+    private func indexForDrop(_ localY: CGFloat, count: Int) -> Int {
         guard count > 0 else { return 0 }
         if localY < 0 { return 0 }
         for index in 0..<count {
