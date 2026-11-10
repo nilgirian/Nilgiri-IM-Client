@@ -229,6 +229,7 @@ final class ActionMenuStore: ObservableObject {
         return true
     }
 
+    @discardableResult
     func moveToActions(id: UUID, at index: Int, reposition: Bool) -> Bool {
         guard let button = buttons.first(where: { $0.id == id }) else { return false }
         return moveToActions(text: button.text, at: index, reposition: reposition)
@@ -595,7 +596,7 @@ struct ActionSlotsDrawer: View {
         .dropDestination(for: String.self) { items, location in
             acceptActionReturn(items, at: indexForShortcutDrop(location.y))
         } isTargeted: { _ in }
-        .onDrop(of: [UTType.utf8PlainText, UTType.plainText]) { providers in
+        .onDrop(of: [UTType.utf8PlainText, UTType.plainText], isTargeted: nil) { providers in
             loadActionReturn(providers, at: menu.shortcuts.count)
         }
     }
