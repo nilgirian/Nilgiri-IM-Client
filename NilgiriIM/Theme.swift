@@ -7,6 +7,19 @@ enum Chrome {
     static let barOpacity = 0.5
 
     static let barBackground = AnyShapeStyle(Material.ultraThin.opacity(barOpacity))
+
+    /// White laid over that frost on a play-screen hot button (a compass
+    /// letter and an action plate). 0.20 is a fifth lighter than the bare
+    /// frost, short of a wash. Both buttons use this one resting fill.
+    static let hotButtonPlateLighten = 0.20
+
+    static let hotButtonPlate = Color.white.opacity(hotButtonPlateLighten)
+
+    /// Press light. White at 0.42 still sits well above the 0.20 rest, so a
+    /// tap reads as a flash rather than another shade of the plate.
+    static let hotButtonFlashOpacity = 0.42
+
+    static let hotButtonFlash = Color.white.opacity(hotButtonFlashOpacity)
 }
 
 /// Matrix Mode. The left-edge card writes it. Missing key stays off.
