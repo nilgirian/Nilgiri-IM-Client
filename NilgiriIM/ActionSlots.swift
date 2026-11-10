@@ -231,11 +231,17 @@ struct ActionSlotsDrawer: View {
         .shadow(color: .black.opacity(0.45), radius: 14, x: -8, y: 0)
     }
 
-    /// Slot name on the left, pull-down of the action on the right.
+    /// Slot name, then the letter the hot button shows for the assigned
+    /// action, then the pull-down. A blank slot keeps the letter's width and
+    /// draws nothing, so the rows still line up. Hiding hot-button labels
+    /// leaves this letter visible.
     private func slotRow(_ index: Int) -> some View {
         HStack(spacing: 12) {
-            Text("Slot \(index + 1)")
-                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Slot \(index + 1)")
+                slotLetter(index)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             Picker("Slot \(index + 1)", selection: store.binding(at: index)) {
                 ForEach(SkillAction.allCases) { action in
                     Text(verbatim: action.menuTitle).tag(action)
@@ -246,6 +252,22 @@ struct ActionSlotsDrawer: View {
             .tint(MatrixShade.display(Color(white: 0.78), enabled: matrixMode.enabled))
         }
     }
+
+    /// The same bold letter a hot button paints, in the hot button's ink.
+    /// Matrix Mode recolours it the same way. A blank keeps a clear letter
+    /// of that width so the slot name stays on the same line.
+    private func slotLetter(_ index: Int) -> some View {
+        let letter = store.slots.indices.contains(index) ? store.slots[index].letter : nil
+        return Text(verbatim: letter ?? "H")
+            .font(.system(size: 17, weight: .bold))
+            .foregroundStyle(MatrixShade.display(Color(white: 0.78), enabled: matrixMode.enabled))
+            .opacity(letter == nil ? 0 : 1)
+            .frame(width: Self.slotLetterWidth, alignment: .center)
+            .accessibilityHidden(letter == nil)
+    }
+
+    /// Wide enough for one bold capital at the row's 17pt size.
+    private static let slotLetterWidth: CGFloat = 20
 
     /// Opens from the right edge, or follows a finger that is already dragging the card.
     /// A vertical move that starts while the card is closed is left alone.
