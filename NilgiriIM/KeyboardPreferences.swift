@@ -125,12 +125,13 @@ struct WindowPortraitProbe: UIViewRepresentable {
 }
 
 /// Dark grey card on the left edge. A rightward swipe from that edge opens it.
-/// Portrait and landscape keyboard switches stay at the top, then the switch
-/// that hides hot-button letters and Keep last command. Report issues, the
-/// newbie guide, and About Nilgiri IM open in Safari. Unlink, while the
-/// player is in the game, sits at the bottom of the card.
+/// Portrait and landscape keyboard switches, Matrix Mode, Hide hot button
+/// labels, and Keep last command stay at the top. Report issues, the newbie
+/// guide, and About Nilgiri IM open in Safari. Unlink, while the player is
+/// in the game, sits at the bottom of the card.
 struct KeyboardSettingsDrawer: View {
     @ObservedObject var preferences: KeyboardHidePreferences
+    @ObservedObject var matrixMode: MatrixMode
     /// Toggled by the accessibility action. Each change opens the card.
     @Binding var openRequest: Bool
     /// False on the welcome menu. Unlink is an in-game control.
@@ -228,9 +229,10 @@ struct KeyboardSettingsDrawer: View {
             VStack(alignment: .leading, spacing: 22) {
                 Text("Keyboard")
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.62))
+                    .foregroundStyle(Color(white: 0.62).matrix)
                 Toggle("Hide keyboard in portrait mode", isOn: $preferences.hideInPortrait)
                 Toggle("Hide keyboard in landscape mode", isOn: $preferences.hideInLandscape)
+                Toggle("Matrix Mode", isOn: $matrixMode.enabled)
                 Toggle("Hide hot button labels", isOn: $preferences.hideHotButtonLabels)
                 Toggle("Keep last command", isOn: $preferences.keepLastCommand)
                 VStack(alignment: .leading, spacing: 12) {
@@ -250,7 +252,7 @@ struct KeyboardSettingsDrawer: View {
             .font(.system(size: 17))
             .toggleStyle(.switch)
             .tint(Color(white: 0.78))
-            .foregroundStyle(Color(white: 0.92))
+            .foregroundStyle(Color(white: 0.92).matrix)
             .padding(.leading, insets.left + 20)
             .padding(.trailing, 18)
             .padding(.top, insets.top + 24)

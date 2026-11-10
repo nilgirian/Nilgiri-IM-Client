@@ -2,6 +2,7 @@ import SwiftUI
 
 struct LoginView: View {
     @EnvironmentObject private var session: IMSession
+    @StateObject private var matrixMode = MatrixMode.shared
     @FocusState private var passwordFocused: Bool
     /// Bumped on every password write. A name edit clears Password only when
     /// this is unchanged across one main-actor turn, so AutoFill can write
@@ -39,7 +40,7 @@ struct LoginView: View {
                             Task { await session.login() }
                         } label: {
                             Text(session.offersResume ? "Resume parked session" : "Enter Nilgiri")
-                                .foregroundStyle(Color.black)
+                                .foregroundStyle(Color.black.matrix)
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
@@ -49,7 +50,7 @@ struct LoginView: View {
 
                         Text("– OR –")
                             .font(.caption)
-                            .foregroundStyle(Color(white: 0.78))
+                            .foregroundStyle(Color(white: 0.78).matrix)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
                             .accessibilityLabel("or")
@@ -58,7 +59,7 @@ struct LoginView: View {
                             session.openCharacterCreation()
                         } label: {
                             Text("Create new character")
-                                .foregroundStyle(Color(white: 0.78))
+                                .foregroundStyle(Color(white: 0.78).matrix)
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.bordered)
@@ -71,11 +72,12 @@ struct LoginView: View {
                 } footer: {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(session.status)
-                            .foregroundStyle(session.characterMissing ? Color.red : Color(white: 0.78))
+                            .foregroundStyle(session.characterMissing ? Color.red.matrix : Color(white: 0.78).matrix)
                         if session.characterMissing {
                             Button("Create new character") {
                                 session.openCharacterCreation()
                             }
+                            .matrixAccentText()
                             .disabled(session.busy)
                         }
                     }
@@ -93,7 +95,7 @@ struct LoginView: View {
             }
             .scrollContentBackground(.hidden)
             .background(Color.black)
-            .foregroundStyle(Color(white: 0.78))
+            .foregroundStyle(MatrixShade.display(Color(white: 0.78), enabled: matrixMode.enabled))
             .preferredColorScheme(.dark)
             .toolbarBackground(Color.black, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
@@ -104,6 +106,7 @@ struct LoginView: View {
                 ToolbarItem(placement: .principal) {
                     Text("Nilgiri the Forgotten World")
                         .font(.headline)
+                        .foregroundStyle(matrixMode.enabled ? Color.primary.matrix : Color.primary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.6)
                 }
@@ -184,7 +187,7 @@ struct FieldClearButton: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: "xmark.circle.fill")
-                .foregroundStyle(Color(white: 0.55))
+                .foregroundStyle(Color(white: 0.55).matrix)
                 .frame(minWidth: 44, minHeight: 44)
                 .contentShape(Rectangle())
         }
@@ -230,7 +233,7 @@ struct RevealableSecureField: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button(action: toggleReveal) {
                 Image(systemName: revealed ? "eye.slash" : "eye")
-                    .foregroundStyle(Color(white: 0.78))
+                    .foregroundStyle(Color(white: 0.78).matrix)
                     .frame(minWidth: 44, minHeight: 44)
                     .contentShape(Rectangle())
             }

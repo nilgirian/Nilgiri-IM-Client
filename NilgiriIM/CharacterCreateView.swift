@@ -10,6 +10,7 @@ private let creationScreen = Color.black
 /// reads the email.
 struct CharacterCreateView: View {
     @EnvironmentObject private var session: IMSession
+    @StateObject private var matrixMode = MatrixMode.shared
     @State private var selectedIndex: Int?
     @State private var textAnswer = ""
     @State private var passwordAnswer = ""
@@ -39,7 +40,8 @@ struct CharacterCreateView: View {
                     Button("Cancel") {
                         session.cancelCharacterCreation()
                     }
-                    .foregroundStyle(Color(white: 0.78))
+                    .foregroundStyle(Color(white: 0.78).matrix)
+                    .matrixAccentText()
                 }
                 if session.createStep?.isPassword == true {
                     ToolbarItemGroup(placement: .keyboard) {
@@ -47,6 +49,7 @@ struct CharacterCreateView: View {
                         Button("Done") {
                             passwordFocused = false
                         }
+                        .matrixAccentText()
                     }
                 }
             }
@@ -72,7 +75,7 @@ struct CharacterCreateView: View {
             Section {
                 if let createError = session.createError, createError.isEmpty == false {
                     Text(createError)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(Color.red.matrix)
                 }
                 Button {
                     Task { await session.startCharacterCreation() }
@@ -84,12 +87,13 @@ struct CharacterCreateView: View {
                         }
                     }
                 }
+                .matrixAccentText()
                 .disabled(canStart == false)
             }
         }
         .scrollContentBackground(.hidden)
         .background(creationScreen)
-        .foregroundStyle(Color(white: 0.78))
+        .foregroundStyle(Color(white: 0.78).matrix)
     }
 
     private var canStart: Bool {
@@ -118,7 +122,12 @@ struct CharacterCreateView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 0) {
-                            Ansi.text(session.createGreeting ?? "", fontSize: fontSize, columns: creationColumns)
+                            Ansi.text(
+                                session.createGreeting ?? "",
+                                fontSize: fontSize,
+                                columns: creationColumns,
+                                matrix: matrixMode.enabled
+                            )
                                 .frame(maxWidth: .infinity, alignment: .topLeading)
                                 .padding(8)
                             creationSections(fontSize: fontSize)
@@ -180,7 +189,7 @@ struct CharacterCreateView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if let error = step.error, error.isEmpty == false {
                     Text(error)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(Color.red.matrix)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if step.isText {
@@ -216,6 +225,7 @@ struct CharacterCreateView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(Color(white: 0.28))
+                .matrixProminentText()
                 .disabled(session.createBusy || answer(for: step).isEmpty)
             }
             .padding(16)
@@ -229,7 +239,7 @@ struct CharacterCreateView: View {
         .scrollBounceBehavior(.basedOnSize)
         .frame(maxHeight: maxHeight)
         .frame(height: fittedHeight)
-        .foregroundStyle(creationInk)
+        .foregroundStyle(creationInk.matrix)
         .background(Chrome.barBackground)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .background {
@@ -251,7 +261,8 @@ struct CharacterCreateView: View {
                     Ansi.text(
                         ansiLines.joined(separator: "\n"),
                         fontSize: fontSize,
-                        columns: creationColumns
+                        columns: creationColumns,
+                        matrix: matrixMode.enabled
                     )
                     .frame(maxWidth: .infinity, alignment: .topLeading)
                     .padding(.horizontal, 8)
@@ -259,7 +270,7 @@ struct CharacterCreateView: View {
                     ForEach(Array(section.lines.enumerated()), id: \.offset) { _, line in
                         Text(verbatim: line.isEmpty ? " " : line)
                             .font(.system(size: fontSize, design: .monospaced))
-                            .foregroundStyle(creationInk)
+                            .foregroundStyle(creationInk.matrix)
                             .multilineTextAlignment(.leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 8)
@@ -313,7 +324,7 @@ struct CharacterCreateView: View {
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             if let error = step.error, error.isEmpty == false {
                 Text(error)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Color.red.matrix)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             Button {
@@ -323,11 +334,12 @@ struct CharacterCreateView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(Color(white: 0.28))
+            .matrixProminentText()
             .disabled(session.createBusy || passwordAnswer.isEmpty)
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .foregroundStyle(creationInk)
+        .foregroundStyle(creationInk.matrix)
         .background(Chrome.barBackground)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .background {

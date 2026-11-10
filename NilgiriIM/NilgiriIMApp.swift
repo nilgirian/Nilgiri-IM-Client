@@ -87,6 +87,8 @@ private func clearDeliveredNotificationsAndBadge(_ session: IMSession) {
 /// The app credit and the world credit sit between those two lines.
 /// Black on white stays the same in light and dark mode.
 private struct LaunchSplash: View {
+    @StateObject private var matrixMode = MatrixMode.shared
+
     var body: some View {
         ZStack {
             Color.white.ignoresSafeArea()
@@ -108,7 +110,7 @@ private struct LaunchSplash: View {
                 Text(versionLine)
                     .font(.subheadline)
             }
-            .foregroundStyle(Color.black)
+            .foregroundStyle(MatrixShade.display(Color.black, enabled: matrixMode.enabled))
             .multilineTextAlignment(.center)
             .padding(.horizontal, 32)
         }
