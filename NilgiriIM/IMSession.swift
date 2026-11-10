@@ -30,6 +30,9 @@ final class IMSession: ObservableObject {
     /// Awards from lines that just arrived (`+87 XP!`, `LEVEL!`), in order.
     /// Replacing a saved transcript does not set it. The line text stays.
     @Published private(set) var progressPulse: ProgressPulse?
+    /// Latest long-exit listing. Nil until one has been read, including after
+    /// the transcript is wiped. Reading it does not change line text.
+    @Published private(set) var roomExits: RoomExitListing?
     @Published var lines: [LineDTO] = []
     /// Word hilited in the main transcript. Nil when nothing is hilited.
     /// Later actions can target this. The server's line text is not changed.
@@ -147,6 +150,9 @@ final class IMSession: ObservableObject {
     /// `+87 XP!` / `LEVEL!` collected from this live batch. Cleared on commit.
     private var liveProgress: [String] = []
     private var progressSerial = 0
+    /// Long-exit lines seen so far. A block can span server lines, so this
+    /// stays across appends. A replaced transcript starts it over.
+    private var exitScan = RoomExitScan()
     private let defaults = UserDefaults.standard
 
     private enum StoreKey {
@@ -444,13 +450,23 @@ final class IMSession: ObservableObject {
         cancelCharacterCreation()
     }
 
-    func send() async {
-        // The welcome menu is the panel. A typed line would answer it.
+    /// Posts the command line. `fallback` is sent only when the field is blank,
+    /// and it is not written into the field, so a repeated command can stay
+    /// a grey placeholder. The welcome menu is the panel; a typed line would
+    /// answer it.
+    func send(fallback: String? = nil) async {
         guard atMenu == false else { return }
         menuExit = false
-        let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let typed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = typed.isEmpty
+            ? (fallback?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+            : typed
         guard text.isEmpty == false else { return }
-        command = ""
+        // Already blank when repeating a placeholder. Leaving `command` alone
+        // avoids a field update that would restart the keyboard session.
+        if command.isEmpty == false {
+            command = ""
+        }
         do {
             let data = try await post("/input", ["text": text])
             noteMenuFlag(data)
@@ -582,6 +598,7 @@ final class IMSession: ObservableObject {
             }
             cancelResumeReveal()
             lines = []
+            forgetRoomExits()
             lastSeq = 0
             token = nil
             sessionId = nil
@@ -977,6 +994,7 @@ final class IMSession: ObservableObject {
     private func dropClosedSession() async {
         cancelResumeReveal()
         lines = []
+        forgetRoomExits()
         lastSeq = 0
         atMenu = false
         menuBusy = false
@@ -1096,6 +1114,7 @@ final class IMSession: ObservableObject {
     ) {
         // Another character's saved cursor is not a gap in this transcript.
         let seenSeq = trustCursor ? lastSeq : 0
+        exitScan.reset()
         var shown: [LineDTO] = []
         var maxSeq: Int64 = 0
         for line in incoming {
@@ -1103,8 +1122,10 @@ final class IMSession: ObservableObject {
                 maxSeq = line.seq
             }
             guard let shownLine = presentable(line, live: false, adoptDeath: false) else { continue }
+            exitScan.consume(shownLine.text)
             shown.append(shownLine)
         }
+        noteRoomExits()
         commitVitals()
         lastSeq = maxSeq
         // Keep the newest window before the separator is placed, so a long
@@ -1143,9 +1164,13 @@ final class IMSession: ObservableObject {
                 adoptDeath: fresh && adoptDeath
             ) else { continue }
             if fresh {
+                // Exits are read off the text that will be shown. A repeated
+                // seq is not read again, and the stored line is not rewritten.
+                exitScan.consume(shownLine.text)
                 next.append(shownLine)
             }
         }
+        noteRoomExits()
         commitVitals()
         publishLines(
             trimmed(applyingDisconnectSeparator(
@@ -1169,6 +1194,21 @@ final class IMSession: ObservableObject {
             pendingResumeReveal = true
         }
         lines = next
+    }
+
+    /// Publishes the listing the scanner committed, if it changed.
+    /// The transcript lines are left as they were.
+    private func noteRoomExits() {
+        let scanned = exitScan.listing
+        guard scanned != roomExits else { return }
+        roomExits = scanned
+    }
+
+    /// Drops a listing with the transcript it came from.
+    private func forgetRoomExits() {
+        exitScan.reset()
+        guard roomExits != nil else { return }
+        roomExits = nil
     }
 
     /// The transcript calls this after the ease to the bottom has finished.
@@ -1753,6 +1793,7 @@ final class IMSession: ObservableObject {
         cancelResumeReveal()
         resumeSeparatorID = nil
         lines = []
+        forgetRoomExits()
         lastSeq = 0
         pendingVitals = nil
         vitals = nil
@@ -1787,6 +1828,7 @@ final class IMSession: ObservableObject {
         cancelResumeReveal()
         resumeSeparatorID = nil
         lines = []
+        forgetRoomExits()
         lastSeq = 0
         atMenu = false
         menuBusy = false

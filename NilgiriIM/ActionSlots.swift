@@ -178,6 +178,7 @@ final class ActionShortcutStore: ObservableObject {
 struct ActionSlotsDrawer: View {
     @ObservedObject var store: ActionSlotStore
     @ObservedObject var shortcutStore: ActionShortcutStore
+    @ObservedObject private var matrixMode = MatrixMode.shared
     /// Toggled by the accessibility action. Each change opens the card.
     @Binding var openRequest: Bool
     /// Global frame of the log between the bars. Empty until the first layout.
@@ -312,7 +313,7 @@ struct ActionSlotsDrawer: View {
                     }
                 }
                 .font(.system(size: 17))
-                .foregroundStyle(Color(white: 0.92))
+                .foregroundStyle(MatrixShade.display(Color(white: 0.92), enabled: matrixMode.enabled))
                 .padding(.trailing, insets.right + 20)
                 .padding(.leading, 18)
                 .padding(.top, insets.top + 24)
@@ -356,7 +357,7 @@ struct ActionSlotsDrawer: View {
     private func sectionTitle(_ title: String) -> some View {
         Text(title)
             .font(.system(size: 13, weight: .semibold, design: .monospaced))
-            .foregroundStyle(Color(white: 0.62))
+            .foregroundStyle(MatrixShade.display(Color(white: 0.62), enabled: matrixMode.enabled))
             .accessibilityAddTraits(.isHeader)
     }
 
@@ -478,7 +479,7 @@ struct ActionSlotsDrawer: View {
             }
             .pickerStyle(.menu)
             .labelsHidden()
-            .tint(Color(white: 0.78))
+            .tint(MatrixShade.display(Color(white: 0.78), enabled: matrixMode.enabled))
         }
     }
 

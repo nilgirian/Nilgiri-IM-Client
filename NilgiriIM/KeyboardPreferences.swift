@@ -2,8 +2,11 @@ import SwiftUI
 import UIKit
 
 /// Whether sending a command, or turning the window, dismisses the keyboard.
+/// Also whether the input line keeps the last command as grey placeholder text.
 /// Missing keys keep the device default. iPhone hides in landscape only.
-/// iPad keeps the keyboard up in both orientations. Moving a switch writes the key.
+/// iPad keeps the keyboard up in both orientations. The hot-button switch
+/// hides letters only; a missing key leaves them showing. Keep last command defaults off.
+/// Moving a switch writes the key.
 final class KeyboardHidePreferences: ObservableObject {
     @Published var hideInPortrait: Bool {
         didSet { UserDefaults.standard.set(hideInPortrait, forKey: Key.portrait) }
@@ -13,9 +16,22 @@ final class KeyboardHidePreferences: ObservableObject {
         didSet { UserDefaults.standard.set(hideInLandscape, forKey: Key.landscape) }
     }
 
+    /// Hide the letter on each on-screen hot button. The plate stays, and it still lights.
+    @Published var hideHotButtonLabels: Bool {
+        didSet { UserDefaults.standard.set(hideHotButtonLabels, forKey: Key.hotButtonLabels) }
+    }
+
+    /// Grey placeholder of the last command sent from the input line.
+    /// Return on an empty field sends that text. Off leaves the placeholder blank.
+    @Published var keepLastCommand: Bool {
+        didSet { UserDefaults.standard.set(keepLastCommand, forKey: Key.keepLastCommand) }
+    }
+
     private enum Key {
         static let portrait = "im.hideKeyboardPortrait"
         static let landscape = "im.hideKeyboardLandscape"
+        static let hotButtonLabels = "im.hideHotButtonLabels"
+        static let keepLastCommand = "im.keepLastCommand"
     }
 
     init() {
@@ -23,6 +39,8 @@ final class KeyboardHidePreferences: ObservableObject {
         let phone = UIDevice.current.userInterfaceIdiom == .phone
         hideInPortrait = Self.stored(defaults, Key.portrait, fallback: false)
         hideInLandscape = Self.stored(defaults, Key.landscape, fallback: phone)
+        hideHotButtonLabels = Self.stored(defaults, Key.hotButtonLabels, fallback: false)
+        keepLastCommand = Self.stored(defaults, Key.keepLastCommand, fallback: false)
     }
 
     func hidesKeyboard(isPortrait: Bool) -> Bool {
@@ -107,11 +125,13 @@ struct WindowPortraitProbe: UIViewRepresentable {
 }
 
 /// Dark grey card on the left edge. A rightward swipe from that edge opens it.
-/// Portrait and landscape keyboard switches stay at the top. Report issues,
-/// the newbie guide, and About Nilgiri IM open in Safari. Unlink, while the
-/// player is in the game, sits at the bottom of the card.
+/// Portrait and landscape keyboard switches, Matrix Mode, Hide hot button
+/// labels, and Keep last command stay at the top. Report issues, the newbie
+/// guide, and About Nilgiri IM open in Safari. Unlink, while the player is
+/// in the game, sits at the bottom of the card.
 struct KeyboardSettingsDrawer: View {
     @ObservedObject var preferences: KeyboardHidePreferences
+    @ObservedObject var matrixMode: MatrixMode
     /// Toggled by the accessibility action. Each change opens the card.
     @Binding var openRequest: Bool
     /// False on the welcome menu. Unlink is an in-game control.
@@ -209,9 +229,12 @@ struct KeyboardSettingsDrawer: View {
             VStack(alignment: .leading, spacing: 22) {
                 Text("Keyboard")
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.62))
+                    .foregroundStyle(Color(white: 0.62).matrix)
                 Toggle("Hide keyboard in portrait mode", isOn: $preferences.hideInPortrait)
                 Toggle("Hide keyboard in landscape mode", isOn: $preferences.hideInLandscape)
+                Toggle("Matrix Mode", isOn: $matrixMode.enabled)
+                Toggle("Hide hot button labels", isOn: $preferences.hideHotButtonLabels)
+                Toggle("Keep last command", isOn: $preferences.keepLastCommand)
                 VStack(alignment: .leading, spacing: 12) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("To report issues, take a screenshot and you should have an option to \"Share Beta Feedback\" or use this link to")
@@ -229,7 +252,7 @@ struct KeyboardSettingsDrawer: View {
             .font(.system(size: 17))
             .toggleStyle(.switch)
             .tint(Color(white: 0.78))
-            .foregroundStyle(Color(white: 0.92))
+            .foregroundStyle(Color(white: 0.92).matrix)
             .padding(.leading, insets.left + 20)
             .padding(.trailing, 18)
             .padding(.top, insets.top + 24)
