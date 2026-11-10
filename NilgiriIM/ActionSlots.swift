@@ -1,92 +1,6 @@
 import SwiftUI
 import UIKit
 
-/// One assignable right-edge action. `blank` shows no icon and sends nothing.
-/// The letter is a bold system glyph. `hit` uses H; the issue named letters
-/// for kick, backstab, look, flee, and drink, and left hit to match that set.
-enum SkillAction: String, CaseIterable, Identifiable {
-    case blank
-    case hit
-    case kick
-    case backstab
-    case look
-    case flee
-    case drink
-
-    var id: String { rawValue }
-
-    /// Pull-down title. The word is the command, so it stays lowercase.
-    var menuTitle: String { rawValue }
-
-    var letter: String? {
-        switch self {
-        case .blank: return nil
-        case .hit: return "H"
-        case .kick: return "K"
-        case .backstab: return "B"
-        case .look: return "L"
-        case .flee: return "F"
-        case .drink: return "D"
-        }
-    }
-
-    /// `kick`, or `kick guard` when a word is hilited. Nil for a blank slot.
-    /// The hilite is sent as stored. A missing hilite sends the verb alone.
-    func command(target: String?) -> String? {
-        guard self != .blank else { return nil }
-        let name = target?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if name.isEmpty { return rawValue }
-        return rawValue + " " + name
-    }
-}
-
-/// Three action slots. Missing or unknown values stay blank. A change writes
-/// `im.actionSlots` so the icons are still there after a relaunch.
-final class ActionSlotStore: ObservableObject {
-    static let count = 3
-
-    @Published var slots: [SkillAction] {
-        didSet { save() }
-    }
-
-    private enum Key {
-        static let slots = "im.actionSlots"
-    }
-
-    init() {
-        slots = Self.load()
-    }
-
-    func binding(at index: Int) -> Binding<SkillAction> {
-        Binding(
-            get: {
-                guard self.slots.indices.contains(index) else { return .blank }
-                return self.slots[index]
-            },
-            set: { newValue in
-                guard self.slots.indices.contains(index) else { return }
-                guard self.slots[index] != newValue else { return }
-                self.slots[index] = newValue
-            }
-        )
-    }
-
-    private func save() {
-        UserDefaults.standard.set(slots.map(\.rawValue), forKey: Key.slots)
-    }
-
-    private static func load() -> [SkillAction] {
-        guard let raw = UserDefaults.standard.stringArray(forKey: Key.slots) else {
-            return Array(repeating: .blank, count: count)
-        }
-        var loaded = raw.prefix(count).map { SkillAction(rawValue: $0) ?? .blank }
-        while loaded.count < count {
-            loaded.append(.blank)
-        }
-        return loaded
-    }
-}
-
 /// One right-edge shortcut. The text is sent as the player left it.
 /// A new id is minted when the row is created; reloading mints new ids and
 /// the saved order is the string array.
@@ -171,13 +85,142 @@ final class ActionShortcutStore: ObservableObject {
     }
 }
 
+/// One play-screen hot button. `text` is the action, copied from the shortcut
+/// the player dropped and never rewritten. `icon` is 0, 1, or 2 characters.
+/// Empty means the plate is drawn with no glyph.
+struct HotButton: Identifiable, Equatable {
+    let id: UUID
+    var text: String
+    var icon: String
+
+    init(id: UUID = UUID(), text: String, icon: String) {
+        self.id = id
+        self.text = text
+        self.icon = Self.clampedIcon(icon)
+    }
+
+    /// Newlines are not an icon. Anything past two characters is dropped.
+    static func clampedIcon(_ raw: String) -> String {
+        let flat = raw.filter { $0.isNewline == false }
+        return String(flat.prefix(2))
+    }
+
+    /// The glyph a newly dropped action starts with. The first character,
+    /// uppercased when it is a letter, so `hit` starts as H. Empty text
+    /// starts with no icon. The player can replace it with anything, or clear it.
+    static func defaultIcon(for text: String) -> String {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = body.first else { return "" }
+        if first.isLetter {
+            return String(first).uppercased()
+        }
+        return String(first)
+    }
+}
+
+/// The hot buttons, in the order the play screen draws them. At most six.
+/// Missing `im.hotButtons` seeds hit [H], look [L], flee [F]. An empty array
+/// is a list the player cleared, so the seed is not put back. The old slot
+/// key is not read: this list replaces those three pull-downs.
+final class HotButtonStore: ObservableObject {
+    static let limit = 6
+
+    @Published private(set) var buttons: [HotButton] {
+        didSet { save() }
+    }
+
+    private enum Key {
+        static let buttons = "im.hotButtons"
+    }
+
+    private struct Record: Codable {
+        var text: String
+        var icon: String
+    }
+
+    private static let seed: [HotButton] = [
+        HotButton(text: "hit", icon: "H"),
+        HotButton(text: "look", icon: "L"),
+        HotButton(text: "flee", icon: "F"),
+    ]
+
+    init() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: Key.buttons) == nil {
+            buttons = Self.seed
+            Self.write(Self.seed, defaults: defaults)
+        } else {
+            buttons = Self.read(defaults)
+        }
+    }
+
+    /// Same action twice is refused. Comparison trims both ends and leaves
+    /// the stored text alone, so `hit` and `hit ` are one action.
+    func canAccept(_ text: String) -> Bool {
+        guard buttons.count < Self.limit else { return false }
+        let key = Self.matchKey(text)
+        return buttons.contains { Self.matchKey($0.text) == key } == false
+    }
+
+    @discardableResult
+    func insert(text: String, at index: Int) -> Bool {
+        guard canAccept(text) else { return false }
+        let item = HotButton(text: text, icon: HotButton.defaultIcon(for: text))
+        let clamped = min(max(0, index), buttons.count)
+        buttons.insert(item, at: clamped)
+        return true
+    }
+
+    func updateIcon(id: UUID, icon: String) {
+        guard let index = buttons.firstIndex(where: { $0.id == id }) else { return }
+        let clamped = HotButton.clampedIcon(icon)
+        guard buttons[index].icon != clamped else { return }
+        buttons[index].icon = clamped
+    }
+
+    func remove(id: UUID) {
+        guard let index = buttons.firstIndex(where: { $0.id == id }) else { return }
+        buttons.remove(at: index)
+    }
+
+    func move(from: Int, to: Int) {
+        guard buttons.indices.contains(from), buttons.indices.contains(to), from != to else { return }
+        let item = buttons.remove(at: from)
+        buttons.insert(item, at: to)
+    }
+
+    private static func matchKey(_ text: String) -> String {
+        text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func save() {
+        Self.write(Array(buttons.prefix(Self.limit)), defaults: .standard)
+    }
+
+    private static func write(_ buttons: [HotButton], defaults: UserDefaults) {
+        let records = buttons.prefix(Self.limit).map { Record(text: $0.text, icon: HotButton.clampedIcon($0.icon)) }
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        defaults.set(data, forKey: Key.buttons)
+    }
+
+    /// A present key that does not decode stays empty. That is not the
+    /// missing-key case, so the seed is not written back over it.
+    private static func read(_ defaults: UserDefaults) -> [HotButton] {
+        guard let data = defaults.data(forKey: Key.buttons),
+              let records = try? JSONDecoder().decode([Record].self, from: data) else {
+            return []
+        }
+        return records.prefix(Self.limit).map { HotButton(text: $0.text, icon: $0.icon) }
+    }
+}
+
 /// Dark grey card on the right edge, the left settings card mirrored.
 /// A leftward swipe from the log's right edge opens it. Shortcuts sit above
-/// the three pull-downs. The strip is only as tall as the log, so Say, Send,
+/// the hot buttons. The strip is only as tall as the log, so Say, Send,
 /// and the name bar keep their taps.
 struct ActionSlotsDrawer: View {
-    @ObservedObject var store: ActionSlotStore
     @ObservedObject var shortcutStore: ActionShortcutStore
+    @ObservedObject var hotButtons: HotButtonStore
     @ObservedObject private var matrixMode = MatrixMode.shared
     /// Toggled by the accessibility action. Each change opens the card.
     @Binding var openRequest: Bool
@@ -194,15 +237,30 @@ struct ActionSlotsDrawer: View {
     private enum Metrics {
         static let rowStride: CGFloat = 48
         static let deleteDistance: CGFloat = 64
+        static let iconHitWidth: CGFloat = 52
+        static let stripBody: CGFloat = 52
     }
 
-    /// Row being held. Nil when no shortcut drag is in progress.
-    private struct ShortcutDrag {
+    private enum DragList { case actions, hotButtons }
+
+    /// Row being held. Nil when no drag is in progress.
+    private struct HeldDrag {
         enum Axis { case horizontal, vertical }
         var id: UUID
+        var list: DragList
         var origin: Int
         var translation: CGSize
         var axis: Axis?
+        /// Finger, in the window. Compared with the row frames from the probes.
+        var location: CGPoint
+    }
+
+    /// An action drag that is currently over a hot-button target.
+    private struct IncomingDrop {
+        var index: Int
+        var accepted: Bool
+        /// Over the rows themselves, so they can open a gap. A strip drop appends.
+        var overRows: Bool
     }
 
     /// Dark grey, see-through, so the log shows behind the card.
@@ -215,10 +273,16 @@ struct ActionSlotsDrawer: View {
     @State private var cardOpen = false
     /// Shortcut row in inline edit. Nil shows every row as a label.
     @State private var editingID: UUID?
-    /// Hold-and-drag on a shortcut. While set, the card's own pan stays put.
-    @State private var shortcutDrag: ShortcutDrag?
+    /// Hot-button icon in inline edit. Nil shows every icon as a plate.
+    @State private var editingIconID: UUID?
+    /// Hold-and-drag. While set, the card's own pan stays put.
+    @State private var held: HeldDrag?
     /// True from the long-press began until the finger lifts.
-    @State private var shortcutDragActive = false
+    @State private var heldActive = false
+    /// Visible card, in window coordinates. The flying preview is positioned from it.
+    @State private var cardWindow: CGRect = .zero
+    /// Hot-button rows, in window coordinates. Empty until they have been laid out.
+    @State private var hotWindow: CGRect = .zero
 
     var body: some View {
         GeometryReader { geo in
@@ -297,7 +361,7 @@ struct ActionSlotsDrawer: View {
 
     private func card(width: CGFloat, height: CGFloat, insets: UIEdgeInsets) -> some View {
         // The column is at least as tall as the window. A short landscape
-        // window scrolls instead of clipping the last slot. Bounce stays off
+        // window scrolls instead of clipping the last row. Bounce stays off
         // while nothing overflows.
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
@@ -307,9 +371,9 @@ struct ActionSlotsDrawer: View {
                         shortcutRows(width: width)
                     }
                     sectionDivider
-                    sectionTitle("Hot Buttons")
-                    ForEach(0..<ActionSlotStore.count, id: \.self) { index in
-                        slotRow(index)
+                    VStack(alignment: .leading, spacing: 8) {
+                        sectionTitle("Hot Buttons")
+                        hotButtonRows
                     }
                 }
                 .font(.system(size: 17))
@@ -321,7 +385,7 @@ struct ActionSlotsDrawer: View {
                 .frame(maxWidth: .infinity, minHeight: height, alignment: .topLeading)
             }
             .scrollBounceBehavior(.basedOnSize)
-            .scrollDisabled(shortcutDragActive)
+            .scrollDisabled(heldActive)
             // A scroll while editing must not take the keyboard down. The
             // command field is already resigned for the open card.
             .scrollDismissesKeyboard(.never)
@@ -332,11 +396,18 @@ struct ActionSlotsDrawer: View {
                 guard let id else { return }
                 scrollEditingRow(id, proxy: proxy)
             }
+            .onChange(of: editingIconID) { _, id in
+                guard let id else { return }
+                scrollEditingRow(id, proxy: proxy)
+            }
         }
         .ignoresSafeArea()
         .frame(width: width, alignment: .topLeading)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(Self.menuGrey)
+        .overlay {
+            dragOverlay
+        }
         .clipShape(
             UnevenRoundedRectangle(
                 topLeadingRadius: 18,
@@ -352,6 +423,31 @@ struct ActionSlotsDrawer: View {
                 .frame(width: 1)
         }
         .shadow(color: .black.opacity(0.45), radius: 14, x: -8, y: 0)
+    }
+
+    /// Window frame of the card, plus the stand-in target used when the hot
+    /// button rows are scrolled off the bottom. The overlay does not take taps:
+    /// the finger is still the row's long press, and the frames decide the drop.
+    private var dragOverlay: some View {
+        ZStack(alignment: .bottom) {
+            GeometryReader { proxy in
+                WindowFrameProbe { frame in
+                    adopt(frame, into: $cardWindow)
+                }
+                .frame(width: proxy.size.width, height: proxy.size.height)
+            }
+            if dropStripVisible {
+                dropStrip
+            }
+            if let flying = flyingPreview, cardWindow.width > 1 {
+                flyingRow(text: flying.text, accepted: flying.accepted)
+                    .position(
+                        x: flying.location.x - cardWindow.minX,
+                        y: flying.location.y - cardWindow.minY
+                    )
+            }
+        }
+        .allowsHitTesting(false)
     }
 
     private func sectionTitle(_ title: String) -> some View {
@@ -396,16 +492,16 @@ struct ActionSlotsDrawer: View {
     }
 
     private func shortcutRow(index: Int, shortcut: ActionShortcut, width: CGFloat) -> some View {
-        let offset = rowOffset(index: index)
-        let dragging = shortcutDrag?.id == shortcut.id
-        let deleting = dragging && shortcutDrag?.axis == .horizontal
+        let offset = actionRowOffset(index: index)
+        let dragging = held?.list == .actions && held?.id == shortcut.id
+        let deleting = dragging && held?.axis == .horizontal
         let trimmed = shortcut.text.trimmingCharacters(in: .whitespacesAndNewlines)
         return ZStack(alignment: .leading) {
             if deleting {
                 Text("Delete")
                     .font(.system(size: 13, weight: .semibold, design: .monospaced))
                     .foregroundStyle(Color.red.opacity(0.9))
-                    .opacity(min(1, max(0, (shortcutDrag?.translation.width ?? 0) / Metrics.deleteDistance)))
+                    .opacity(min(1, max(0, (held?.translation.width ?? 0) / Metrics.deleteDistance)))
                     .padding(.leading, 2)
                     .allowsHitTesting(false)
             }
@@ -431,12 +527,16 @@ struct ActionSlotsDrawer: View {
                         .contentShape(Rectangle())
                         .overlay {
                             ShortcutRowGestures(
-                                onTap: { activate(shortcut, width: width) },
+                                onTap: { _ in activate(shortcut, width: width) },
                                 onDoubleTap: { editingID = shortcut.id },
-                                onPressBegan: { beginDrag(shortcut) },
-                                onPressChanged: { updateDrag($0) },
-                                onPressEnded: { translation, committed in
-                                    finishDrag(translation: translation, committed: committed)
+                                onPressBegan: { location in
+                                    beginDrag(shortcut.id, list: .actions, location: location)
+                                },
+                                onPressChanged: { translation, location in
+                                    updateDrag(translation, location)
+                                },
+                                onPressEnded: { translation, location, committed in
+                                    finishDrag(translation: translation, location: location, committed: committed)
                                 }
                             )
                         }
@@ -449,11 +549,14 @@ struct ActionSlotsDrawer: View {
                         .accessibilityAction(named: Text("Delete")) { deleteShortcut(shortcut.id) }
                         .accessibilityAction(named: Text("Move up")) { moveShortcut(shortcut.id, by: -1) }
                         .accessibilityAction(named: Text("Move down")) { moveShortcut(shortcut.id, by: 1) }
+                        .accessibilityAction(named: Text("Add to hot buttons")) {
+                            hotButtons.insert(text: shortcut.text, at: hotButtons.buttons.count)
+                        }
                 }
             }
             .offset(offset)
             .background(deleting ? Color(white: 0.22) : Color.clear)
-            .opacity(rowOpacity(index: index))
+            .opacity(actionRowOpacity(index: index))
         }
         .frame(maxWidth: .infinity)
         .frame(height: Metrics.rowStride)
@@ -467,20 +570,171 @@ struct ActionSlotsDrawer: View {
         return "Sends this shortcut followed by \(name)"
     }
 
-    /// Slot name on the left, pull-down of the action on the right.
-    private func slotRow(_ index: Int) -> some View {
-        HStack(spacing: 12) {
-            Text("Slot \(index + 1)")
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Picker("Slot \(index + 1)", selection: store.binding(at: index)) {
-                ForEach(SkillAction.allCases) { action in
-                    Text(verbatim: action.menuTitle).tag(action)
-                }
+    /// Icon plate and the action text, in list order. The plate is what the
+    /// play-screen button shows. Tap the plate to type 0, 1, or 2 characters.
+    /// Hold the row to reorder, or to drag it out of this area and remove it.
+    private var hotButtonRows: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(hotButtons.buttons.enumerated()), id: \.element.id) { index, button in
+                hotButtonRow(index: index, button: button)
             }
-            .pickerStyle(.menu)
-            .labelsHidden()
-            .tint(MatrixShade.display(Color(white: 0.78), enabled: matrixMode.enabled))
         }
+        .frame(maxWidth: .infinity, minHeight: Metrics.rowStride, alignment: .topLeading)
+        .background {
+            // The probe has to be the rows' size. A background that takes the
+            // scroll view's proposal would treat the whole card as the drop target.
+            GeometryReader { proxy in
+                WindowFrameProbe { frame in
+                    adopt(frame, into: $hotWindow)
+                }
+                .frame(width: proxy.size.width, height: proxy.size.height)
+            }
+        }
+    }
+
+    private func hotButtonRow(index: Int, button: HotButton) -> some View {
+        let offset = hotRowOffset(index: index)
+        let dragging = held?.list == .hotButtons && held?.id == button.id
+        let trimmed = button.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return HStack(spacing: 10) {
+            if editingIconID == button.id {
+                IconEditor(
+                    text: button.icon,
+                    matrix: matrixMode.enabled,
+                    onText: { hotButtons.updateIcon(id: button.id, icon: $0) },
+                    onCommit: {
+                        if editingIconID == button.id {
+                            editingIconID = nil
+                        }
+                    }
+                )
+                .frame(width: 40, height: 32)
+                .background(iconPlateFill)
+            } else {
+                iconPlate(button.icon)
+            }
+            Text(verbatim: trimmed.isEmpty ? "action" : button.text)
+                .font(.system(size: 17, design: .monospaced))
+                .foregroundStyle(Color(white: 0.92).opacity(trimmed.isEmpty ? 0.35 : 1))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: Metrics.rowStride)
+        .overlay {
+            if editingIconID != button.id {
+                ShortcutRowGestures(
+                    onTap: { point in
+                        guard point.x <= Metrics.iconHitWidth else { return }
+                        editingID = nil
+                        editingIconID = button.id
+                    },
+                    onDoubleTap: nil,
+                    onPressBegan: { location in
+                        beginDrag(button.id, list: .hotButtons, location: location)
+                    },
+                    onPressChanged: { translation, location in
+                        updateDrag(translation, location)
+                    },
+                    onPressEnded: { translation, location, committed in
+                        finishDrag(translation: translation, location: location, committed: committed)
+                    }
+                )
+            }
+        }
+        .offset(offset)
+        .opacity(hotRowOpacity(index: index))
+        .zIndex(dragging ? 1 : 0)
+        .id(button.id)
+        .accessibilityElement(children: editingIconID == button.id ? .contain : .ignore)
+        .accessibilityLabel(trimmed.isEmpty ? "Empty hot button" : button.text)
+        .accessibilityValue(button.icon.isEmpty ? "No icon" : "Icon \(button.icon)")
+        .accessibilityHint("Drag out of hot buttons to remove")
+        .accessibilityAction(named: Text("Edit icon")) {
+            editingID = nil
+            editingIconID = button.id
+        }
+        .accessibilityAction(named: Text("Move up")) { moveHotButton(button.id, by: -1) }
+        .accessibilityAction(named: Text("Move down")) { moveHotButton(button.id, by: 1) }
+        .accessibilityAction(named: Text("Remove")) { removeHotButton(button.id) }
+    }
+
+    private func iconPlate(_ icon: String) -> some View {
+        Text(verbatim: icon)
+            .font(.system(size: 17, weight: .bold, design: .monospaced))
+            .foregroundStyle(MatrixShade.display(Color(white: 0.92), enabled: matrixMode.enabled))
+            .lineLimit(1)
+            .minimumScaleFactor(0.5)
+            .frame(width: 40, height: 32)
+            .background(iconPlateFill)
+    }
+
+    private var iconPlateFill: some View {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color.white.opacity(0.12))
+    }
+
+    /// Shown only while an action is being dragged and the hot-button rows are
+    /// off the card. The drop appends. Reordering still happens on the rows.
+    private var dropStripVisible: Bool {
+        guard let drag = held, drag.list == .actions, drag.axis == .vertical else { return false }
+        return hotAreaMostlyHidden
+    }
+
+    private var hotAreaMostlyHidden: Bool {
+        guard hotWindow.width > 1, hotWindow.height > 1 else { return true }
+        guard cardWindow.width > 1, cardWindow.height > 1 else { return false }
+        let visible = hotWindow.intersection(cardWindow)
+        if visible.isNull { return true }
+        return visible.height < 40
+    }
+
+    private var dropStrip: some View {
+        let hovering = fingerInStrip(held?.location ?? .zero)
+        let accepted = hovering && (incomingDrop?.accepted ?? false)
+        return HStack(spacing: 8) {
+            Text("Hot Buttons")
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                .foregroundStyle(MatrixShade.display(Color(white: 0.78), enabled: matrixMode.enabled))
+            Spacer(minLength: 0)
+            Text("\(hotButtons.buttons.count)/\(HotButtonStore.limit)")
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                .foregroundStyle(MatrixShade.display(Color(white: 0.62), enabled: matrixMode.enabled))
+        }
+        .padding(.horizontal, 18)
+        .padding(.bottom, Self.windowInsets.bottom)
+        .frame(maxWidth: .infinity)
+        .frame(height: Metrics.stripBody + Self.windowInsets.bottom, alignment: .center)
+        .background(Color(white: accepted ? 0.34 : 0.16).opacity(0.94))
+        .accessibilityHidden(true)
+    }
+
+    private var flyingPreview: (text: String, accepted: Bool, location: CGPoint)? {
+        guard let drop = incomingDrop, let drag = held, drag.list == .actions,
+              let shortcut = shortcutStore.shortcuts.first(where: { $0.id == drag.id }) else { return nil }
+        return (shortcut.text, drop.accepted, drag.location)
+    }
+
+    private func flyingRow(text: String, accepted: Bool) -> some View {
+        let shown = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return HStack(spacing: 8) {
+            iconPlate(HotButton.defaultIcon(for: text))
+            Text(verbatim: shown.isEmpty ? "action" : text)
+                .font(.system(size: 17, design: .monospaced))
+                .foregroundStyle(MatrixShade.display(Color(white: 0.92), enabled: matrixMode.enabled))
+                .lineLimit(1)
+        }
+        .padding(.leading, 4)
+        .padding(.trailing, 10)
+        .frame(maxWidth: 220)
+        .frame(height: 40)
+        .background(
+            Color(white: 0.30).opacity(0.96),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
+        .opacity(accepted ? 1 : 0.35)
+        .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
     }
 
     /// Opens from the right edge, or follows a finger that is already dragging the card.
@@ -488,8 +742,8 @@ struct ActionSlotsDrawer: View {
     private func pan(width: CGFloat, fromEdgeOnly: Bool) -> some Gesture {
         DragGesture(minimumDistance: 10, coordinateSpace: .named(Self.space))
             .onChanged { value in
-                // A held shortcut owns the finger. The card must not follow it shut.
-                if shortcutDragActive {
+                // A held row owns the finger. The card must not follow it shut.
+                if heldActive {
                     ignoreDrag = true
                     return
                 }
@@ -517,7 +771,7 @@ struct ActionSlotsDrawer: View {
             .onEnded { value in
                 let origin = dragOrigin
                 dragOrigin = nil
-                let blocked = ignoreDrag || shortcutDragActive
+                let blocked = ignoreDrag || heldActive
                 ignoreDrag = false
                 guard blocked == false, let origin else { return }
                 let predicted = origin - value.predictedEndTranslation.width
@@ -530,8 +784,11 @@ struct ActionSlotsDrawer: View {
     private func settleCard(open: Bool, width: CGFloat) {
         if open == false {
             editingID = nil
-            shortcutDragActive = false
-            shortcutDrag = nil
+            editingIconID = nil
+            heldActive = false
+            held = nil
+            cardWindow = .zero
+            hotWindow = .zero
         }
         withAnimation(.easeOut(duration: 0.22)) {
             travel = open ? width : 0
@@ -543,6 +800,7 @@ struct ActionSlotsDrawer: View {
 
     private func addShortcut() {
         guard let id = shortcutStore.addBlank() else { return }
+        editingIconID = nil
         editingID = id
     }
 
@@ -551,10 +809,12 @@ struct ActionSlotsDrawer: View {
     /// tap opens the inline editor instead of closing the card.
     private func activate(_ shortcut: ActionShortcut, width: CGFloat) {
         guard let command = ActionShortcut.command(text: shortcut.text, target: hilitedWord) else {
+            editingIconID = nil
             editingID = shortcut.id
             return
         }
         editingID = nil
+        editingIconID = nil
         settleCard(open: false, width: width)
         onSend(command)
     }
@@ -564,9 +824,9 @@ struct ActionSlotsDrawer: View {
             editingID = nil
         }
         withAnimation(.easeOut(duration: 0.18)) {
-            if shortcutDrag?.id == id {
-                shortcutDrag = nil
-                shortcutDragActive = false
+            if held?.id == id {
+                held = nil
+                heldActive = false
             }
             shortcutStore.remove(id: id)
         }
@@ -577,41 +837,81 @@ struct ActionSlotsDrawer: View {
         shortcutStore.move(from: index, to: index + delta)
     }
 
-    private func beginDrag(_ shortcut: ActionShortcut) {
-        guard editingID == nil else { return }
-        guard let index = shortcutStore.shortcuts.firstIndex(where: { $0.id == shortcut.id }) else { return }
-        shortcutDragActive = true
-        shortcutDrag = ShortcutDrag(id: shortcut.id, origin: index, translation: .zero, axis: nil)
+    private func removeHotButton(_ id: UUID) {
+        if editingIconID == id {
+            editingIconID = nil
+        }
+        withAnimation(.easeOut(duration: 0.18)) {
+            if held?.id == id {
+                held = nil
+                heldActive = false
+            }
+            hotButtons.remove(id: id)
+        }
     }
 
-    private func updateDrag(_ translation: CGSize) {
-        guard var current = shortcutDrag else { return }
-        current.axis = lockedAxis(for: translation, current: current.axis)
+    private func moveHotButton(_ id: UUID, by delta: Int) {
+        guard let index = hotButtons.buttons.firstIndex(where: { $0.id == id }) else { return }
+        hotButtons.move(from: index, to: index + delta)
+    }
+
+    private func beginDrag(_ id: UUID, list: DragList, location: CGPoint) {
+        guard editingID == nil, editingIconID == nil else { return }
+        let index: Int?
+        switch list {
+        case .actions:
+            index = shortcutStore.shortcuts.firstIndex(where: { $0.id == id })
+        case .hotButtons:
+            index = hotButtons.buttons.firstIndex(where: { $0.id == id })
+        }
+        guard let index else { return }
+        heldActive = true
+        held = HeldDrag(id: id, list: list, origin: index, translation: .zero, axis: nil, location: location)
+    }
+
+    private func updateDrag(_ translation: CGSize, _ location: CGPoint) {
+        guard var current = held else { return }
+        if current.list == .actions {
+            current.axis = lockedAxis(for: translation, current: current.axis)
+        }
         current.translation = translation
+        current.location = location
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            shortcutDrag = current
+            held = current
         }
     }
 
-    private func finishDrag(translation: CGSize, committed: Bool) {
-        guard var current = shortcutDrag else { return }
+    private func finishDrag(translation: CGSize, location: CGPoint, committed: Bool) {
+        guard var current = held else { return }
         guard cardOpen else {
-            shortcutDrag = nil
-            shortcutDragActive = false
+            held = nil
+            heldActive = false
             return
         }
         current.translation = translation
-        if current.axis == nil {
+        current.location = location
+        if current.list == .actions, current.axis == nil {
             current.axis = lockedAxis(for: translation, current: nil)
         }
-        if committed, current.axis == .horizontal,
+        if committed, current.list == .actions, current.axis == .horizontal,
            current.translation.width >= Metrics.deleteDistance {
             deleteShortcut(current.id)
             return
         }
-        if committed, current.axis == .vertical,
+        if committed, current.list == .actions, current.axis == .vertical,
+           let shortcut = shortcutStore.shortcuts.first(where: { $0.id == current.id }),
+           fingerInDropTarget(location) {
+            let index = dropIndex(for: location)
+            withAnimation(.easeOut(duration: 0.16)) {
+                held = nil
+                heldActive = false
+                hotButtons.insert(text: shortcut.text, at: index)
+            }
+            return
+        }
+        if committed, current.list == .actions, current.axis == .vertical,
            let index = shortcutStore.shortcuts.firstIndex(where: { $0.id == current.id }) {
             let target = verticalTravel(
                 origin: current.origin,
@@ -623,22 +923,49 @@ struct ActionSlotsDrawer: View {
                 var transaction = Transaction()
                 transaction.disablesAnimations = true
                 withTransaction(transaction) {
-                    shortcutDrag = nil
-                    shortcutDragActive = false
+                    held = nil
+                    heldActive = false
                     shortcutStore.move(from: index, to: dest)
                 }
                 return
             }
         }
+        if committed, current.list == .hotButtons {
+            let traveled = hypot(current.translation.width, current.translation.height)
+            if hotFingerStillInside(location) == false, traveled >= 24 {
+                removeHotButton(current.id)
+                return
+            }
+            if hotFingerStillInside(location),
+               let index = hotButtons.buttons.firstIndex(where: { $0.id == current.id }) {
+                let target = verticalTravel(
+                    origin: current.origin,
+                    translationY: current.translation.height,
+                    count: hotButtons.buttons.count
+                ).target
+                let dest = index + (target - current.origin)
+                if hotButtons.buttons.indices.contains(dest), dest != index {
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        held = nil
+                        heldActive = false
+                        hotButtons.move(from: index, to: dest)
+                    }
+                    return
+                }
+            }
+        }
         withAnimation(.easeOut(duration: 0.16)) {
-            shortcutDrag = nil
-            shortcutDragActive = false
+            held = nil
+            heldActive = false
         }
     }
 
-    /// Rightward travel deletes. Vertical travel reorders. A leftward move
-    /// is neither: the card pan is already suppressed for this hold.
-    private func lockedAxis(for translation: CGSize, current: ShortcutDrag.Axis?) -> ShortcutDrag.Axis? {
+    /// Rightward travel deletes an action. Vertical travel reorders it, and
+    /// can leave the list to land on the hot buttons. A leftward move is
+    /// neither: the card pan is already suppressed for this hold.
+    private func lockedAxis(for translation: CGSize, current: HeldDrag.Axis?) -> HeldDrag.Axis? {
         if let current { return current }
         let dx = translation.width
         let dy = translation.height
@@ -666,13 +993,17 @@ struct ActionSlotsDrawer: View {
         return (travel, target)
     }
 
-    private func rowOffset(index: Int) -> CGSize {
-        guard let drag = shortcutDrag, let axis = drag.axis else { return .zero }
+    private func actionRowOffset(index: Int) -> CGSize {
+        guard let drag = held, drag.list == .actions, let axis = drag.axis else { return .zero }
         let shortcuts = shortcutStore.shortcuts
         guard shortcuts.indices.contains(index) else { return .zero }
         if axis == .horizontal {
             guard shortcuts[index].id == drag.id else { return .zero }
             return CGSize(width: max(0, drag.translation.width), height: 0)
+        }
+        // A copy flying toward the hot buttons leaves the action where it is.
+        if incomingDrop != nil {
+            return .zero
         }
         let placed = verticalTravel(
             origin: drag.origin,
@@ -691,12 +1022,151 @@ struct ActionSlotsDrawer: View {
         return .zero
     }
 
-    private func rowOpacity(index: Int) -> Double {
-        guard let drag = shortcutDrag, drag.axis == .horizontal else { return 1 }
+    private func actionRowOpacity(index: Int) -> Double {
+        guard let drag = held, drag.list == .actions else { return 1 }
         guard shortcutStore.shortcuts.indices.contains(index) else { return 1 }
         guard shortcutStore.shortcuts[index].id == drag.id else { return 1 }
-        let progress = min(1, max(0, drag.translation.width / Metrics.deleteDistance))
-        return 1 - 0.45 * progress
+        if drag.axis == .horizontal {
+            let progress = min(1, max(0, drag.translation.width / Metrics.deleteDistance))
+            return 1 - 0.45 * progress
+        }
+        if incomingDrop != nil {
+            return 0.4
+        }
+        return 1
+    }
+
+    private func hotRowOffset(index: Int) -> CGSize {
+        let buttons = hotButtons.buttons
+        guard buttons.indices.contains(index) else { return .zero }
+        if let drag = held, drag.list == .hotButtons {
+            return hotDragOffset(index: index, drag: drag, count: buttons.count)
+        }
+        guard let drop = incomingDrop, drop.accepted, drop.overRows, index >= drop.index else {
+            return .zero
+        }
+        return CGSize(width: 0, height: Metrics.rowStride)
+    }
+
+    private func hotDragOffset(index: Int, drag: HeldDrag, count: Int) -> CGSize {
+        let buttons = hotButtons.buttons
+        guard buttons.indices.contains(index) else { return .zero }
+        if hotFingerStillInside(drag.location) {
+            let placed = verticalTravel(
+                origin: drag.origin,
+                translationY: drag.translation.height,
+                count: count
+            )
+            if index == drag.origin {
+                return CGSize(width: 0, height: placed.travel)
+            }
+            if placed.target > drag.origin, index > drag.origin, index <= placed.target {
+                return CGSize(width: 0, height: -Metrics.rowStride)
+            }
+            if placed.target < drag.origin, index < drag.origin, index >= placed.target {
+                return CGSize(width: 0, height: Metrics.rowStride)
+            }
+            return .zero
+        }
+        if buttons[index].id == drag.id {
+            return CGSize(width: drag.translation.width, height: drag.translation.height)
+        }
+        if index > drag.origin {
+            return CGSize(width: 0, height: -Metrics.rowStride)
+        }
+        return .zero
+    }
+
+    private func hotRowOpacity(index: Int) -> Double {
+        guard let drag = held, drag.list == .hotButtons else { return 1 }
+        guard hotButtons.buttons.indices.contains(index) else { return 1 }
+        guard hotButtons.buttons[index].id == drag.id else { return 1 }
+        if hotFingerStillInside(drag.location) == false {
+            return 0.7
+        }
+        return 1
+    }
+
+    private var incomingDrop: IncomingDrop? {
+        guard let drag = held, drag.list == .actions, drag.axis == .vertical else { return nil }
+        guard shortcutStore.shortcuts.contains(where: { $0.id == drag.id }) else { return nil }
+        let overRows = fingerInHotRows(drag.location)
+        let overStrip = fingerInStrip(drag.location)
+        guard overRows || overStrip else { return nil }
+        let index = overRows ? hotInsertionIndex(fingerY: drag.location.y) : hotButtons.buttons.count
+        guard let shortcut = shortcutStore.shortcuts.first(where: { $0.id == drag.id }) else { return nil }
+        return IncomingDrop(
+            index: index,
+            accepted: hotButtons.canAccept(shortcut.text),
+            overRows: overRows
+        )
+    }
+
+    /// The rows, grown a little past their frame so a finger that slips off a
+    /// plate while reordering still counts as inside. An unmeasured frame is
+    /// not a drop target, or a vertical action drag would look like a drop
+    /// before the first layout.
+    private func fingerInHotRows(_ location: CGPoint) -> Bool {
+        guard hotWindow.width > 1, hotWindow.height > 1 else { return false }
+        return hotWindow.insetBy(dx: -24, dy: -20).contains(location)
+    }
+
+    /// A hot-button drag stays "inside" until the rows have been measured, so
+    /// the lift cannot delete the row before the probe has reported.
+    private func hotFingerStillInside(_ location: CGPoint) -> Bool {
+        guard hotWindow.width > 1, hotWindow.height > 1 else { return true }
+        return fingerInHotRows(location)
+    }
+
+    private func fingerInStrip(_ location: CGPoint) -> Bool {
+        guard dropStripVisible, cardWindow.width > 1, cardWindow.height > 1 else { return false }
+        let height = Metrics.stripBody + Self.windowInsets.bottom
+        let strip = CGRect(
+            x: cardWindow.minX,
+            y: cardWindow.maxY - height,
+            width: cardWindow.width,
+            height: height
+        )
+        return strip.insetBy(dx: -8, dy: -12).contains(location)
+    }
+
+    private func fingerInDropTarget(_ location: CGPoint) -> Bool {
+        if hotWindow.width > 1, hotWindow.insetBy(dx: -24, dy: -20).contains(location) {
+            return true
+        }
+        return fingerInStrip(location)
+    }
+
+    private func dropIndex(for location: CGPoint) -> Int {
+        if hotWindow.width > 1, hotWindow.insetBy(dx: -24, dy: -20).contains(location) {
+            return hotInsertionIndex(fingerY: location.y)
+        }
+        return hotButtons.buttons.count
+    }
+
+    /// Midpoint of each row. Above the first row, and an empty area, insert at 0.
+    private func hotInsertionIndex(fingerY: CGFloat) -> Int {
+        let count = hotButtons.buttons.count
+        guard count > 0, hotWindow.height > 1 else { return 0 }
+        let localY = fingerY - hotWindow.minY
+        if localY < 0 { return 0 }
+        for index in 0..<count {
+            let mid = (CGFloat(index) + 0.5) * Metrics.rowStride
+            if localY < mid {
+                return index
+            }
+        }
+        return count
+    }
+
+    private func adopt(_ frame: CGRect, into storage: Binding<CGRect>) {
+        guard frame.width > 1, frame.height > 1 else { return }
+        let old = storage.wrappedValue
+        guard abs(old.minX - frame.minX) > 0.5
+            || abs(old.minY - frame.minY) > 0.5
+            || abs(old.width - frame.width) > 0.5
+            || abs(old.height - frame.height) > 0.5 else { return }
+        storage.wrappedValue = frame
     }
 
     /// Puts the editing row near the top of the card, above the keyboard.
@@ -704,7 +1174,7 @@ struct ActionSlotsDrawer: View {
     /// under the keys on a short landscape window.
     private func scrollEditingRow(_ id: UUID, proxy: ScrollViewProxy) {
         func align() {
-            guard editingID == id else { return }
+            guard editingID == id || editingIconID == id else { return }
             proxy.scrollTo(id, anchor: UnitPoint(x: 0, y: 0.12))
         }
         DispatchQueue.main.async(execute: align)
@@ -856,15 +1326,179 @@ private struct ShortcutEditor: UIViewRepresentable {
     }
 }
 
-/// Tap, double tap, and hold on one shortcut row. The single tap waits until
-/// the double tap fails, so an edit does not also send. A hold that already
-/// began swallows the tap that follows the finger lifting.
+/// Icon field on a hot-button row. Two characters at most. Empty is kept:
+/// the play-screen plate is then blank. Same focus retry as the shortcut
+/// field, for the same reason.
+private struct IconEditor: UIViewRepresentable {
+    var text: String
+    var matrix: Bool
+    var onText: (String) -> Void
+    var onCommit: () -> Void
+
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        field.delegate = context.coordinator
+        field.font = UIFont.monospacedSystemFont(ofSize: 17, weight: .bold)
+        field.textColor = UIColor(white: 0.92, alpha: 1)
+        field.tintColor = field.textColor
+        field.backgroundColor = .clear
+        field.borderStyle = .none
+        field.textAlignment = .center
+        field.keyboardType = .asciiCapable
+        field.returnKeyType = .done
+        field.autocorrectionType = .no
+        field.spellCheckingType = .no
+        field.smartDashesType = .no
+        field.smartQuotesType = .no
+        field.smartInsertDeleteType = .no
+        field.autocapitalizationType = .none
+        field.keyboardAppearance = .dark
+        field.adjustsFontForContentSizeCategory = false
+        field.accessibilityLabel = "Hot button icon"
+        field.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.changed(_:)),
+            for: .editingChanged
+        )
+        return field
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView _: UITextField,
+        context _: Context
+    ) -> CGSize? {
+        let width: CGFloat
+        if let proposed = proposal.width, proposed > 0, proposed < .greatestFiniteMagnitude {
+            width = proposed
+        } else {
+            width = 40
+        }
+        return CGSize(width: width, height: 32)
+    }
+
+    func updateUIView(_ field: UITextField, context: Context) {
+        let coordinator = context.coordinator
+        coordinator.onText = onText
+        coordinator.onCommit = onCommit
+        let ink = MatrixShade.display(UIColor(white: 0.92, alpha: 1), enabled: matrix)
+        field.textColor = ink
+        field.tintColor = ink
+        if field.markedTextRange == nil, field.text != text {
+            coordinator.applying = true
+            field.text = text
+            coordinator.applying = false
+        }
+        if coordinator.didFocus == false {
+            coordinator.didFocus = true
+            coordinator.scheduleBecome(field)
+        }
+    }
+
+    static func dismantleUIView(_ uiView: UITextField, coordinator: Coordinator) {
+        coordinator.didFocus = false
+        if uiView.isFirstResponder {
+            uiView.resignFirstResponder()
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var onText: (String) -> Void = { _ in }
+        var onCommit: () -> Void = {}
+        var applying = false
+        var didFocus = false
+
+        @objc func changed(_ field: UITextField) {
+            guard applying == false else { return }
+            guard field.markedTextRange == nil else { return }
+            let raw = field.text ?? ""
+            let flat = String(raw.filter { $0.isNewline == false }.prefix(2))
+            if flat != raw {
+                applying = true
+                field.text = flat
+                applying = false
+            }
+            onText(flat)
+        }
+
+        func textField(
+            _ textField: UITextField,
+            shouldChangeCharactersIn range: NSRange,
+            replacementString string: String
+        ) -> Bool {
+            if applying { return false }
+            if string.contains(where: { $0.isNewline }) {
+                return false
+            }
+            let current = textField.text ?? ""
+            guard let swiftRange = Range(range, in: current) else { return false }
+            let replaced = current.replacingCharacters(in: swiftRange, with: string)
+            let next = String(replaced.filter { $0.isNewline == false }.prefix(2))
+            if next == replaced {
+                return true
+            }
+            // A paste longer than two characters keeps the first two.
+            // `applying` stops the assignment from re-entering this method.
+            applying = true
+            textField.text = next
+            applying = false
+            onText(next)
+            return false
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            let start = textField.beginningOfDocument
+            let end = textField.endOfDocument
+            textField.selectedTextRange = textField.textRange(from: start, to: end)
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            onCommit()
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            textField.resignFirstResponder()
+            return false
+        }
+
+        func scheduleBecome(_ field: UITextField, retries: Int = 8) {
+            DispatchQueue.main.async { [weak field] in
+                guard let field else { return }
+                guard self.didFocus else { return }
+                guard field.window != nil else {
+                    guard retries > 0 else { return }
+                    self.scheduleBecome(field, retries: retries - 1)
+                    return
+                }
+                guard field.isFirstResponder == false else { return }
+                if field.becomeFirstResponder() {
+                    return
+                }
+                guard retries > 0 else { return }
+                UIApplication.shared.sendAction(
+                    #selector(UIResponder.resignFirstResponder),
+                    to: nil,
+                    from: nil,
+                    for: nil
+                )
+                self.scheduleBecome(field, retries: retries - 1)
+            }
+        }
+    }
+}
+
+/// Tap, double tap, and hold on one row. The single tap waits until the
+/// double tap fails, so an edit does not also send. A hold that already
+/// began swallows the tap that follows the finger lifting. A nil double tap
+/// is a row with no second action: the single tap fires on its own.
 private struct ShortcutRowGestures: UIViewRepresentable {
-    var onTap: () -> Void
-    var onDoubleTap: () -> Void
-    var onPressBegan: () -> Void
-    var onPressChanged: (CGSize) -> Void
-    var onPressEnded: (CGSize, Bool) -> Void
+    var onTap: (CGPoint) -> Void
+    var onDoubleTap: (() -> Void)?
+    var onPressBegan: (CGPoint) -> Void
+    var onPressChanged: (CGSize, CGPoint) -> Void
+    var onPressEnded: (CGSize, CGPoint, Bool) -> Void
 
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
@@ -872,17 +1506,10 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         view.isAccessibilityElement = false
         let single = UITapGestureRecognizer(
             target: context.coordinator,
-            action: #selector(Coordinator.singleTap)
+            action: #selector(Coordinator.singleTap(_:))
         )
         single.numberOfTapsRequired = 1
         single.cancelsTouchesInView = false
-        let double = UITapGestureRecognizer(
-            target: context.coordinator,
-            action: #selector(Coordinator.doubleTap)
-        )
-        double.numberOfTapsRequired = 2
-        double.cancelsTouchesInView = false
-        single.require(toFail: double)
         let press = UILongPressGestureRecognizer(
             target: context.coordinator,
             action: #selector(Coordinator.longPress(_:))
@@ -890,8 +1517,17 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         press.minimumPressDuration = 0.35
         press.cancelsTouchesInView = true
         view.addGestureRecognizer(single)
-        view.addGestureRecognizer(double)
         view.addGestureRecognizer(press)
+        if onDoubleTap != nil {
+            let double = UITapGestureRecognizer(
+                target: context.coordinator,
+                action: #selector(Coordinator.doubleTap)
+            )
+            double.numberOfTapsRequired = 2
+            double.cancelsTouchesInView = false
+            single.require(toFail: double)
+            view.addGestureRecognizer(double)
+        }
         return view
     }
 
@@ -922,56 +1558,67 @@ private struct ShortcutRowGestures: UIViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     final class Coordinator: NSObject {
-        var onTap: () -> Void = {}
-        var onDoubleTap: () -> Void = {}
-        var onPressBegan: () -> Void = {}
-        var onPressChanged: (CGSize) -> Void = { _ in }
-        var onPressEnded: (CGSize, Bool) -> Void = { _, _ in }
+        var onTap: (CGPoint) -> Void = { _ in }
+        var onDoubleTap: (() -> Void)?
+        var onPressBegan: (CGPoint) -> Void = { _ in }
+        var onPressChanged: (CGSize, CGPoint) -> Void = { _, _ in }
+        var onPressEnded: (CGSize, CGPoint, Bool) -> Void = { _, _, _ in }
         var origin: CGPoint?
         var pressed = false
         var suppressTapsUntil = Date.distantPast
 
-        @objc func singleTap() {
+        @objc func singleTap(_ gesture: UITapGestureRecognizer) {
             guard Date() >= suppressTapsUntil else { return }
-            onTap()
+            onTap(gesture.location(in: gesture.view))
         }
 
         @objc func doubleTap() {
             guard Date() >= suppressTapsUntil else { return }
-            onDoubleTap()
+            onDoubleTap?()
         }
 
         @objc func longPress(_ gesture: UILongPressGestureRecognizer) {
-            let location = gesture.location(in: gesture.view?.window)
+            let location = windowLocation(gesture)
             switch gesture.state {
             case .began:
                 origin = location
                 pressed = true
                 suppressTapsUntil = .distantFuture
                 setScrollLocked(true, from: gesture.view)
-                onPressBegan()
+                onPressBegan(location)
             case .changed:
                 guard pressed, let origin else { return }
-                onPressChanged(translation(from: origin, to: location))
+                onPressChanged(translation(from: origin, to: location), location)
             case .ended:
                 guard pressed else { return }
                 pressed = false
-                let translation = origin.map { translation(from: $0, to: location) } ?? .zero
+                let moved = origin.map { translation(from: $0, to: location) } ?? .zero
                 origin = nil
                 suppressTapsUntil = Date().addingTimeInterval(0.45)
                 setScrollLocked(false, from: gesture.view)
-                onPressEnded(translation, true)
+                onPressEnded(moved, location, true)
             case .cancelled, .failed:
                 guard pressed else { return }
                 pressed = false
-                let translation = origin.map { translation(from: $0, to: location) } ?? .zero
+                let moved = origin.map { translation(from: $0, to: location) } ?? .zero
                 origin = nil
                 suppressTapsUntil = Date().addingTimeInterval(0.45)
                 setScrollLocked(false, from: gesture.view)
-                onPressEnded(translation, false)
+                onPressEnded(moved, location, false)
             default:
                 break
             }
+        }
+
+        /// Window coordinates, same space as the frame probes. A nil window
+        /// falls back to the screen, which matches a fullscreen window.
+        private func windowLocation(_ gesture: UIGestureRecognizer) -> CGPoint {
+            guard let view = gesture.view else { return gesture.location(in: nil) }
+            let local = gesture.location(in: view)
+            if let window = view.window {
+                return view.convert(local, to: window)
+            }
+            return view.convert(local, to: nil)
         }
 
         private func translation(from origin: CGPoint, to location: CGPoint) -> CGSize {
@@ -989,6 +1636,68 @@ private struct ShortcutRowGestures: UIViewRepresentable {
                 }
                 current = next.superview
             }
+        }
+    }
+}
+
+/// Reports its bounds in window coordinates. SwiftUI's global space and a
+/// UIKit window differ once the window is not at the screen origin, and the
+/// drag's finger is a window point, so both sides of the hit test use the window.
+private struct WindowFrameProbe: UIViewRepresentable {
+    var onFrame: (CGRect) -> Void
+
+    func makeUIView(context: Context) -> Probe {
+        let view = Probe()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        view.isAccessibilityElement = false
+        return view
+    }
+
+    func updateUIView(_ uiView: Probe, context: Context) {
+        uiView.onFrame = onFrame
+        uiView.publishIfNeeded()
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView _: Probe,
+        context _: Context
+    ) -> CGSize? {
+        CGSize(width: finite(proposal.width), height: finite(proposal.height))
+    }
+
+    private func finite(_ value: CGFloat?) -> CGFloat {
+        guard let value, value > 0, value < .greatestFiniteMagnitude else { return 0 }
+        return value
+    }
+
+    final class Probe: UIView {
+        var onFrame: (CGRect) -> Void = { _ in }
+        private var last: CGRect = .null
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            publishIfNeeded()
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            publishIfNeeded()
+        }
+
+        func publishIfNeeded() {
+            guard let window, bounds.width > 1, bounds.height > 1 else { return }
+            let frame = convert(bounds, to: window)
+            guard frame.width > 1, frame.height > 1 else { return }
+            if abs(last.minX - frame.minX) <= 0.5,
+               abs(last.minY - frame.minY) <= 0.5,
+               abs(last.width - frame.width) <= 0.5,
+               abs(last.height - frame.height) <= 0.5 {
+                return
+            }
+            last = frame
+            onFrame(frame)
         }
     }
 }

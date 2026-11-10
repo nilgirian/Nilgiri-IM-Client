@@ -2665,7 +2665,7 @@ struct TranscriptView: View {
     @StateObject private var matrixMode = MatrixMode.shared
     /// Last non-communication line posted from the input bar (Return or Send).
     /// Speech, channels, and the Say button leave this unchanged. Compass
-    /// directions and action slots do not replace it. Shown greyed out, and
+    /// directions and hot buttons do not replace it. Shown greyed out, and
     /// repeated from an empty field, only while Keep last command is on.
     /// Kept for this play screen, not on disk.
     @State private var lastCommand = ""
@@ -2679,7 +2679,7 @@ struct TranscriptView: View {
     @State private var settingsOpenRequest = false
     /// The left card has settled open. The command keyboard stays down until it closes.
     @State private var keyboardSettingsOpen = false
-    @StateObject private var actionSlots = ActionSlotStore()
+    @StateObject private var hotButtons = HotButtonStore()
     @StateObject private var actionShortcuts = ActionShortcutStore()
     /// Bumped by the accessibility action. Each change opens the right card.
     @State private var actionSlotsOpenRequest = false
@@ -2858,8 +2858,8 @@ struct TranscriptView: View {
             }
             .overlay {
                 ActionSlotsDrawer(
-                    store: actionSlots,
                     shortcutStore: actionShortcuts,
+                    hotButtons: hotButtons,
                     openRequest: $actionSlotsOpenRequest,
                     logFrame: logGlobalFrame,
                     hilitedWord: session.hilitedWord,
@@ -3287,11 +3287,12 @@ struct TranscriptView: View {
         }
     }
 
-    /// The slot's verb, plus the hilited word when there is one.
-    /// A blank slot does not send. The welcome menu is not a target.
-    private func sendSkill(_ action: SkillAction) async {
+    /// The hot button's action, plus the hilited word when there is one.
+    /// Empty action text does not send. The welcome menu is not a target.
+    /// The stored action is not edited.
+    private func sendHotButton(_ button: HotButton) async {
         guard session.atMenu == false else { return }
-        guard let text = action.command(target: session.hilitedWord) else { return }
+        guard let text = ActionShortcut.command(text: button.text, target: session.hilitedWord) else { return }
         await sendDirection(text)
     }
 
@@ -3304,20 +3305,25 @@ struct TranscriptView: View {
         await sendDirection(command)
     }
 
-    /// Assigned skills, packed to the bottom of the log, just above the command
-    /// bar. The trailing gap stays clear of the right-edge swipe strip: that
-    /// strip overlaps the safe area by at most 24 points.
+    /// Hot buttons, packed to the bottom of the log, just above the command
+    /// bar. One plate per entry in the hot-button list, in that order. None
+    /// when the list is empty. The trailing gap stays clear of the right-edge
+    /// swipe strip: that strip overlaps the safe area by at most 24 points.
+    /// The room passed in is the log height above the input bar, so the plates
+    /// stay off the direction row.
     @ViewBuilder
     private var skillActionButtons: some View {
         if session.atMenu == false {
+            let room = logGlobalFrame.height > 1 ? max(0, logGlobalFrame.height - 8) : 0
             VStack(alignment: .trailing, spacing: 0) {
                 HStack(alignment: .bottom, spacing: 0) {
-                    SkillActionStack(
-                        slots: actionSlots.slots,
+                    HotButtonStack(
+                        buttons: hotButtons.buttons,
                         target: session.hilitedWord,
-                        hideLabels: keyboardPrefs.hideHotButtonLabels
-                    ) { action in
-                        Task { await sendSkill(action) }
+                        hideLabels: keyboardPrefs.hideHotButtonLabels,
+                        maxHeight: room
+                    ) { button in
+                        Task { await sendHotButton(button) }
                     }
                     Color.clear
                         .frame(width: 28, height: 1)
@@ -3776,70 +3782,88 @@ private struct ActionPanel: View {
     }
 }
 
-/// Assigned skills, stacked above the command bar. Blank slots are absent.
-/// The letter is a bold system face. The plate is the bar frost, and a tap
-/// lights it the same way a compass letter does: white for a quarter second.
-/// A hidden label leaves that plate and the light in place.
-private struct SkillActionStack: View {
+/// Hot buttons, stacked above the command bar in list order. Every entry is
+/// drawn, including one whose icon is empty. The glyph is a bold monospaced
+/// face, at most two characters. The plate is the bar frost, and a tap lights
+/// it the same way a compass letter does: white for a quarter second. A hidden
+/// label, or an empty icon, leaves that plate and the light in place.
+/// Spacing shrinks before the plate does, so six fit in the log in either
+/// orientation. The log ends where the input bar begins, so the plates stay
+/// above the direction buttons.
+private struct HotButtonStack: View {
     @ObservedObject private var matrixMode = MatrixMode.shared
-    var slots: [SkillAction]
-    /// Hilited word, spoken with the verb. The tap reads `hilitedWord` itself.
+    var buttons: [HotButton]
+    /// Hilited word, spoken with the action. The tap reads `hilitedWord` itself.
     var target: String?
-    /// The letter is invisible. The frost plate and the press light stay.
+    /// The glyph is invisible. The frost plate and the press light stay.
     var hideLabels: Bool
-    var send: (SkillAction) -> Void
+    /// Vertical room in the log, above the gap that clears the input bar.
+    /// Zero until that log has been measured; the plates then use the full size.
+    var maxHeight: CGFloat
+    var send: (HotButton) -> Void
 
-    /// Slots whose letters are lit. A second tap of the same slot restarts a quarter second.
-    @State private var litSlots: Set<Int> = []
-    /// Per-slot generation so an earlier timer cannot put the light out early.
-    @State private var lightTokens: [Int: Int] = [:]
+    /// Buttons whose plates are lit. A second tap of the same button restarts a quarter second.
+    @State private var litButtons: Set<UUID> = []
+    /// Per-button generation so an earlier timer cannot put the light out early.
+    @State private var lightTokens: [UUID: Int] = [:]
 
-    private struct Row: Identifiable {
-        let index: Int
-        let action: SkillAction
-        let letter: String
-        var id: Int { index }
-    }
-
-    private var rows: [Row] {
-        var packed: [Row] = []
-        for (index, action) in slots.enumerated() {
-            guard let letter = action.letter else { continue }
-            packed.append(Row(index: index, action: action, letter: letter))
-        }
-        return packed
+    private struct Metrics {
+        var side: CGFloat
+        var spacing: CGFloat
+        var font: CGFloat
     }
 
     var body: some View {
-        let packed = rows
-        if packed.isEmpty == false {
-            ViewThatFits(in: .vertical) {
-                column(packed, side: 44, spacing: 4, fontSize: 17)
-                column(packed, side: 36, spacing: 2, fontSize: 15)
-                column(packed, side: 32, spacing: 2, fontSize: 14)
-            }
+        if buttons.isEmpty == false {
+            let metrics = layout(count: buttons.count, maxHeight: maxHeight)
+            column(metrics)
         }
     }
 
-    private func column(
-        _ packed: [Row],
-        side: CGFloat,
-        spacing: CGFloat,
-        fontSize: CGFloat
-    ) -> some View {
-        VStack(spacing: spacing) {
-            ForEach(packed) { row in
-                let lit = litSlots.contains(row.index)
+    /// Full-size plates and a 4 point gap when they fit. The gap shrinks to
+    /// nothing before a plate gets smaller than 44. Six plates that still do
+    /// not fit step down, and stop at 24 so a short landscape log can hold them.
+    private func layout(count: Int, maxHeight: CGFloat) -> Metrics {
+        let fullSide: CGFloat = 44
+        let minSide: CGFloat = 24
+        let fullSpacing: CGFloat = 4
+        guard count > 0 else { return Metrics(side: fullSide, spacing: fullSpacing, font: 17) }
+        let gaps = CGFloat(max(count - 1, 0))
+        let full = CGFloat(count) * fullSide + gaps * fullSpacing
+        if maxHeight <= 1 || full <= maxHeight {
+            return Metrics(side: fullSide, spacing: fullSpacing, font: 17)
+        }
+        if gaps > 0 {
+            let spacing = ((maxHeight - CGFloat(count) * fullSide) / gaps).rounded(.down)
+            if spacing >= 0 {
+                return Metrics(side: fullSide, spacing: spacing, font: 17)
+            }
+        }
+        let side = min(fullSide, max(minSide, (maxHeight / CGFloat(count)).rounded(.down)))
+        let font = max(11, (17 * side / fullSide).rounded())
+        return Metrics(side: side, spacing: 0, font: font)
+    }
+
+    private func column(_ metrics: Metrics) -> some View {
+        VStack(spacing: metrics.spacing) {
+            ForEach(buttons) { button in
+                let lit = litButtons.contains(button.id)
+                let showsGlyph = hideLabels == false && button.icon.isEmpty == false
+                let spoken = ActionShortcut.command(text: button.text, target: target)
+                    ?? button.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 Button {
-                    light(row.index)
-                    send(row.action)
+                    guard ActionShortcut.command(text: button.text, target: target) != nil else { return }
+                    light(button.id)
+                    send(button)
                 } label: {
-                    Text(verbatim: row.letter)
-                        .font(.system(size: fontSize, weight: .bold))
+                    Text(verbatim: button.icon)
+                        .font(.system(size: metrics.font, weight: .bold, design: .monospaced))
                         .foregroundStyle(MatrixShade.display(lit ? Color.white : ink, enabled: matrixMode.enabled))
-                        // Opacity stops at the letter. The frost and the press light sit outside it.
-                        .opacity(hideLabels ? 0 : 1)
-                        .frame(width: side, height: side)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.5)
+                        // Opacity stops at the glyph. The frost and the press light sit outside it.
+                        .opacity(showsGlyph ? 1 : 0)
+                        .frame(width: metrics.side, height: metrics.side)
                         .background {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
                                 .fill(Color.white.opacity(lit ? 0.42 : 0))
@@ -3849,24 +3873,24 @@ private struct SkillActionStack: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(row.action.command(target: target) ?? row.action.rawValue)
+                .accessibilityLabel(spoken.isEmpty ? "Hot button" : spoken)
             }
         }
     }
 
-    /// Brighten this letter for a quarter second. The button still sends the action.
-    private func light(_ index: Int) {
-        let token = (lightTokens[index] ?? 0) + 1
-        lightTokens[index] = token
+    /// Brighten this plate for a quarter second. The button still sends the action.
+    private func light(_ id: UUID) {
+        let token = (lightTokens[id] ?? 0) + 1
+        lightTokens[id] = token
         withAnimation(.easeOut(duration: 0.08)) {
-            litSlots.insert(index)
+            litButtons.insert(id)
             return
         }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(250))
-            guard lightTokens[index] == token else { return }
+            guard lightTokens[id] == token else { return }
             withAnimation(.easeOut(duration: 0.15)) {
-                litSlots.remove(index)
+                litButtons.remove(id)
                 return
             }
         }
