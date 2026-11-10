@@ -1564,7 +1564,7 @@ private struct ShortcutRowGestures: UIViewRepresentable {
             guard yieldsToSystemDrag else { return [] }
             let text = dragText
             let provider = NSItemProvider()
-            _ = provider.registerObject(text as NSString, visibility: .all)
+            provider.registerObject(text as NSString, visibility: .all)
             for type in [UTType.utf8PlainText, UTType.plainText] {
                 provider.registerDataRepresentation(
                     forTypeIdentifier: type.identifier,
