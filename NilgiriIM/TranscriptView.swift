@@ -45,7 +45,7 @@ private func transcriptIsPortrait(_ view: UIView) -> Bool {
 private enum CommunicationLine {
     static let portraitBoost: CGFloat = 4
 
-    private static let kinds: Set<String> = [
+    fileprivate static let kinds: Set<String> = [
         "say", "says",
         "ask", "asks",
         "exclaim", "exclaims",
@@ -110,6 +110,30 @@ private enum CommunicationLine {
             index = raw.index(after: index)
         }
         return out
+    }
+}
+
+/// Outgoing speech and channel commands. Display lines use `CommunicationLine`;
+/// this looks at the first word (or `'` / `:` shortcut) of what was typed.
+private enum CommunicationCommand {
+    /// Channel names already recognised for enlarged communication lines,
+    /// plus verbs that classification does not list as a typed command.
+    private static let verbs: Set<String> = CommunicationLine.kinds.union([
+        "reply", "chat", "auction", "grats", "ooc", "gtell", "gsay", "emote"
+    ])
+
+    static func isOutgoing(_ command: String) -> Bool {
+        let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.isEmpty == false else { return false }
+        if text.hasPrefix("'") || text.hasPrefix(":") { return true }
+        let word = String(text.prefix { $0.isWhitespace == false }).lowercased()
+        if verbs.contains(word) { return true }
+        let matches = verbs.filter { $0.hasPrefix(word) }
+        guard matches.count == 1 else { return false }
+        // Two letters are enough when unique among these verbs, except `go`,
+        // which is movement and only a prefix of `gossip`.
+        if word.count >= 3 { return true }
+        return word.count == 2 && word != "go"
     }
 }
 
@@ -2289,6 +2313,11 @@ private final class CommandTextField: UITextField {
 /// hide-on send still end editing. A tap on the log does not, when this
 /// orientation leaves the keyboard up.
 ///
+/// `placeholder` is grey hint text, not the field value. Empty leaves the
+/// line blank. Typing replaces the hint the way a normal placeholder does.
+/// Return still calls `onSubmit`; the caller sends the hint when the field
+/// is empty.
+///
 /// Traits are set once. `textInputMode` is not overridden, and
 /// `becomeFirstResponder` is not called from `updateUIView`: doing either
 /// restarts the input session, the caret blinks, and the keyboard never attaches.
@@ -2297,6 +2326,8 @@ private struct CommandLineField: UIViewRepresentable {
     @Binding var isFocused: Bool
     /// Hide switch for the orientation on screen. Return dismisses only then.
     var dismissOnSubmit: Bool
+    /// Grey hint. Empty shows nothing. Not copied into `text` when the player types.
+    var placeholder: String
     var onSubmit: () -> Void
 
     func makeUIView(context: Context) -> UITextField {
@@ -2316,11 +2347,8 @@ private struct CommandLineField: UIViewRepresentable {
         field.spellCheckingType = .no
         field.autocapitalizationType = .none
         field.keyboardAppearance = .dark
-        field.attributedPlaceholder = NSAttributedString(
-            string: "command",
-            attributes: [.foregroundColor: UIColor(white: 0.78, alpha: 0.45)]
-        )
         field.accessibilityLabel = "command"
+        applyPlaceholder(on: field)
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         field.setContentHuggingPriority(.defaultLow, for: .horizontal)
         field.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -2349,7 +2377,25 @@ private struct CommandLineField: UIViewRepresentable {
         return CGSize(width: width, height: 44)
     }
 
+    /// Field white at 45% opacity, so the hint reads as greyed-out text.
+    /// Applied only when the string changes, so a layout pass does not
+    /// touch the field while the player is typing.
+    private func applyPlaceholder(on field: UITextField) {
+        let shown = field.attributedPlaceholder?.string ?? ""
+        guard shown != placeholder else { return }
+        guard placeholder.isEmpty == false else {
+            field.attributedPlaceholder = nil
+            return
+        }
+        let color = (field.textColor ?? UIColor(white: 0.78, alpha: 1)).withAlphaComponent(0.45)
+        field.attributedPlaceholder = NSAttributedString(
+            string: placeholder,
+            attributes: [.foregroundColor: color]
+        )
+    }
+
     func updateUIView(_ field: UITextField, context: Context) {
+        applyPlaceholder(on: field)
         let coordinator = context.coordinator
         coordinator.onSubmit = onSubmit
         coordinator.dismissOnSubmit = dismissOnSubmit
@@ -2557,6 +2603,12 @@ struct TranscriptView: View {
     /// this flag; the command field reads it and resigns only when it drops.
     @State private var commandFocused = false
     @StateObject private var keyboardPrefs = KeyboardHidePreferences()
+    /// Last non-communication line posted from the input bar (Return or Send).
+    /// Speech, channels, and the Say button leave this unchanged. Compass
+    /// directions and action slots do not replace it. Shown greyed out, and
+    /// repeated from an empty field, only while Keep last command is on.
+    /// Kept for this play screen, not on disk.
+    @State private var lastCommand = ""
     /// The command field should be first responder. Set when this orientation
     /// keeps the keyboard, cleared when the player swipes it away or a switch hides it.
     @State private var keyboardHeld = false
@@ -2949,8 +3001,21 @@ struct TranscriptView: View {
     private func sendCommand() async {
         // Hide-on drops the keyboard on the keypress, not after the round trip.
         // Hide-off leaves an already-focused field alone so it does not resign
-        // and become again.
+        // and become again. A blank field still takes that same keyboard step,
+        // then sends the grey placeholder when Keep last command is on.
         hideCommandKeyboardIfPreferred()
+        let typed = session.command.trimmingCharacters(in: .whitespacesAndNewlines)
+        if typed.isEmpty {
+            // Switch off, or nothing remembered yet: a blank Return still goes
+            // through `send()`, which does not post an empty line.
+            guard keyboardPrefs.keepLastCommand, lastCommand.isEmpty == false else {
+                await session.send()
+                return
+            }
+            await session.send(fallback: lastCommand)
+            return
+        }
+        rememberLastCommand(typed)
         await session.send()
     }
 
@@ -2961,8 +3026,10 @@ struct TranscriptView: View {
         let draft = session.command
         let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else { return }
-        if alreadySay(trimmed) == false {
-            session.command = "say " + trimmed
+        let said = alreadySay(trimmed)
+        let outgoing = said ? trimmed : "say " + trimmed
+        if said == false {
+            session.command = outgoing
         }
         if keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false {
             keepCommandKeyboard()
@@ -3120,8 +3187,24 @@ struct TranscriptView: View {
         return folded == "say" || folded.hasPrefix("say ")
     }
 
-    private var commandIsBlank: Bool {
+    /// Remembers a typed Send/Return line unless it is speech or a channel.
+    /// The Say button never calls this.
+    private func rememberLastCommand(_ text: String) {
+        guard CommunicationCommand.isOutgoing(text) == false else { return }
+        lastCommand = text
+    }
+
+
+    /// Blank after the same trim `send()` uses. Whitespace is not a command.
+    private var typedCommandIsBlank: Bool {
         session.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Grey text in the command field. Empty when the switch is off, or when
+    /// this screen has not sent from the input line yet.
+    private var commandPlaceholder: String {
+        guard keyboardPrefs.keepLastCommand, lastCommand.isEmpty == false else { return "" }
+        return lastCommand
     }
 
     /// Same path as a typed command: `session.send()` posts `session.command`.
@@ -3214,6 +3297,7 @@ struct TranscriptView: View {
                     dismissOnSubmit: keyboardPrefs.hidesKeyboard(
                         isPortrait: KeyboardHidePreferences.interfaceIsPortrait()
                     ),
+                    placeholder: commandPlaceholder,
                     onSubmit: { Task { await sendCommand() } }
                 )
                     .onAppear {
@@ -3239,10 +3323,14 @@ struct TranscriptView: View {
                     }
                     .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                     .padding(.trailing, 16)
-                commandIcon("bubble.left.fill", label: "Say") {
+                commandIcon("bubble.left.fill", label: "Say", disabled: typedCommandIsBlank) {
                     Task { await sendSay() }
                 }
-                commandIcon("paperplane.fill", label: "Send") {
+                commandIcon(
+                    "paperplane.fill",
+                    label: "Send",
+                    disabled: typedCommandIsBlank && commandPlaceholder.isEmpty
+                ) {
                     Task { await sendCommand() }
                 }
             }
@@ -3275,6 +3363,7 @@ struct TranscriptView: View {
     private func commandIcon(
         _ symbol: String,
         label: String,
+        disabled: Bool,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -3285,7 +3374,7 @@ struct TranscriptView: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(ink)
-        .disabled(commandIsBlank)
+        .disabled(disabled)
         .accessibilityLabel(label)
     }
 }
