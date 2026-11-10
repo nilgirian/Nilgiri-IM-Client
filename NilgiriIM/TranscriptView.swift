@@ -3234,7 +3234,11 @@ struct TranscriptView: View {
         if session.atMenu == false {
             VStack(alignment: .trailing, spacing: 0) {
                 HStack(alignment: .bottom, spacing: 0) {
-                    SkillActionStack(slots: actionSlots.slots, target: session.hilitedWord) { action in
+                    SkillActionStack(
+                        slots: actionSlots.slots,
+                        target: session.hilitedWord,
+                        hideLabels: keyboardPrefs.hideHotButtonLabels
+                    ) { action in
                         Task { await sendSkill(action) }
                     }
                     Color.clear
@@ -3272,7 +3276,7 @@ struct TranscriptView: View {
     private var inputBar: some View {
         VStack(spacing: 0) {
             if actionPanelShown {
-                ActionPanel { command in
+                ActionPanel(hideLabels: keyboardPrefs.hideHotButtonLabels, exits: session.roomExits) { command in
                     Task { await sendDirection(command) }
                 }
                 Rectangle()
@@ -3578,8 +3582,15 @@ private struct GameMenuPanel: View {
 
 /// One row of compass commands on the input bar's frost. Each tap posts the
 /// full direction through `session.send()`, the same as typing it. The pressed
-/// letter stays lit for a quarter second, then returns to ink.
+/// letter stays lit for a quarter second, then returns to ink. Hiding labels
+/// drops the letter only; the plate still lights and the tap still sends.
+/// Until an exits listing arrives, every letter is shown. After that, an open
+/// exit shows its letter, a closed door is grey and does not send, and a
+/// direction with no exit keeps a blank slot.
 private struct ActionPanel: View {
+    /// The letter is invisible. The row, the press light, and the tap stay.
+    var hideLabels: Bool
+    var exits: RoomExitListing?
     var send: (String) -> Void
 
     private struct Direction: Identifiable {
@@ -3605,28 +3616,53 @@ private struct ActionPanel: View {
     var body: some View {
         HStack(spacing: 0) {
             ForEach(Self.directions) { direction in
-                let lit = litCommands.contains(direction.command)
-                Button(direction.label) {
-                    light(direction.command)
-                    send(direction.command)
-                }
-                .buttonStyle(.plain)
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(lit ? Color.white : ink)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 10)
-                .background {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color.white.opacity(lit ? 0.42 : 0))
-                        .padding(.horizontal, 3)
-                        .padding(.vertical, 3)
-                }
-                .contentShape(Rectangle())
-                .accessibilityLabel(direction.command)
+                directionButton(direction)
             }
         }
         .padding(.horizontal, 4)
         .padding(.top, 4)
+    }
+
+    /// The slot width stays `maxWidth: .infinity` for every direction, so a
+    /// blank keeps the same place as a letter.
+    private func directionButton(_ direction: Direction) -> some View {
+        let known = exits != nil
+        let door = exits?.door(for: direction.command)
+        let showsLetter = known == false || door != nil
+        let usable = known == false || door == .open
+        let lit = usable && litCommands.contains(direction.command)
+        return Button {
+            guard usable else { return }
+            light(direction.command)
+            send(direction.command)
+        } label: {
+            // Opacity stops at the letter. The press light is on the button.
+            // Hidden labels and missing exits both drop the letter only.
+            Text(verbatim: direction.label)
+                .opacity(showsLetter && hideLabels == false ? 1 : 0)
+        }
+        .buttonStyle(.plain)
+        .disabled(usable == false)
+        .font(.system(.body, design: .monospaced))
+        .foregroundStyle(letterInk(closed: door == .closed, lit: lit))
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(lit ? 0.42 : 0))
+                .padding(.horizontal, 3)
+                .padding(.vertical, 3)
+        }
+        .contentShape(Rectangle())
+        .accessibilityLabel(direction.command)
+        .accessibilityHidden(showsLetter == false)
+    }
+
+    /// Closed doors stay readable and grey. A lit open letter is white.
+    private func letterInk(closed: Bool, lit: Bool) -> Color {
+        if lit { return .white }
+        if closed { return ink.opacity(0.38) }
+        return ink
     }
 
     /// Brighten this letter for a quarter second. The button still sends the command.
@@ -3653,10 +3689,13 @@ private struct ActionPanel: View {
 /// Assigned skills, stacked above the command bar. Blank slots are absent.
 /// The letter is a bold system face. The plate is the bar frost, and a tap
 /// lights it the same way a compass letter does: white for a quarter second.
+/// A hidden label leaves that plate and the light in place.
 private struct SkillActionStack: View {
     var slots: [SkillAction]
     /// Hilited word, spoken with the verb. The tap reads `hilitedWord` itself.
     var target: String?
+    /// The letter is invisible. The frost plate and the press light stay.
+    var hideLabels: Bool
     var send: (SkillAction) -> Void
 
     /// Slots whose letters are lit. A second tap of the same slot restarts a quarter second.
@@ -3707,6 +3746,8 @@ private struct SkillActionStack: View {
                     Text(verbatim: row.letter)
                         .font(.system(size: fontSize, weight: .bold))
                         .foregroundStyle(lit ? Color.white : ink)
+                        // Opacity stops at the letter. The frost and the press light sit outside it.
+                        .opacity(hideLabels ? 0 : 1)
                         .frame(width: side, height: side)
                         .background {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)

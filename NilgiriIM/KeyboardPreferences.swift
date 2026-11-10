@@ -4,7 +4,8 @@ import UIKit
 /// Whether sending a command, or turning the window, dismisses the keyboard.
 /// Also whether the input line keeps the last command as grey placeholder text.
 /// Missing keys keep the device default. iPhone hides in landscape only.
-/// iPad keeps the keyboard up in both orientations. Keep last command defaults off.
+/// iPad keeps the keyboard up in both orientations. The hot-button switch
+/// hides letters only; a missing key leaves them showing. Keep last command defaults off.
 /// Moving a switch writes the key.
 final class KeyboardHidePreferences: ObservableObject {
     @Published var hideInPortrait: Bool {
@@ -13,6 +14,11 @@ final class KeyboardHidePreferences: ObservableObject {
 
     @Published var hideInLandscape: Bool {
         didSet { UserDefaults.standard.set(hideInLandscape, forKey: Key.landscape) }
+    }
+
+    /// Hide the letter on each on-screen hot button. The plate stays, and it still lights.
+    @Published var hideHotButtonLabels: Bool {
+        didSet { UserDefaults.standard.set(hideHotButtonLabels, forKey: Key.hotButtonLabels) }
     }
 
     /// Grey placeholder of the last command sent from the input line.
@@ -24,6 +30,7 @@ final class KeyboardHidePreferences: ObservableObject {
     private enum Key {
         static let portrait = "im.hideKeyboardPortrait"
         static let landscape = "im.hideKeyboardLandscape"
+        static let hotButtonLabels = "im.hideHotButtonLabels"
         static let keepLastCommand = "im.keepLastCommand"
     }
 
@@ -32,6 +39,7 @@ final class KeyboardHidePreferences: ObservableObject {
         let phone = UIDevice.current.userInterfaceIdiom == .phone
         hideInPortrait = Self.stored(defaults, Key.portrait, fallback: false)
         hideInLandscape = Self.stored(defaults, Key.landscape, fallback: phone)
+        hideHotButtonLabels = Self.stored(defaults, Key.hotButtonLabels, fallback: false)
         keepLastCommand = Self.stored(defaults, Key.keepLastCommand, fallback: false)
     }
 
@@ -117,9 +125,10 @@ struct WindowPortraitProbe: UIViewRepresentable {
 }
 
 /// Dark grey card on the left edge. A rightward swipe from that edge opens it.
-/// Portrait and landscape keyboard switches, and Keep last command, stay at
-/// the top. Report issues, the newbie guide, and About Nilgiri IM open in
-/// Safari. Unlink, while the player is in the game, sits at the bottom of the card.
+/// Portrait and landscape keyboard switches stay at the top, then the switch
+/// that hides hot-button letters and Keep last command. Report issues, the
+/// newbie guide, and About Nilgiri IM open in Safari. Unlink, while the
+/// player is in the game, sits at the bottom of the card.
 struct KeyboardSettingsDrawer: View {
     @ObservedObject var preferences: KeyboardHidePreferences
     /// Toggled by the accessibility action. Each change opens the card.
@@ -222,6 +231,7 @@ struct KeyboardSettingsDrawer: View {
                     .foregroundStyle(Color(white: 0.62))
                 Toggle("Hide keyboard in portrait mode", isOn: $preferences.hideInPortrait)
                 Toggle("Hide keyboard in landscape mode", isOn: $preferences.hideInLandscape)
+                Toggle("Hide hot button labels", isOn: $preferences.hideHotButtonLabels)
                 Toggle("Keep last command", isOn: $preferences.keepLastCommand)
                 VStack(alignment: .leading, spacing: 12) {
                     VStack(alignment: .leading, spacing: 2) {
