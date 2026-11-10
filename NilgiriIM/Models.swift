@@ -620,6 +620,140 @@ enum HMVPrompt {
     }
 }
 
+/// One `EXITS_LONG` room listing (`environment exits long_on`).
+/// Nil on the session means no listing has been read yet, so every compass
+/// letter stays available. An empty `doors` map means a listing arrived and
+/// named nothing (`None.`). The scrollback is never edited.
+///
+/// The game prints a header and then one line per exit, with the dash in a
+/// fixed column. A closed door's destination is wrapped in parentheses:
+///
+/// ```
+/// Obvious exits:
+/// North  - (portcullis)
+/// East   - Ye Olde Reading Room
+/// West   - Ye Olde Common Room
+/// South  - The Temple Square
+/// ```
+///
+/// `Up` and `Down` use the same column (`Up     - ...`, `Down   - ...`).
+struct RoomExitListing: Equatable {
+    enum Door: Equatable {
+        case open
+        case closed
+    }
+
+    /// Keys are the move commands: `north`, `south`, `east`, `west`, `up`, `down`.
+    /// A missing key is a direction the listing did not name.
+    var doors: [String: Door]
+
+    func door(for command: String) -> Door? {
+        doors[command]
+    }
+}
+
+/// Reads long-exit lines out of game text. ANSI is ignored. The string passed
+/// in is not modified, and nothing here is written back onto a transcript line.
+struct RoomExitScan {
+    /// Last listing committed by an exit line or `None.`. A header by itself
+    /// leaves this alone so the previous room stays up until the new lines arrive.
+    private(set) var listing: RoomExitListing?
+    private var collecting = false
+    private var doors: [String: RoomExitListing.Door] = [:]
+
+    mutating func reset() {
+        listing = nil
+        collecting = false
+        doors = [:]
+    }
+
+    /// `raw` may hold several server lines. ANSI around the words is skipped.
+    mutating func consume(_ raw: String) {
+        let plain = Self.plain(raw)
+        for piece in plain.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            consumeLine(piece.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
+    private mutating func consumeLine(_ line: String) {
+        if line.isEmpty { return }
+        if Self.isHeader(line) {
+            collecting = true
+            doors = [:]
+            return
+        }
+        guard collecting else { return }
+        if Self.isNone(line) {
+            doors = [:]
+            collecting = false
+            listing = RoomExitListing(doors: doors)
+            return
+        }
+        if let exit = Self.exit(on: line) {
+            doors[exit.command] = exit.door
+            listing = RoomExitListing(doors: doors)
+            return
+        }
+        collecting = false
+    }
+
+    /// `Obvious exits:` on its own line, as `EXITS_LONG` prints it.
+    private static func isHeader(_ line: String) -> Bool {
+        line.compare("Obvious exits:", options: [.caseInsensitive]) == .orderedSame
+    }
+
+    /// A listing that names no direction.
+    private static func isNone(_ line: String) -> Bool {
+        let folded = line.lowercased()
+        return folded == "none" || folded == "none."
+    }
+
+    /// `North  - (portcullis)` or `East   - Ye Olde Reading Room`.
+    /// The direction word, then whitespace, a hyphen, whitespace, and the
+    /// destination. Parentheses around the whole destination are a closed door.
+    private static func exit(on line: String) -> (command: String, door: RoomExitListing.Door)? {
+        let folded = line.lowercased()
+        for command in directionCommands {
+            guard folded.hasPrefix(command) else { continue }
+            let nameEnd = line.index(line.startIndex, offsetBy: command.count)
+            guard nameEnd < line.endIndex, line[nameEnd].isWhitespace else { continue }
+            var rest = line[nameEnd...].drop(while: \.isWhitespace)
+            guard rest.first == "-" else { continue }
+            rest = rest.dropFirst().drop(while: \.isWhitespace)
+            let destination = rest.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard destination.isEmpty == false else { continue }
+            let closed = destination.first == "(" && destination.last == ")"
+            return (command, closed ? .closed : .open)
+        }
+        return nil
+    }
+
+    private static let directionCommands = ["north", "south", "east", "west", "up", "down"]
+
+    /// Visible characters. CSI color sequences are dropped, matching the
+    /// prompt parser. Every other character is kept, in order.
+    private static func plain(_ raw: String) -> String {
+        var plain = ""
+        var index = raw.startIndex
+        while index < raw.endIndex {
+            let next = raw.index(after: index)
+            if raw[index] == "\u{001B}", next < raw.endIndex, raw[next] == "[" {
+                var cursor = raw.index(after: next)
+                while cursor < raw.endIndex {
+                    let character = raw[cursor]
+                    cursor = raw.index(after: cursor)
+                    if character.isLetter { break }
+                }
+                index = cursor
+                continue
+            }
+            plain.append(raw[index])
+            index = raw.index(after: index)
+        }
+        return plain
+    }
+}
+
 /// One creation step's info block. `lines` is the plain `info`, unchanged.
 /// `ansiLines` is `infoAnsi` when the server sent it. The view draws the
 /// rule between sections; nothing here is written into the line text.

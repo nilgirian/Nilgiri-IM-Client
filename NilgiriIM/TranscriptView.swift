@@ -45,7 +45,7 @@ private func transcriptIsPortrait(_ view: UIView) -> Bool {
 private enum CommunicationLine {
     static let portraitBoost: CGFloat = 4
 
-    private static let kinds: Set<String> = [
+    fileprivate static let kinds: Set<String> = [
         "say", "says",
         "ask", "asks",
         "exclaim", "exclaims",
@@ -110,6 +110,30 @@ private enum CommunicationLine {
             index = raw.index(after: index)
         }
         return out
+    }
+}
+
+/// Outgoing speech and channel commands. Display lines use `CommunicationLine`;
+/// this looks at the first word (or `'` / `:` shortcut) of what was typed.
+private enum CommunicationCommand {
+    /// Channel names already recognised for enlarged communication lines,
+    /// plus verbs that classification does not list as a typed command.
+    private static let verbs: Set<String> = CommunicationLine.kinds.union([
+        "reply", "chat", "auction", "grats", "ooc", "gtell", "gsay", "emote"
+    ])
+
+    static func isOutgoing(_ command: String) -> Bool {
+        let text = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard text.isEmpty == false else { return false }
+        if text.hasPrefix("'") || text.hasPrefix(":") { return true }
+        let word = String(text.prefix { $0.isWhitespace == false }).lowercased()
+        if verbs.contains(word) { return true }
+        let matches = verbs.filter { $0.hasPrefix(word) }
+        guard matches.count == 1 else { return false }
+        // Two letters are enough when unique among these verbs, except `go`,
+        // which is movement and only a prefix of `gossip`.
+        if word.count >= 3 { return true }
+        return word.count == 2 && word != "go"
     }
 }
 
@@ -2331,6 +2355,11 @@ private final class CommandTextField: UITextField {
 /// hide-on send still end editing. A tap on the log does not, when this
 /// orientation leaves the keyboard up.
 ///
+/// `placeholder` is grey hint text, not the field value. Empty leaves the
+/// line blank. Typing replaces the hint the way a normal placeholder does.
+/// Return still calls `onSubmit`; the caller sends the hint when the field
+/// is empty.
+///
 /// Traits are set once. `textInputMode` is not overridden, and
 /// `becomeFirstResponder` is not called from `updateUIView`: doing either
 /// restarts the input session, the caret blinks, and the keyboard never attaches.
@@ -2339,6 +2368,8 @@ private struct CommandLineField: UIViewRepresentable {
     @Binding var isFocused: Bool
     /// Hide switch for the orientation on screen. Return dismisses only then.
     var dismissOnSubmit: Bool
+    /// Grey hint. Empty shows nothing. Not copied into `text` when the player types.
+    var placeholder: String
     /// Matrix Mode. The field's ink follows it without rewriting the command.
     var matrix: Bool
     var onSubmit: () -> Void
@@ -2388,7 +2419,26 @@ private struct CommandLineField: UIViewRepresentable {
         return CGSize(width: width, height: 44)
     }
 
+    /// Field white at 45% opacity, so the hint reads as greyed-out text.
+    /// Applied only when the string changes, so a layout pass does not
+    /// touch the field while the player is typing. `force` also refreshes
+    /// the tint after Matrix Mode recasts the field ink.
+    private func applyPlaceholder(on field: UITextField, force: Bool = false) {
+        let shown = field.attributedPlaceholder?.string ?? ""
+        guard force || shown != placeholder else { return }
+        guard placeholder.isEmpty == false else {
+            field.attributedPlaceholder = nil
+            return
+        }
+        let color = (field.textColor ?? UIColor(white: 0.78, alpha: 1)).withAlphaComponent(0.45)
+        field.attributedPlaceholder = NSAttributedString(
+            string: placeholder,
+            attributes: [.foregroundColor: color]
+        )
+    }
+
     func updateUIView(_ field: UITextField, context: Context) {
+        applyPlaceholder(on: field)
         let coordinator = context.coordinator
         coordinator.onSubmit = onSubmit
         coordinator.dismissOnSubmit = dismissOnSubmit
@@ -2437,16 +2487,13 @@ private struct CommandLineField: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    /// Ink and the placeholder tint. The placeholder string stays "command".
+    /// Ink and caret tint. The last-command hint string is left to
+    /// `applyPlaceholder`, which recasts its colour from the new ink.
     private func applyInk(_ field: UITextField, enabled: Bool) {
         let ink = MatrixShade.display(UIColor(white: 0.78, alpha: 1), enabled: enabled)
-        let faint = MatrixShade.display(UIColor(white: 0.78, alpha: 0.45), enabled: enabled)
         field.textColor = ink
         field.tintColor = ink
-        field.attributedPlaceholder = NSAttributedString(
-            string: "command",
-            attributes: [.foregroundColor: faint]
-        )
+        applyPlaceholder(on: field, force: true)
     }
 
     final class Coordinator: NSObject, UITextFieldDelegate {
@@ -2616,6 +2663,12 @@ struct TranscriptView: View {
     @State private var commandFocused = false
     @StateObject private var keyboardPrefs = KeyboardHidePreferences()
     @StateObject private var matrixMode = MatrixMode.shared
+    /// Last non-communication line posted from the input bar (Return or Send).
+    /// Speech, channels, and the Say button leave this unchanged. Compass
+    /// directions and action slots do not replace it. Shown greyed out, and
+    /// repeated from an empty field, only while Keep last command is on.
+    /// Kept for this play screen, not on disk.
+    @State private var lastCommand = ""
     /// The command field should be first responder. Set when this orientation
     /// keeps the keyboard, cleared when the player swipes it away or a switch hides it.
     @State private var keyboardHeld = false
@@ -3011,8 +3064,21 @@ struct TranscriptView: View {
     private func sendCommand() async {
         // Hide-on drops the keyboard on the keypress, not after the round trip.
         // Hide-off leaves an already-focused field alone so it does not resign
-        // and become again.
+        // and become again. A blank field still takes that same keyboard step,
+        // then sends the grey placeholder when Keep last command is on.
         hideCommandKeyboardIfPreferred()
+        let typed = session.command.trimmingCharacters(in: .whitespacesAndNewlines)
+        if typed.isEmpty {
+            // Switch off, or nothing remembered yet: a blank Return still goes
+            // through `send()`, which does not post an empty line.
+            guard keyboardPrefs.keepLastCommand, lastCommand.isEmpty == false else {
+                await session.send()
+                return
+            }
+            await session.send(fallback: lastCommand)
+            return
+        }
+        rememberLastCommand(typed)
         await session.send()
     }
 
@@ -3023,8 +3089,10 @@ struct TranscriptView: View {
         let draft = session.command
         let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.isEmpty == false else { return }
-        if alreadySay(trimmed) == false {
-            session.command = "say " + trimmed
+        let said = alreadySay(trimmed)
+        let outgoing = said ? trimmed : "say " + trimmed
+        if said == false {
+            session.command = outgoing
         }
         if keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false {
             keepCommandKeyboard()
@@ -3182,8 +3250,24 @@ struct TranscriptView: View {
         return folded == "say" || folded.hasPrefix("say ")
     }
 
-    private var commandIsBlank: Bool {
+    /// Remembers a typed Send/Return line unless it is speech or a channel.
+    /// The Say button never calls this.
+    private func rememberLastCommand(_ text: String) {
+        guard CommunicationCommand.isOutgoing(text) == false else { return }
+        lastCommand = text
+    }
+
+
+    /// Blank after the same trim `send()` uses. Whitespace is not a command.
+    private var typedCommandIsBlank: Bool {
         session.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Grey text in the command field. Empty when the switch is off, or when
+    /// this screen has not sent from the input line yet.
+    private var commandPlaceholder: String {
+        guard keyboardPrefs.keepLastCommand, lastCommand.isEmpty == false else { return "" }
+        return lastCommand
     }
 
     /// Same path as a typed command: `session.send()` posts `session.command`.
@@ -3213,7 +3297,11 @@ struct TranscriptView: View {
         if session.atMenu == false {
             VStack(alignment: .trailing, spacing: 0) {
                 HStack(alignment: .bottom, spacing: 0) {
-                    SkillActionStack(slots: actionSlots.slots, target: session.hilitedWord) { action in
+                    SkillActionStack(
+                        slots: actionSlots.slots,
+                        target: session.hilitedWord,
+                        hideLabels: keyboardPrefs.hideHotButtonLabels
+                    ) { action in
                         Task { await sendSkill(action) }
                     }
                     Color.clear
@@ -3251,7 +3339,7 @@ struct TranscriptView: View {
     private var inputBar: some View {
         VStack(spacing: 0) {
             if actionPanelShown {
-                ActionPanel { command in
+                ActionPanel(hideLabels: keyboardPrefs.hideHotButtonLabels, exits: session.roomExits) { command in
                     Task { await sendDirection(command) }
                 }
                 Rectangle()
@@ -3272,6 +3360,7 @@ struct TranscriptView: View {
                     dismissOnSubmit: keyboardPrefs.hidesKeyboard(
                         isPortrait: KeyboardHidePreferences.interfaceIsPortrait()
                     ),
+                    placeholder: commandPlaceholder,
                     matrix: matrixMode.enabled,
                     onSubmit: { Task { await sendCommand() } }
                 )
@@ -3298,10 +3387,14 @@ struct TranscriptView: View {
                     }
                     .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                     .padding(.trailing, 16)
-                commandIcon("bubble.left.fill", label: "Say") {
+                commandIcon("bubble.left.fill", label: "Say", disabled: typedCommandIsBlank) {
                     Task { await sendSay() }
                 }
-                commandIcon("paperplane.fill", label: "Send") {
+                commandIcon(
+                    "paperplane.fill",
+                    label: "Send",
+                    disabled: typedCommandIsBlank && commandPlaceholder.isEmpty
+                ) {
                     Task { await sendCommand() }
                 }
             }
@@ -3334,6 +3427,7 @@ struct TranscriptView: View {
     private func commandIcon(
         _ symbol: String,
         label: String,
+        disabled: Bool,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -3344,7 +3438,7 @@ struct TranscriptView: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(ink.matrix)
-        .disabled(commandIsBlank)
+        .disabled(disabled)
         .accessibilityLabel(label)
     }
 }
@@ -3556,9 +3650,16 @@ private struct GameMenuPanel: View {
 
 /// One row of compass commands on the input bar's frost. Each tap posts the
 /// full direction through `session.send()`, the same as typing it. The pressed
-/// letter stays lit for a quarter second, then returns to ink.
+/// letter stays lit for a quarter second, then returns to ink. Hiding labels
+/// drops the letter only; the plate still lights and the tap still sends.
+/// Until an exits listing arrives, every letter is shown. After that, an open
+/// exit shows its letter, a closed door is grey and does not send, and a
+/// direction with no exit keeps a blank slot.
 private struct ActionPanel: View {
     @ObservedObject private var matrixMode = MatrixMode.shared
+    /// The letter is invisible. The row, the press light, and the tap stay.
+    var hideLabels: Bool
+    var exits: RoomExitListing?
     var send: (String) -> Void
 
     private struct Direction: Identifiable {
@@ -3584,28 +3685,59 @@ private struct ActionPanel: View {
     var body: some View {
         HStack(spacing: 0) {
             ForEach(Self.directions) { direction in
-                let lit = litCommands.contains(direction.command)
-                Button(direction.label) {
-                    light(direction.command)
-                    send(direction.command)
-                }
-                .buttonStyle(.plain)
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(MatrixShade.display(lit ? Color.white : ink, enabled: matrixMode.enabled))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 10)
-                .background {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color.white.opacity(lit ? 0.42 : 0))
-                        .padding(.horizontal, 3)
-                        .padding(.vertical, 3)
-                }
-                .contentShape(Rectangle())
-                .accessibilityLabel(direction.command)
+                directionButton(direction)
             }
         }
         .padding(.horizontal, 4)
         .padding(.top, 4)
+    }
+
+    /// The slot width stays `maxWidth: .infinity` for every direction, so a
+    /// blank keeps the same place as a letter.
+    private func directionButton(_ direction: Direction) -> some View {
+        let known = exits != nil
+        let door = exits?.door(for: direction.command)
+        let showsLetter = known == false || door != nil
+        let usable = known == false || door == .open
+        let lit = usable && litCommands.contains(direction.command)
+        return Button {
+            guard usable else { return }
+            light(direction.command)
+            send(direction.command)
+        } label: {
+            // Opacity stops at the letter. The press light is on the button.
+            // Hidden labels and missing exits both drop the letter only.
+            Text(verbatim: direction.label)
+                .opacity(showsLetter && hideLabels == false ? 1 : 0)
+        }
+        .buttonStyle(.plain)
+        .disabled(usable == false)
+        .font(.system(.body, design: .monospaced))
+        .foregroundStyle(letterInk(closed: door == .closed, lit: lit))
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(lit ? 0.42 : 0))
+                .padding(.horizontal, 3)
+                .padding(.vertical, 3)
+        }
+        .contentShape(Rectangle())
+        .accessibilityLabel(direction.command)
+        .accessibilityHidden(showsLetter == false)
+    }
+
+    /// Closed doors stay readable and grey. A lit open letter is white.
+    private func letterInk(closed: Bool, lit: Bool) -> Color {
+        let color: Color
+        if lit {
+            color = .white
+        } else if closed {
+            color = ink.opacity(0.38)
+        } else {
+            color = ink
+        }
+        return MatrixShade.display(color, enabled: matrixMode.enabled)
     }
 
     /// Brighten this letter for a quarter second. The button still sends the command.
@@ -3632,11 +3764,14 @@ private struct ActionPanel: View {
 /// Assigned skills, stacked above the command bar. Blank slots are absent.
 /// The letter is a bold system face. The plate is the bar frost, and a tap
 /// lights it the same way a compass letter does: white for a quarter second.
+/// A hidden label leaves that plate and the light in place.
 private struct SkillActionStack: View {
     @ObservedObject private var matrixMode = MatrixMode.shared
     var slots: [SkillAction]
     /// Hilited word, spoken with the verb. The tap reads `hilitedWord` itself.
     var target: String?
+    /// The letter is invisible. The frost plate and the press light stay.
+    var hideLabels: Bool
     var send: (SkillAction) -> Void
 
     /// Slots whose letters are lit. A second tap of the same slot restarts a quarter second.
@@ -3687,6 +3822,8 @@ private struct SkillActionStack: View {
                     Text(verbatim: row.letter)
                         .font(.system(size: fontSize, weight: .bold))
                         .foregroundStyle(MatrixShade.display(lit ? Color.white : ink, enabled: matrixMode.enabled))
+                        // Opacity stops at the letter. The frost and the press light sit outside it.
+                        .opacity(hideLabels ? 0 : 1)
                         .frame(width: side, height: side)
                         .background {
                             RoundedRectangle(cornerRadius: 8, style: .continuous)
