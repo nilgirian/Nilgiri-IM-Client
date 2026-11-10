@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// One right-edge shortcut. The text is sent as the player left it.
 /// A new id is minted when the row is created; reloading mints new ids and
@@ -238,7 +239,6 @@ struct ActionSlotsDrawer: View {
         static let rowStride: CGFloat = 48
         static let deleteDistance: CGFloat = 64
         static let iconHitWidth: CGFloat = 52
-        static let stripBody: CGFloat = 52
     }
 
     private enum DragList { case actions, hotButtons }
@@ -251,16 +251,8 @@ struct ActionSlotsDrawer: View {
         var origin: Int
         var translation: CGSize
         var axis: Axis?
-        /// Finger, in the window. Compared with the row frames from the probes.
+        /// Finger, in the window. Translation is taken from this, not a hit test.
         var location: CGPoint
-    }
-
-    /// An action drag that is currently over a hot-button target.
-    private struct IncomingDrop {
-        var index: Int
-        var accepted: Bool
-        /// Over the rows themselves, so they can open a gap. A strip drop appends.
-        var overRows: Bool
     }
 
     /// Dark grey, see-through, so the log shows behind the card.
@@ -279,10 +271,8 @@ struct ActionSlotsDrawer: View {
     @State private var held: HeldDrag?
     /// True from the long-press began until the finger lifts.
     @State private var heldActive = false
-    /// Visible card, in window coordinates. The flying preview is positioned from it.
-    @State private var cardWindow: CGRect = .zero
-    /// Hot-button rows, in window coordinates. Empty until they have been laid out.
-    @State private var hotWindow: CGRect = .zero
+    /// The system drop session is over the Hot Buttons well or the append bar.
+    @State private var hotDropTargeted = false
 
     var body: some View {
         GeometryReader { geo in
@@ -371,10 +361,7 @@ struct ActionSlotsDrawer: View {
                         shortcutRows(width: width)
                     }
                     sectionDivider
-                    VStack(alignment: .leading, spacing: 8) {
-                        sectionTitle("Hot Buttons")
-                        hotButtonRows
-                    }
+                    hotButtonSection
                 }
                 .font(.system(size: 17))
                 .foregroundStyle(MatrixShade.display(Color(white: 0.92), enabled: matrixMode.enabled))
@@ -405,8 +392,10 @@ struct ActionSlotsDrawer: View {
         .frame(width: width, alignment: .topLeading)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(Self.menuGrey)
-        .overlay {
-            dragOverlay
+        .overlay(alignment: .bottom) {
+            if showAppendBar {
+                appendBar
+            }
         }
         .clipShape(
             UnevenRoundedRectangle(
@@ -425,29 +414,43 @@ struct ActionSlotsDrawer: View {
         .shadow(color: .black.opacity(0.45), radius: 14, x: -8, y: 0)
     }
 
-    /// Window frame of the card, plus the stand-in target used when the hot
-    /// button rows are scrolled off the bottom. The overlay does not take taps:
-    /// the finger is still the row's long press, and the frames decide the drop.
-    private var dragOverlay: some View {
-        ZStack(alignment: .bottom) {
-            GeometryReader { proxy in
-                WindowFrameProbe { frame in
-                    adopt(frame, into: $cardWindow)
-                }
-                .frame(width: proxy.size.width, height: proxy.size.height)
-            }
-            if dropStripVisible {
-                dropStrip
-            }
-            if let flying = flyingPreview, cardWindow.width > 1 {
-                flyingRow(text: flying.text, accepted: flying.accepted)
-                    .position(
-                        x: flying.location.x - cardWindow.minX,
-                        y: flying.location.y - cardWindow.minY
-                    )
-            }
+    /// Actions above, then the hot-button well. The well is the drop target:
+    /// a `String` in `public.utf8-plain-text`, the same payload `.draggable`
+    /// writes on an action row. An empty list keeps one row of height so the
+    /// target does not collapse.
+    private var hotButtonSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Hot Buttons")
+            hotButtonRows
         }
-        .allowsHitTesting(false)
+    }
+
+    /// Shown while an action is being dragged down, and while a system drop
+    /// is over the card. It stays on screen when the well has scrolled away,
+    /// and a drop here appends. Minimum height so an empty hit still lands.
+    private var showAppendBar: Bool {
+        if hotDropTargeted { return true }
+        guard let drag = held, drag.list == .actions, drag.axis == .vertical else { return false }
+        return true
+    }
+
+    private var appendBar: some View {
+        Text("Hot Buttons")
+            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+            .foregroundStyle(MatrixShade.display(Color(white: 0.78), enabled: matrixMode.enabled))
+            .frame(maxWidth: .infinity, minHeight: Metrics.rowStride, alignment: .center)
+            .padding(.bottom, Self.windowInsets.bottom)
+            .background(Color(white: hotDropTargeted ? 0.34 : 0.18).opacity(0.94))
+            .contentShape(Rectangle())
+            .dropDestination(for: String.self) { items, _ in
+                acceptActionDrop(items, at: hotButtons.buttons.count)
+            } isTargeted: { targeted in
+                setHotDropTargeted(targeted)
+            }
+            .onDrop(of: [UTType.utf8PlainText, UTType.plainText], isTargeted: $hotDropTargeted) { providers in
+                loadActionDrop(providers, at: hotButtons.buttons.count)
+            }
+            .accessibilityHidden(true)
     }
 
     private func sectionTitle(_ title: String) -> some View {
@@ -527,6 +530,8 @@ struct ActionSlotsDrawer: View {
                         .contentShape(Rectangle())
                         .overlay {
                             ShortcutRowGestures(
+                                yieldsToSystemDrag: true,
+                                dragText: shortcut.text,
                                 onTap: { _ in activate(shortcut, width: width) },
                                 onDoubleTap: { editingID = shortcut.id },
                                 onPressBegan: { location in
@@ -572,7 +577,10 @@ struct ActionSlotsDrawer: View {
 
     /// Icon plate and the action text, in list order. The plate is what the
     /// play-screen button shows. Tap the plate to type 0, 1, or 2 characters.
-    /// Hold the row to reorder, or to drag it out of this area and remove it.
+    /// Hold the row to reorder inside this list. A drag that leaves the list
+    /// removes only that hot button; the action row is a different object.
+    /// The well keeps a row of height when the list is empty, and it accepts
+    /// the action row's `String` drop there.
     private var hotButtonRows: some View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(hotButtons.buttons.enumerated()), id: \.element.id) { index, button in
@@ -581,15 +589,26 @@ struct ActionSlotsDrawer: View {
         }
         .frame(maxWidth: .infinity, minHeight: Metrics.rowStride, alignment: .topLeading)
         .background {
-            // The probe has to be the rows' size. A background that takes the
-            // scroll view's proposal would treat the whole card as the drop target.
-            GeometryReader { proxy in
-                WindowFrameProbe { frame in
-                    adopt(frame, into: $hotWindow)
-                }
-                .frame(width: proxy.size.width, height: proxy.size.height)
-            }
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.white.opacity(hotWellFill))
         }
+        .contentShape(Rectangle())
+        .dropDestination(for: String.self) { items, location in
+            acceptActionDrop(items, at: indexForRowDrop(location.y))
+        } isTargeted: { targeted in
+            setHotDropTargeted(targeted)
+        }
+        .onDrop(of: [UTType.utf8PlainText, UTType.plainText], isTargeted: $hotDropTargeted) { providers in
+            loadActionDrop(providers, at: hotButtons.buttons.count)
+        }
+    }
+
+    /// Quiet when the list is empty, so the well is still a visible target.
+    /// Brighter while a drop is aimed at it.
+    private var hotWellFill: Double {
+        if hotDropTargeted || actionDragIntoHotButtons { return 0.12 }
+        if hotButtons.buttons.isEmpty { return 0.06 }
+        return 0
     }
 
     private func hotButtonRow(index: Int, button: HotButton) -> some View {
@@ -675,68 +694,6 @@ struct ActionSlotsDrawer: View {
             .fill(Color.white.opacity(0.12))
     }
 
-    /// Shown only while an action is being dragged and the hot-button rows are
-    /// off the card. The drop appends. Reordering still happens on the rows.
-    private var dropStripVisible: Bool {
-        guard let drag = held, drag.list == .actions, drag.axis == .vertical else { return false }
-        return hotAreaMostlyHidden
-    }
-
-    private var hotAreaMostlyHidden: Bool {
-        guard hotWindow.width > 1, hotWindow.height > 1 else { return true }
-        guard cardWindow.width > 1, cardWindow.height > 1 else { return false }
-        let visible = hotWindow.intersection(cardWindow)
-        if visible.isNull { return true }
-        return visible.height < 40
-    }
-
-    private var dropStrip: some View {
-        let hovering = fingerInStrip(held?.location ?? .zero)
-        let accepted = hovering && (incomingDrop?.accepted ?? false)
-        return HStack(spacing: 8) {
-            Text("Hot Buttons")
-                .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                .foregroundStyle(MatrixShade.display(Color(white: 0.78), enabled: matrixMode.enabled))
-            Spacer(minLength: 0)
-            Text("\(hotButtons.buttons.count)/\(HotButtonStore.limit)")
-                .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                .foregroundStyle(MatrixShade.display(Color(white: 0.62), enabled: matrixMode.enabled))
-        }
-        .padding(.horizontal, 18)
-        .padding(.bottom, Self.windowInsets.bottom)
-        .frame(maxWidth: .infinity)
-        .frame(height: Metrics.stripBody + Self.windowInsets.bottom, alignment: .center)
-        .background(Color(white: accepted ? 0.34 : 0.16).opacity(0.94))
-        .accessibilityHidden(true)
-    }
-
-    private var flyingPreview: (text: String, accepted: Bool, location: CGPoint)? {
-        guard let drop = incomingDrop, let drag = held, drag.list == .actions,
-              let shortcut = shortcutStore.shortcuts.first(where: { $0.id == drag.id }) else { return nil }
-        return (shortcut.text, drop.accepted, drag.location)
-    }
-
-    private func flyingRow(text: String, accepted: Bool) -> some View {
-        let shown = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return HStack(spacing: 8) {
-            iconPlate(HotButton.defaultIcon(for: text))
-            Text(verbatim: shown.isEmpty ? "action" : text)
-                .font(.system(size: 17, design: .monospaced))
-                .foregroundStyle(MatrixShade.display(Color(white: 0.92), enabled: matrixMode.enabled))
-                .lineLimit(1)
-        }
-        .padding(.leading, 4)
-        .padding(.trailing, 10)
-        .frame(maxWidth: 220)
-        .frame(height: 40)
-        .background(
-            Color(white: 0.30).opacity(0.96),
-            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-        )
-        .opacity(accepted ? 1 : 0.35)
-        .shadow(color: .black.opacity(0.35), radius: 6, y: 2)
-    }
-
     /// Opens from the right edge, or follows a finger that is already dragging the card.
     /// A vertical move that starts while the card is closed is left alone.
     private func pan(width: CGFloat, fromEdgeOnly: Bool) -> some Gesture {
@@ -787,8 +744,7 @@ struct ActionSlotsDrawer: View {
             editingIconID = nil
             heldActive = false
             held = nil
-            cardWindow = .zero
-            hotWindow = .zero
+            hotDropTargeted = false
         }
         withAnimation(.easeOut(duration: 0.22)) {
             travel = open ? width : 0
@@ -902,12 +858,16 @@ struct ActionSlotsDrawer: View {
         }
         if committed, current.list == .actions, current.axis == .vertical,
            let shortcut = shortcutStore.shortcuts.first(where: { $0.id == current.id }),
-           fingerInDropTarget(location) {
-            let index = dropIndex(for: location)
+           draggedDownIntoHotButtons(
+               origin: current.origin,
+               translationY: current.translation.height,
+               actionCount: shortcutStore.shortcuts.count
+           ) {
+            // Copy. The action row stays in the Actions list.
             withAnimation(.easeOut(duration: 0.16)) {
                 held = nil
                 heldActive = false
-                hotButtons.insert(text: shortcut.text, at: index)
+                hotButtons.insert(text: shortcut.text, at: hotButtons.buttons.count)
             }
             return
         }
@@ -931,13 +891,17 @@ struct ActionSlotsDrawer: View {
             }
         }
         if committed, current.list == .hotButtons {
-            let traveled = hypot(current.translation.width, current.translation.height)
-            if hotFingerStillInside(location) == false, traveled >= 24 {
+            // Leaving the section removes this entry only. The shortcut with
+            // the same words, if there is one, is a different row and stays.
+            if hotDragExited(
+                origin: current.origin,
+                translation: current.translation,
+                count: hotButtons.buttons.count
+            ) {
                 removeHotButton(current.id)
                 return
             }
-            if hotFingerStillInside(location),
-               let index = hotButtons.buttons.firstIndex(where: { $0.id == current.id }) {
+            if let index = hotButtons.buttons.firstIndex(where: { $0.id == current.id }) {
                 let target = verticalTravel(
                     origin: current.origin,
                     translationY: current.translation.height,
@@ -1001,8 +965,8 @@ struct ActionSlotsDrawer: View {
             guard shortcuts[index].id == drag.id else { return .zero }
             return CGSize(width: max(0, drag.translation.width), height: 0)
         }
-        // A copy flying toward the hot buttons leaves the action where it is.
-        if incomingDrop != nil {
+        // A copy heading into Hot Buttons leaves the action where it is.
+        if actionDragIntoHotButtons {
             return .zero
         }
         let placed = verticalTravel(
@@ -1030,7 +994,7 @@ struct ActionSlotsDrawer: View {
             let progress = min(1, max(0, drag.translation.width / Metrics.deleteDistance))
             return 1 - 0.45 * progress
         }
-        if incomingDrop != nil {
+        if actionDragIntoHotButtons {
             return 0.4
         }
         return 1
@@ -1042,16 +1006,14 @@ struct ActionSlotsDrawer: View {
         if let drag = held, drag.list == .hotButtons {
             return hotDragOffset(index: index, drag: drag, count: buttons.count)
         }
-        guard let drop = incomingDrop, drop.accepted, drop.overRows, index >= drop.index else {
-            return .zero
-        }
-        return CGSize(width: 0, height: Metrics.rowStride)
+        return .zero
     }
 
     private func hotDragOffset(index: Int, drag: HeldDrag, count: Int) -> CGSize {
         let buttons = hotButtons.buttons
         guard buttons.indices.contains(index) else { return .zero }
-        if hotFingerStillInside(drag.location) {
+        let exited = hotDragExited(origin: drag.origin, translation: drag.translation, count: count)
+        if exited == false {
             let placed = verticalTravel(
                 origin: drag.origin,
                 translationY: drag.translation.height,
@@ -1081,92 +1043,86 @@ struct ActionSlotsDrawer: View {
         guard let drag = held, drag.list == .hotButtons else { return 1 }
         guard hotButtons.buttons.indices.contains(index) else { return 1 }
         guard hotButtons.buttons[index].id == drag.id else { return 1 }
-        if hotFingerStillInside(drag.location) == false {
+        if hotDragExited(
+            origin: drag.origin,
+            translation: drag.translation,
+            count: hotButtons.buttons.count
+        ) {
             return 0.7
         }
         return 1
     }
 
-    private var incomingDrop: IncomingDrop? {
-        guard let drag = held, drag.list == .actions, drag.axis == .vertical else { return nil }
-        guard shortcutStore.shortcuts.contains(where: { $0.id == drag.id }) else { return nil }
-        let overRows = fingerInHotRows(drag.location)
-        let overStrip = fingerInStrip(drag.location)
-        guard overRows || overStrip else { return nil }
-        let index = overRows ? hotInsertionIndex(fingerY: drag.location.y) : hotButtons.buttons.count
-        guard let shortcut = shortcutStore.shortcuts.first(where: { $0.id == drag.id }) else { return nil }
-        return IncomingDrop(
-            index: index,
-            accepted: hotButtons.canAccept(shortcut.text),
-            overRows: overRows
+    /// Downward travel past the last action row. Measured from the row the
+    /// finger started on, so it does not depend on a window frame.
+    private var actionDragIntoHotButtons: Bool {
+        guard let drag = held, drag.list == .actions, drag.axis == .vertical else { return false }
+        return draggedDownIntoHotButtons(
+            origin: drag.origin,
+            translationY: drag.translation.height,
+            actionCount: shortcutStore.shortcuts.count
         )
     }
 
-    /// The rows, grown a little past their frame so a finger that slips off a
-    /// plate while reordering still counts as inside. An unmeasured frame is
-    /// not a drop target, or a vertical action drag would look like a drop
-    /// before the first layout.
-    private func fingerInHotRows(_ location: CGPoint) -> Bool {
-        guard hotWindow.width > 1, hotWindow.height > 1 else { return false }
-        return hotWindow.insetBy(dx: -24, dy: -20).contains(location)
+    private func draggedDownIntoHotButtons(origin: Int, translationY: CGFloat, actionCount: Int) -> Bool {
+        let pastBottom = translationY - CGFloat(max(0, actionCount - 1 - origin)) * Metrics.rowStride
+        return pastBottom > 40
     }
 
-    /// A hot-button drag stays "inside" until the rows have been measured, so
-    /// the lift cannot delete the row before the probe has reported.
-    private func hotFingerStillInside(_ location: CGPoint) -> Bool {
-        guard hotWindow.width > 1, hotWindow.height > 1 else { return true }
-        return fingerInHotRows(location)
-    }
-
-    private func fingerInStrip(_ location: CGPoint) -> Bool {
-        guard dropStripVisible, cardWindow.width > 1, cardWindow.height > 1 else { return false }
-        let height = Metrics.stripBody + Self.windowInsets.bottom
-        let strip = CGRect(
-            x: cardWindow.minX,
-            y: cardWindow.maxY - height,
-            width: cardWindow.width,
-            height: height
-        )
-        return strip.insetBy(dx: -8, dy: -12).contains(location)
-    }
-
-    private func fingerInDropTarget(_ location: CGPoint) -> Bool {
-        if hotWindow.width > 1, hotWindow.insetBy(dx: -24, dy: -20).contains(location) {
+    /// Up past the top of the section (toward Actions), down past the last
+    /// row, or clearly sideways. A reorder inside the list stays put.
+    private func hotDragExited(origin: Int, translation: CGSize, count: Int) -> Bool {
+        let stride = Metrics.rowStride
+        let above = -translation.height - CGFloat(origin) * stride
+        if above > 28 { return true }
+        let below = translation.height - CGFloat(max(0, count - 1 - origin)) * stride
+        if below > 36 { return true }
+        if abs(translation.width) > 56, abs(translation.width) > abs(translation.height) * 1.1 {
             return true
         }
-        return fingerInStrip(location)
+        return false
     }
 
-    private func dropIndex(for location: CGPoint) -> Int {
-        if hotWindow.width > 1, hotWindow.insetBy(dx: -24, dy: -20).contains(location) {
-            return hotInsertionIndex(fingerY: location.y)
+    /// `items` is the action text. Inserts a copy. Does not remove the action
+    /// row. Refuses a 7th and a duplicate.
+    private func acceptActionDrop(_ items: [String], at index: Int) -> Bool {
+        guard let text = items.first else { return false }
+        return hotButtons.insert(text: text, at: index)
+    }
+
+    /// Same bytes the action row's drag registers: `public.utf8-plain-text`
+    /// and `public.plain-text`. The load finishes after the drop is accepted.
+    private func loadActionDrop(_ providers: [NSItemProvider], at index: Int) -> Bool {
+        guard let provider = providers.first else { return false }
+        let identifiers = [UTType.utf8PlainText.identifier, UTType.plainText.identifier]
+        guard let type = identifiers.first(where: { provider.hasItemConformingToTypeIdentifier($0) }) else {
+            return false
         }
-        return hotButtons.buttons.count
+        provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in
+            guard let data, let text = String(data: data, encoding: .utf8) else { return }
+            DispatchQueue.main.async {
+                _ = self.hotButtons.insert(text: text, at: index)
+            }
+        }
+        return true
     }
 
-    /// Midpoint of each row. Above the first row, and an empty area, insert at 0.
-    private func hotInsertionIndex(fingerY: CGFloat) -> Int {
+    /// Midpoint of each row in the well. The well's local origin is the first
+    /// row, including when that row is the empty minimum-height target.
+    private func indexForRowDrop(_ localY: CGFloat) -> Int {
         let count = hotButtons.buttons.count
-        guard count > 0, hotWindow.height > 1 else { return 0 }
-        let localY = fingerY - hotWindow.minY
+        guard count > 0 else { return 0 }
         if localY < 0 { return 0 }
         for index in 0..<count {
             let mid = (CGFloat(index) + 0.5) * Metrics.rowStride
-            if localY < mid {
-                return index
-            }
+            if localY < mid { return index }
         }
         return count
     }
 
-    private func adopt(_ frame: CGRect, into storage: Binding<CGRect>) {
-        guard frame.width > 1, frame.height > 1 else { return }
-        let old = storage.wrappedValue
-        guard abs(old.minX - frame.minX) > 0.5
-            || abs(old.minY - frame.minY) > 0.5
-            || abs(old.width - frame.width) > 0.5
-            || abs(old.height - frame.height) > 0.5 else { return }
-        storage.wrappedValue = frame
+    private func setHotDropTargeted(_ targeted: Bool) {
+        guard hotDropTargeted != targeted else { return }
+        hotDropTargeted = targeted
     }
 
     /// Puts the editing row near the top of the card, above the keyboard.
@@ -1494,6 +1450,13 @@ private struct IconEditor: UIViewRepresentable {
 /// began swallows the tap that follows the finger lifting. A nil double tap
 /// is a row with no second action: the single tap fires on its own.
 private struct ShortcutRowGestures: UIViewRepresentable {
+    /// An action row yields so the system drag can start beside this hold.
+    /// A hot-button row keeps the hold exclusive: that drag reorders or
+    /// removes, and it does not publish a text payload.
+    var yieldsToSystemDrag: Bool = false
+    /// Action text published as `public.utf8-plain-text` and `public.plain-text`.
+    /// The Hot Buttons well and the append bar both accept those types.
+    var dragText: String = ""
     var onTap: (CGPoint) -> Void
     var onDoubleTap: (() -> Void)?
     var onPressBegan: (CGPoint) -> Void
@@ -1515,7 +1478,16 @@ private struct ShortcutRowGestures: UIViewRepresentable {
             action: #selector(Coordinator.longPress(_:))
         )
         press.minimumPressDuration = 0.35
-        press.cancelsTouchesInView = true
+        press.cancelsTouchesInView = yieldsToSystemDrag == false
+        press.delegate = context.coordinator
+        context.coordinator.yieldsToSystemDrag = yieldsToSystemDrag
+        context.coordinator.dragText = dragText
+        if yieldsToSystemDrag {
+            let drag = UIDragInteraction(delegate: context.coordinator)
+            drag.isEnabled = true
+            drag.allowsSimultaneousRecognitionDuringLift = true
+            view.addInteraction(drag)
+        }
         view.addGestureRecognizer(single)
         view.addGestureRecognizer(press)
         if onDoubleTap != nil {
@@ -1548,16 +1520,24 @@ private struct ShortcutRowGestures: UIViewRepresentable {
 
     func updateUIView(_ uiView: UIView, context: Context) {
         let coordinator = context.coordinator
+        coordinator.yieldsToSystemDrag = yieldsToSystemDrag
+        coordinator.dragText = dragText
         coordinator.onTap = onTap
         coordinator.onDoubleTap = onDoubleTap
         coordinator.onPressBegan = onPressBegan
         coordinator.onPressChanged = onPressChanged
         coordinator.onPressEnded = onPressEnded
+        if let press = uiView.gestureRecognizers?.compactMap({ $0 as? UILongPressGestureRecognizer }).first {
+            press.cancelsTouchesInView = yieldsToSystemDrag == false
+            press.delegate = coordinator
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate, UIDragInteractionDelegate {
+        var yieldsToSystemDrag = false
+        var dragText = ""
         var onTap: (CGPoint) -> Void = { _ in }
         var onDoubleTap: (() -> Void)?
         var onPressBegan: (CGPoint) -> Void = { _ in }
@@ -1566,6 +1546,38 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         var origin: CGPoint?
         var pressed = false
         var suppressTapsUntil = Date.distantPast
+
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+        ) -> Bool {
+            yieldsToSystemDrag
+        }
+
+        /// Action text as `public.utf8-plain-text` and `public.plain-text`.
+        /// The hot-button drop calls `dropDestination(for: String.self)`, which
+        /// reads those same types. A hot-button row publishes nothing.
+        func dragInteraction(
+            _ interaction: UIDragInteraction,
+            itemsForBeginning session: UIDragSession
+        ) -> [UIDragItem] {
+            guard yieldsToSystemDrag else { return [] }
+            let text = dragText
+            let provider = NSItemProvider()
+            _ = provider.registerObject(text as NSString, visibility: .all)
+            for type in [UTType.utf8PlainText, UTType.plainText] {
+                provider.registerDataRepresentation(
+                    forTypeIdentifier: type.identifier,
+                    visibility: .all
+                ) { completion in
+                    completion(Data(text.utf8), nil)
+                    return nil
+                }
+            }
+            let item = UIDragItem(itemProvider: provider)
+            item.localObject = text
+            return [item]
+        }
 
         @objc func singleTap(_ gesture: UITapGestureRecognizer) {
             guard Date() >= suppressTapsUntil else { return }
@@ -1640,64 +1652,3 @@ private struct ShortcutRowGestures: UIViewRepresentable {
     }
 }
 
-/// Reports its bounds in window coordinates. SwiftUI's global space and a
-/// UIKit window differ once the window is not at the screen origin, and the
-/// drag's finger is a window point, so both sides of the hit test use the window.
-private struct WindowFrameProbe: UIViewRepresentable {
-    var onFrame: (CGRect) -> Void
-
-    func makeUIView(context: Context) -> Probe {
-        let view = Probe()
-        view.isUserInteractionEnabled = false
-        view.backgroundColor = .clear
-        view.isAccessibilityElement = false
-        return view
-    }
-
-    func updateUIView(_ uiView: Probe, context: Context) {
-        uiView.onFrame = onFrame
-        uiView.publishIfNeeded()
-    }
-
-    func sizeThatFits(
-        _ proposal: ProposedViewSize,
-        uiView _: Probe,
-        context _: Context
-    ) -> CGSize? {
-        CGSize(width: finite(proposal.width), height: finite(proposal.height))
-    }
-
-    private func finite(_ value: CGFloat?) -> CGFloat {
-        guard let value, value > 0, value < .greatestFiniteMagnitude else { return 0 }
-        return value
-    }
-
-    final class Probe: UIView {
-        var onFrame: (CGRect) -> Void = { _ in }
-        private var last: CGRect = .null
-
-        override func layoutSubviews() {
-            super.layoutSubviews()
-            publishIfNeeded()
-        }
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            publishIfNeeded()
-        }
-
-        func publishIfNeeded() {
-            guard let window, bounds.width > 1, bounds.height > 1 else { return }
-            let frame = convert(bounds, to: window)
-            guard frame.width > 1, frame.height > 1 else { return }
-            if abs(last.minX - frame.minX) <= 0.5,
-               abs(last.minY - frame.minY) <= 0.5,
-               abs(last.width - frame.width) <= 0.5,
-               abs(last.height - frame.height) <= 0.5 {
-                return
-            }
-            last = frame
-            onFrame(frame)
-        }
-    }
-}
