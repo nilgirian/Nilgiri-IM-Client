@@ -66,7 +66,9 @@ struct HotButton: Identifiable, Equatable {
 final class ActionMenuStore: ObservableObject {
     static let shortcutLimit = 10
     static let hotLimit = 6
-    static let seedText = "get all corpse"
+    static let seedText = "get all from corpse"
+    /// Match key of the loot line seeded before the command included `from`.
+    private static let legacyLootKey = "get all corpse"
 
     @Published private(set) var shortcuts: [ActionShortcut] = []
     @Published private(set) var buttons: [HotButton] = []
@@ -97,11 +99,11 @@ final class ActionMenuStore: ObservableObject {
         if defaults.object(forKey: Key.buttons) == nil {
             loadedButtons = Self.hotSeed
         } else {
-            loadedButtons = Self.readButtons(defaults)
+            loadedButtons = Self.migrateLegacyLoot(Self.readButtons(defaults))
         }
         let loadedShortcuts: [ActionShortcut]
         if let stored = defaults.stringArray(forKey: Key.shortcuts) {
-            loadedShortcuts = stored.map { ActionShortcut(text: $0) }
+            loadedShortcuts = stored.map { ActionShortcut(text: Self.migratedActionText($0)) }
         } else {
             loadedShortcuts = [ActionShortcut(text: Self.seedText)]
         }
@@ -289,6 +291,24 @@ final class ActionMenuStore: ObservableObject {
 
     static func matchKey(_ text: String) -> String {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Load-only. The old loot seed becomes `seedText`. Any other text stays.
+    /// The key is `matchKey`, the same trim dedupe uses. A hot button keeps
+    /// its icon and place. `apply` then drops an Actions row that now shares
+    /// a hot-button key, so the command lives in one list.
+    private static func migratedActionText(_ text: String) -> String {
+        matchKey(text) == legacyLootKey ? seedText : text
+    }
+
+    private static func migrateLegacyLoot(_ buttons: [HotButton]) -> [HotButton] {
+        buttons.map { button in
+            let text = migratedActionText(button.text)
+            guard text != button.text else { return button }
+            var copy = button
+            copy.text = text
+            return copy
+        }
     }
 
     private func saveShortcuts() {
