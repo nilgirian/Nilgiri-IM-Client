@@ -61,10 +61,11 @@ struct HotButton: Identifiable, Equatable {
 }
 
 /// Actions and hot buttons together. An action text lives in one list only.
-/// Every change goes through `apply`, which drops duplicate keys, caps hot
-/// buttons at six, and takes those keys out of Actions.
+/// Every change goes through `apply`, which drops duplicate keys, caps
+/// actions at `shortcutLimit` and hot buttons at `hotLimit`, and takes
+/// those hot-button keys out of Actions.
 final class ActionMenuStore: ObservableObject {
-    static let shortcutLimit = 10
+    static let shortcutLimit = 30
     static let hotLimit = 6
     static let seedText = "get all corpse"
 
@@ -101,7 +102,9 @@ final class ActionMenuStore: ObservableObject {
         }
         let loadedShortcuts: [ActionShortcut]
         if let stored = defaults.stringArray(forKey: Key.shortcuts) {
-            loadedShortcuts = stored.map { ActionShortcut(text: $0) }
+            // Count cap only. Saved strings and their order are not rewritten,
+            // and a list already at or under the limit is kept whole.
+            loadedShortcuts = stored.prefix(Self.shortcutLimit).map { ActionShortcut(text: $0) }
         } else {
             loadedShortcuts = [ActionShortcut(text: Self.seedText)]
         }
@@ -200,9 +203,13 @@ final class ActionMenuStore: ObservableObject {
 
     /// Move a hot button back into Actions. Already only in Actions: move
     /// that row when `reposition` is set. The stored words are not rewritten.
+    /// A new row is refused when Actions is at `shortcutLimit`, and the hot
+    /// button stays where it is. Drags and drops both come through here.
     @discardableResult
     func moveToActions(text: String, at index: Int, reposition: Bool) -> Bool {
         let key = Self.matchKey(text)
+        let alreadyInActions = shortcuts.contains { Self.matchKey($0.text) == key }
+        guard alreadyInActions || shortcuts.count < Self.shortcutLimit else { return false }
         var nextButtons = buttons
         var carried: String?
         if let existing = nextButtons.firstIndex(where: { Self.matchKey($0.text) == key }) {
@@ -251,8 +258,9 @@ final class ActionMenuStore: ObservableObject {
     }
 
     /// One write of both lists. Hot buttons keep the first of each key, at
-    /// most six. Actions lose any key that is a hot button, then their own
-    /// duplicates. The stored text of a kept row is not edited.
+    /// most `hotLimit`. Actions lose any key that is a hot button, then their
+    /// own duplicates, and keep at most `shortcutLimit`. The stored text of
+    /// a kept row is not edited.
     private func apply(buttons proposedButtons: [HotButton], shortcuts proposedShortcuts: [ActionShortcut]) {
         let nextButtons = Self.uniqueButtons(proposedButtons)
         let hotKeys = Set(nextButtons.map { Self.matchKey($0.text) })
@@ -263,6 +271,7 @@ final class ActionMenuStore: ObservableObject {
             if hotKeys.contains(key) || seen.contains(key) { continue }
             seen.insert(key)
             nextShortcuts.append(shortcut)
+            if nextShortcuts.count == Self.shortcutLimit { break }
         }
         if nextButtons != buttons {
             buttons = nextButtons
@@ -292,7 +301,8 @@ final class ActionMenuStore: ObservableObject {
     }
 
     private func saveShortcuts() {
-        UserDefaults.standard.set(shortcuts.map(\.text), forKey: Key.shortcuts)
+        let capped = shortcuts.prefix(Self.shortcutLimit).map(\.text)
+        UserDefaults.standard.set(capped, forKey: Key.shortcuts)
     }
 
     private func saveButtons() {
@@ -449,8 +459,11 @@ struct ActionSlotsDrawer: View {
     }
 
     private func card(width: CGFloat, height: CGFloat, insets: UIEdgeInsets) -> some View {
-        // The column is at least as tall as the window. A short landscape
-        // window scrolls instead of clipping the last row. Bounce stays off
+        // The column is at least as tall as the window and scrolls when the
+        // rows overflow. A full Actions list is taller than an iPhone in
+        // portrait or landscape, so this is what keeps the last row reachable.
+        // The row hold locks this scroll view, so a reorder or a move between
+        // Actions and Hot Buttons still follows the finger. Bounce stays off
         // while nothing overflows.
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
