@@ -598,7 +598,8 @@ final class ActionMenuStore: ObservableObject {
     /// already on screen does not mint new row ids on every download.
     private func sameLists(buttons proposedButtons: [HotButton], shortcuts proposedShortcuts: [ActionShortcut]) -> Bool {
         let next = Self.cappedLists(buttons: proposedButtons, shortcuts: proposedShortcuts)
-        let sameButtons = buttons.map { ($0.text, $0.icon) } == next.buttons.map { ($0.text, $0.icon) }
+        let sameButtons = buttons.map(\.text) == next.buttons.map(\.text)
+            && buttons.map(\.icon) == next.buttons.map(\.icon)
         return sameButtons && shortcuts.map(\.text) == next.shortcuts.map(\.text)
     }
 
