@@ -626,7 +626,10 @@ enum HMVPrompt {
 /// named nothing (`None.`). The scrollback is never edited.
 ///
 /// The game prints a header and then one line per exit, with the dash in a
-/// fixed column. A closed door's destination is wrapped in parentheses:
+/// fixed column. A closed door's destination is the keyword in parentheses,
+/// as in `(portcullis)`. An open exit into an unlit room prints
+/// `(too dark to tell)`, optionally followed by an immortal suffix such as
+/// ` [vid]` or ` (hidden)`. Darkness belongs to that exit alone.
 ///
 /// ```
 /// Obvious exits:
@@ -641,6 +644,8 @@ struct RoomExitListing: Equatable {
     enum Door: Equatable {
         case open
         case closed
+        /// Open exit into an unlit room. The listing prints `(too dark to tell)`.
+        case dark
     }
 
     /// Keys are the move commands: `north`, `south`, `east`, `west`, `up`, `down`.
@@ -708,9 +713,13 @@ struct RoomExitScan {
         return folded == "none" || folded == "none."
     }
 
-    /// `North  - (portcullis)` or `East   - Ye Olde Reading Room`.
-    /// The direction word, then whitespace, a hyphen, whitespace, and the
-    /// destination. Parentheses around the whole destination are a closed door.
+    /// `North  - (portcullis)`, `East   - Ye Olde Reading Room`, or
+    /// `North  - (too dark to tell)`. The direction word, then whitespace,
+    /// a hyphen, whitespace, and the destination. A destination that is
+    /// `(too dark to tell)`, or starts with that phrase, is an open exit
+    /// into an unlit room. That check comes before the parentheses rule,
+    /// so an immortal suffix does not turn it into a door. Parentheses
+    /// around any other whole destination are a closed door.
     private static func exit(on line: String) -> (command: String, door: RoomExitListing.Door)? {
         let folded = line.lowercased()
         for command in directionCommands {
@@ -722,11 +731,18 @@ struct RoomExitScan {
             rest = rest.dropFirst().drop(while: \.isWhitespace)
             let destination = rest.trimmingCharacters(in: .whitespacesAndNewlines)
             guard destination.isEmpty == false else { continue }
+            let foldedDestination = destination.lowercased()
+            if foldedDestination == tooDarkToTell || foldedDestination.hasPrefix(tooDarkToTell) {
+                return (command, .dark)
+            }
             let closed = destination.first == "(" && destination.last == ")"
             return (command, closed ? .closed : .open)
         }
         return nil
     }
+
+    /// Open exit into an unlit room. An immortal suffix may follow this phrase.
+    private static let tooDarkToTell = "(too dark to tell)"
 
     private static let directionCommands = ["north", "south", "east", "west", "up", "down"]
 
