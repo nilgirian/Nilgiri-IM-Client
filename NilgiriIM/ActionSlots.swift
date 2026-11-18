@@ -71,16 +71,52 @@ final class ActionMenuStore: ObservableObject {
     /// Match key of the loot line seeded before the command included `from`.
     private static let legacyLootKey = "get all corpse"
 
-    @Published private(set) var shortcuts: [ActionShortcut] = []
-    @Published private(set) var buttons: [HotButton] = []
+    @Published private(set) var shortcuts: [ActionShortcut] = [] {
+        didSet { noteEdit() }
+    }
+    @Published private(set) var buttons: [HotButton] = [] {
+        didSet { noteEdit() }
+    }
 
     /// Icon last used for a key during this launch. Moving back to Hot
     /// Buttons restores it. Not written to disk.
     private var rememberedIcons: [String: String] = [:]
 
+    /// True while this device still has the untouched factory lists.
+    /// A player edit clears it, and it is never set again. Factory seeds
+    /// are not uploaded.
+    private var seeded = true
+    /// True after this launch, or an earlier one, has reconciled against
+    /// a known cloud snapshot. Later updates follow `updatedAt`.
+    private var merged = false
+    /// Timestamp of the blob this device last wrote or adopted.
+    private var updatedAt: TimeInterval = 0
+    /// Init and a cloud apply save UserDefaults without mirroring. A real
+    /// edit flips this on and then every change is written to both stores.
+    private var tracksEdits = false
+    private var reconciling = false
+    private var reconcileAgain = false
+    private var cloudStarted = false
+    /// One push after the current turn, so a move that changes both lists
+    /// synchronizes the finished pair and not the first assignment.
+    private var cloudSyncScheduled = false
+    private var cloudObserver: NSObjectProtocol?
+    private var identityObserver: NSObjectProtocol?
+
     private enum Key {
         static let shortcuts = "im.actionShortcuts"
         static let buttons = "im.hotButtons"
+    }
+
+    /// Cloud copy of the two local payloads, plus the stamp and the seed
+    /// flag. `merged` stays in UserDefaults: it is this device's memory
+    /// that the first reconciliation already happened.
+    private enum SyncKey {
+        static let shortcuts = "im.sync.actionShortcuts"
+        static let buttons = "im.sync.hotButtons"
+        static let updatedAt = "im.sync.updatedAt"
+        static let seeded = "im.sync.seeded"
+        static let merged = "im.sync.merged"
     }
 
     private struct Record: Codable {
@@ -113,6 +149,19 @@ final class ActionMenuStore: ObservableObject {
         apply(buttons: loadedButtons, shortcuts: loadedShortcuts)
         saveShortcuts()
         saveButtons()
+        loadSyncFlags()
+        startCloudSync()
+        tracksEdits = true
+    }
+
+    deinit {
+        let center = NotificationCenter.default
+        if let cloudObserver {
+            center.removeObserver(cloudObserver)
+        }
+        if let identityObserver {
+            center.removeObserver(identityObserver)
+        }
     }
 
     var canAdd: Bool { shortcuts.count < Self.shortcutLimit }
@@ -339,19 +388,371 @@ final class ActionMenuStore: ObservableObject {
     }
 
     private func saveButtons() {
-        let records = buttons.map { Record(text: $0.text, icon: HotButton.clampedIcon($0.icon)) }
-        guard let data = try? JSONEncoder().encode(records) else { return }
+        guard let data = Self.buttonData(buttons) else { return }
         UserDefaults.standard.set(data, forKey: Key.buttons)
+    }
+
+    /// Same JSON `im.hotButtons` already stores: an array of `{text, icon}`.
+    private static func buttonData(_ buttons: [HotButton]) -> Data? {
+        let records = buttons.map { Record(text: $0.text, icon: HotButton.clampedIcon($0.icon)) }
+        return try? JSONEncoder().encode(records)
     }
 
     /// A present key that does not decode stays empty. That is not the
     /// missing-key case, so the seed is not written back over it.
     private static func readButtons(_ defaults: UserDefaults) -> [HotButton] {
-        guard let data = defaults.data(forKey: Key.buttons),
+        buttons(from: defaults.data(forKey: Key.buttons))
+    }
+
+    private static func buttons(from data: Data?) -> [HotButton] {
+        guard let data,
               let records = try? JSONDecoder().decode([Record].self, from: data) else {
             return []
         }
         return records.map { HotButton(text: $0.text, icon: $0.icon) }
+    }
+
+    /// One cloud snapshot. `exists` is false when none of the payload keys
+    /// have been written. An empty list under a present key is a real edit.
+    private struct CloudLists {
+        var buttons: [HotButton]
+        var shortcuts: [ActionShortcut]
+        var updatedAt: TimeInterval
+        var seeded: Bool
+        var exists: Bool
+
+        /// Player data. A blob still marked as the factory seed is not one,
+        /// and neither is a store that has never been written.
+        var hasPlayerData: Bool { exists && seeded == false }
+    }
+
+    /// The flag is missing on the first launch after this sync ships.
+    /// Lists that are still the factory seed stay seeded. Anything else
+    /// was edited before sync existed, so it is eligible to upload.
+    private func loadSyncFlags() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: SyncKey.seeded) == nil {
+            seeded = Self.isFactorySeed(buttons: buttons, shortcuts: shortcuts)
+            defaults.set(seeded, forKey: SyncKey.seeded)
+        } else {
+            seeded = defaults.bool(forKey: SyncKey.seeded)
+        }
+        merged = defaults.bool(forKey: SyncKey.merged)
+        updatedAt = defaults.double(forKey: SyncKey.updatedAt)
+    }
+
+    private func storeSyncFlags() {
+        let defaults = UserDefaults.standard
+        defaults.set(seeded, forKey: SyncKey.seeded)
+        defaults.set(merged, forKey: SyncKey.merged)
+        defaults.set(updatedAt, forKey: SyncKey.updatedAt)
+    }
+
+    /// hit / look / flee, in that order, plus the one loot shortcut.
+    /// Text and icon, not row id. A player who edited and then landed
+    /// back on these rows is not a seed: the stored flag says so.
+    private static func isFactorySeed(buttons: [HotButton], shortcuts: [ActionShortcut]) -> Bool {
+        guard shortcuts.map(\.text) == [seedText] else { return false }
+        guard buttons.count == hotSeed.count else { return false }
+        for (button, seed) in zip(buttons, hotSeed) {
+            if button.text != seed.text || button.icon != seed.icon { return false }
+        }
+        return true
+    }
+
+    private var iCloudAvailable: Bool {
+        FileManager.default.ubiquityIdentityToken != nil
+    }
+
+    /// Signed out: do not read or write the key-value store. Edits stay
+    /// in UserDefaults, the same path they used before sync existed.
+    private func startCloudSync() {
+        if cloudStarted == false {
+            cloudStarted = true
+            let center = NotificationCenter.default
+            let store = NSUbiquitousKeyValueStore.default
+            cloudObserver = center.addObserver(
+                forName: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
+                object: store,
+                queue: OperationQueue.main
+            ) { [weak self] note in
+                self?.cloudStoreChanged(note)
+            }
+            identityObserver = center.addObserver(
+                forName: NSNotification.Name.NSUbiquityIdentityDidChange,
+                object: nil,
+                queue: OperationQueue.main
+            ) { [weak self] _ in
+                self?.iCloudAccountChanged()
+            }
+        }
+        pullCloud()
+    }
+
+    private func iCloudAccountChanged() {
+        guard iCloudAvailable else { return }
+        pullCloud()
+    }
+
+    /// Launch read. `synchronize` fetches the ubiquitous store. A cache
+    /// that already has keys can merge now. An empty cache waits for
+    /// `didChangeExternallyNotification`, which is the initial download.
+    private func pullCloud() {
+        guard iCloudAvailable else { return }
+        let store = NSUbiquitousKeyValueStore.default
+        _ = store.synchronize()
+        let cloud = readCloud()
+        if cloud.exists {
+            reconcile(cloud, cloudKnown: true)
+        }
+    }
+
+    /// External changes only. Applied on the main thread, through `apply`,
+    /// so the hot-button cap, the shortcut cap, and the one-list rule hold.
+    private func cloudStoreChanged(_ note: Notification) {
+        if Thread.isMainThread == false {
+            DispatchQueue.main.async { [weak self] in
+                self?.cloudStoreChanged(note)
+            }
+            return
+        }
+        guard iCloudAvailable else { return }
+        let reason = Self.changeReason(in: note)
+        if reason == NSUbiquitousKeyValueStoreQuotaViolationChange { return }
+        // A different iCloud account replaces the store. Reconcile once
+        // against that snapshot instead of treating it as a later write.
+        if reason == NSUbiquitousKeyValueStoreAccountChange {
+            merged = false
+            UserDefaults.standard.set(false, forKey: SyncKey.merged)
+        }
+        let initial = reason == NSUbiquitousKeyValueStoreInitialSyncChange
+        let cloud = readCloud()
+        if cloud.exists || initial || reason == NSUbiquitousKeyValueStoreAccountChange {
+            reconcile(cloud, cloudKnown: true)
+        }
+    }
+
+    /// First snapshot: upload, adopt, or union. After `merged`, the newer
+    /// `updatedAt` replaces both lists. A tied stamp changes nothing.
+    private func reconcile(_ cloud: CloudLists, cloudKnown: Bool) {
+        if reconciling {
+            reconcileAgain = true
+            return
+        }
+        reconciling = true
+        reconcileAgain = false
+        if merged == false {
+            if cloudKnown {
+                let upload: Bool
+                if cloud.hasPlayerData && seeded {
+                    adopt(cloud)
+                    upload = false
+                } else if cloud.hasPlayerData {
+                    let united = Self.unionLists(
+                        localButtons: buttons,
+                        localShortcuts: shortcuts,
+                        cloudButtons: cloud.buttons,
+                        cloudShortcuts: cloud.shortcuts
+                    )
+                    replaceFromSync(buttons: united.buttons, shortcuts: united.shortcuts)
+                    seeded = false
+                    updatedAt = Date().timeIntervalSince1970
+                    upload = true
+                } else if seeded == false {
+                    if updatedAt <= 0 {
+                        updatedAt = Date().timeIntervalSince1970
+                    }
+                    upload = true
+                } else {
+                    upload = false
+                }
+                merged = true
+                storeSyncFlags()
+                if upload {
+                    writeCloud(updatedAt: updatedAt)
+                }
+            }
+        } else if cloud.hasPlayerData == false {
+            // No player blob in the cloud. A customized device still uploads,
+            // including when this device has never stamped a write.
+            if seeded == false && updatedAt <= cloud.updatedAt {
+                updatedAt = Date().timeIntervalSince1970
+                UserDefaults.standard.set(updatedAt, forKey: SyncKey.updatedAt)
+            }
+            if seeded == false && updatedAt > cloud.updatedAt {
+                writeCloud(updatedAt: updatedAt)
+            }
+        } else if cloud.updatedAt > updatedAt {
+            adopt(cloud)
+        } else if cloud.updatedAt < updatedAt && seeded == false {
+            writeCloud(updatedAt: updatedAt)
+        }
+        reconciling = false
+        if reconcileAgain {
+            reconcileAgain = false
+            reconcile(readCloud(), cloudKnown: true)
+        }
+    }
+
+    /// Take the cloud lists. The seed flag clears first so a crash in
+    /// between cannot later treat the adopted rows as an untouched seed.
+    private func adopt(_ cloud: CloudLists) {
+        seeded = false
+        UserDefaults.standard.set(false, forKey: SyncKey.seeded)
+        if sameLists(buttons: cloud.buttons, shortcuts: cloud.shortcuts) == false {
+            replaceFromSync(buttons: cloud.buttons, shortcuts: cloud.shortcuts)
+        }
+        updatedAt = cloud.updatedAt
+        UserDefaults.standard.set(updatedAt, forKey: SyncKey.updatedAt)
+    }
+
+    /// `apply` enforces one text per list and `hotLimit`. `cappedLists`
+    /// also stops Actions at `shortcutLimit` before that call, so a blob
+    /// from a build with a higher cap cannot keep growing this one.
+    private func replaceFromSync(buttons: [HotButton], shortcuts: [ActionShortcut]) {
+        let wasTracking = tracksEdits
+        tracksEdits = false
+        let next = Self.cappedLists(buttons: buttons, shortcuts: shortcuts)
+        apply(buttons: next.buttons, shortcuts: next.shortcuts)
+        tracksEdits = wasTracking
+    }
+
+    /// Compare the lists `apply` would keep, so a cloud payload that is
+    /// already on screen does not mint new row ids on every download.
+    private func sameLists(buttons proposedButtons: [HotButton], shortcuts proposedShortcuts: [ActionShortcut]) -> Bool {
+        let next = Self.cappedLists(buttons: proposedButtons, shortcuts: proposedShortcuts)
+        let sameButtons = buttons.map(\.text) == next.buttons.map(\.text)
+            && buttons.map(\.icon) == next.buttons.map(\.icon)
+        return sameButtons && shortcuts.map(\.text) == next.shortcuts.map(\.text)
+    }
+
+    /// Same dedupe as `apply`, then `shortcutLimit`. Hot-button keys leave
+    /// Actions. The kept row's text and icon are not rewritten.
+    private static func cappedLists(
+        buttons proposedButtons: [HotButton],
+        shortcuts proposedShortcuts: [ActionShortcut]
+    ) -> (buttons: [HotButton], shortcuts: [ActionShortcut]) {
+        let nextButtons = uniqueButtons(proposedButtons)
+        let hotKeys = Set(nextButtons.map { matchKey($0.text) })
+        var seen = Set<String>()
+        var nextShortcuts: [ActionShortcut] = []
+        for shortcut in proposedShortcuts {
+            let key = matchKey(shortcut.text)
+            if hotKeys.contains(key) || seen.contains(key) { continue }
+            seen.insert(key)
+            nextShortcuts.append(shortcut)
+            if nextShortcuts.count == shortcutLimit { break }
+        }
+        return (nextButtons, nextShortcuts)
+    }
+
+    /// Hot buttons first, this device's row first, so its icon wins when
+    /// both sides have the key. Past `hotLimit`, a hot-button text joins
+    /// Actions. Actions then keep the first `shortcutLimit` texts not
+    /// already on a hot button.
+    private static func unionLists(
+        localButtons: [HotButton],
+        localShortcuts: [ActionShortcut],
+        cloudButtons: [HotButton],
+        cloudShortcuts: [ActionShortcut]
+    ) -> (buttons: [HotButton], shortcuts: [ActionShortcut]) {
+        var seen = Set<String>()
+        var mergedButtons: [HotButton] = []
+        var overflow: [String] = []
+        func considerHot(_ button: HotButton) {
+            let key = matchKey(button.text)
+            if seen.contains(key) { return }
+            if mergedButtons.count < hotLimit {
+                seen.insert(key)
+                mergedButtons.append(button)
+            } else {
+                overflow.append(button.text)
+            }
+        }
+        for button in localButtons { considerHot(button) }
+        for button in cloudButtons { considerHot(button) }
+
+        var mergedShortcuts: [ActionShortcut] = []
+        func considerAction(_ shortcut: ActionShortcut) {
+            let key = matchKey(shortcut.text)
+            if seen.contains(key) { return }
+            if mergedShortcuts.count == shortcutLimit { return }
+            seen.insert(key)
+            mergedShortcuts.append(shortcut)
+        }
+        for shortcut in localShortcuts { considerAction(shortcut) }
+        for shortcut in cloudShortcuts { considerAction(shortcut) }
+        for text in overflow { considerAction(ActionShortcut(text: text)) }
+        return (mergedButtons, mergedShortcuts)
+    }
+
+    /// A player edit. `apply` has already written UserDefaults. The seed
+    /// flag and the stamp are saved immediately. The key-value store is
+    /// updated now, and `synchronize` waits until this turn finishes so a
+    /// two-list move is one blob.
+    private func noteEdit() {
+        guard tracksEdits else { return }
+        seeded = false
+        updatedAt = Date().timeIntervalSince1970
+        storeSyncFlags()
+        writeCloud(updatedAt: updatedAt, push: false)
+        scheduleCloudPush()
+    }
+
+    private func scheduleCloudPush() {
+        guard cloudSyncScheduled == false, iCloudAvailable else { return }
+        cloudSyncScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.cloudSyncScheduled = false
+            guard self.iCloudAvailable else { return }
+            _ = NSUbiquitousKeyValueStore.default.synchronize()
+        }
+    }
+
+    /// No-op when iCloud is signed out, or while the lists are still the
+    /// factory seed. Payloads go out first and `updatedAt` last. Nothing
+    /// is written unless the hot-button JSON encodes, so a partial blob
+    /// cannot wipe the other list.
+    private func writeCloud(updatedAt stamp: TimeInterval, push: Bool = true) {
+        guard iCloudAvailable, seeded == false else { return }
+        guard let data = Self.buttonData(buttons) else { return }
+        let store = NSUbiquitousKeyValueStore.default
+        let texts = Array(shortcuts.prefix(Self.shortcutLimit).map(\.text))
+        store.set(texts, forKey: SyncKey.shortcuts)
+        store.set(data, forKey: SyncKey.buttons)
+        store.set(false, forKey: SyncKey.seeded)
+        store.set(stamp, forKey: SyncKey.updatedAt)
+        if push {
+            _ = store.synchronize()
+        }
+    }
+
+    /// The legacy loot line is rewritten here, before `apply`, the same
+    /// way a local load rewrites it. A missing payload is an empty list
+    /// only when its key is present; absent keys mean the store is empty.
+    private func readCloud() -> CloudLists {
+        let store = NSUbiquitousKeyValueStore.default
+        let shortcutsValue = store.object(forKey: SyncKey.shortcuts)
+        let buttonsValue = store.object(forKey: SyncKey.buttons)
+        let updatedValue = store.object(forKey: SyncKey.updatedAt)
+        let exists = shortcutsValue != nil || buttonsValue != nil || updatedValue != nil
+        let texts = (store.array(forKey: SyncKey.shortcuts) ?? []).compactMap { $0 as? String }
+        let cloudShortcuts = texts.map { ActionShortcut(text: Self.migratedActionText($0)) }
+        let cloudButtons = Self.migrateLegacyLoot(Self.buttons(from: store.data(forKey: SyncKey.buttons)))
+        return CloudLists(
+            buttons: cloudButtons,
+            shortcuts: cloudShortcuts,
+            updatedAt: store.double(forKey: SyncKey.updatedAt),
+            seeded: store.bool(forKey: SyncKey.seeded),
+            exists: exists
+        )
+    }
+
+    private static func changeReason(in note: Notification) -> Int? {
+        guard let value = note.userInfo?[NSUbiquitousKeyValueStoreChangeReasonKey] else { return nil }
+        if let number = value as? NSNumber { return number.intValue }
+        return value as? Int
     }
 }
 
