@@ -1122,6 +1122,8 @@ final class IMSession: ObservableObject {
                 maxSeq = line.seq
             }
             guard let shownLine = presentable(line, live: false, adoptDeath: false) else { continue }
+            // Exits, and the pitch-black room line, are read off the text
+            // that will be shown. The stored line is not rewritten.
             exitScan.consume(shownLine.text)
             shown.append(shownLine)
         }
@@ -1164,8 +1166,9 @@ final class IMSession: ObservableObject {
                 adoptDeath: fresh && adoptDeath
             ) else { continue }
             if fresh {
-                // Exits are read off the text that will be shown. A repeated
-                // seq is not read again, and the stored line is not rewritten.
+                // Exits, and the pitch-black room line, are read off the text
+                // that will be shown. A repeated seq is not read again, and
+                // the stored line is not rewritten.
                 exitScan.consume(shownLine.text)
                 next.append(shownLine)
             }
@@ -1197,7 +1200,9 @@ final class IMSession: ObservableObject {
     }
 
     /// Publishes the listing the scanner committed, if it changed.
-    /// The transcript lines are left as they were.
+    /// A pitch-black room commits every compass direction as dark. The next
+    /// `Obvious exits:` block replaces that listing. The transcript lines
+    /// are left as they were.
     private func noteRoomExits() {
         let scanned = exitScan.listing
         guard scanned != roomExits else { return }

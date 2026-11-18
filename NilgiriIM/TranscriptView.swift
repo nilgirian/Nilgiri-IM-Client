@@ -3667,14 +3667,16 @@ private struct GameMenuPanel: View {
     }
 }
 
-/// One row of compass commands on the input bar's frost. Each letter's plate
-/// is `Chrome.hotButtonPlate`, the same lighter wash as an action button.
-/// Each tap posts the full direction through `session.send()`, the same as
-/// typing it. The pressed letter stays lit for a quarter second, then returns
-/// to ink. Hiding labels drops the letter only; the plate still lights and
-/// the tap still sends. Until an exits listing arrives, every letter is shown.
-/// After that, an open exit shows its letter, a closed door is grey and does
-/// not send, and a direction with no exit keeps a blank slot.
+/// One row of compass commands on the input bar's frost. An open letter's
+/// plate is `Chrome.hotButtonPlate`, the same lighter wash as an action
+/// button. An exit into an unlit room uses that wash as an outline and no
+/// fill. Each tap posts the full direction through `session.send()`, the same
+/// as typing it. The pressed letter stays lit for a quarter second, then
+/// returns to ink. Hiding labels drops the letter only; the plate still
+/// lights and the tap still sends. Until an exits listing arrives, every
+/// letter is shown. After that, an open exit shows its letter, a dark exit
+/// shows the same letter on the outline and still sends, a closed door is
+/// grey and does not send, and a direction with no exit keeps a blank slot.
 private struct ActionPanel: View {
     @ObservedObject private var matrixMode = MatrixMode.shared
     /// The letter is invisible. The row, the press light, and the tap stay.
@@ -3722,8 +3724,10 @@ private struct ActionPanel: View {
         let known = exits != nil
         let door = exits?.door(for: direction.command)
         let showsLetter = known == false || door != nil
-        let usable = known == false || door == .open
+        // Dark is an open exit into an unlit room: same letter, still sends.
+        let usable = known == false || door == .open || door == .dark
         let lit = usable && litCommands.contains(direction.command)
+        let outlined = door == .dark && lit == false
         return Button {
             guard usable else { return }
             light(direction.command)
@@ -3742,16 +3746,25 @@ private struct ActionPanel: View {
         .font(.system(.body, design: .monospaced))
         .foregroundStyle(letterInk(closed: door == .closed, lit: lit))
         .background {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(lit ? Chrome.hotButtonFlash : Chrome.hotButtonPlate)
-                .padding(.horizontal, 3)
-                .padding(.vertical, 3)
+            let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
+            if outlined {
+                shape
+                    .stroke(Chrome.hotButtonPlate, lineWidth: 1)
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 3)
+            } else {
+                shape
+                    .fill(lit ? Chrome.hotButtonFlash : Chrome.hotButtonPlate)
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 3)
+            }
         }
         .accessibilityLabel(direction.command)
         .accessibilityHidden(showsLetter == false)
     }
 
-    /// Closed doors stay readable and grey. A lit open letter is white.
+    /// Closed doors stay readable and grey. An open or dark letter uses ink,
+    /// and a lit one is white.
     private func letterInk(closed: Bool, lit: Bool) -> Color {
         let color: Color
         if lit {

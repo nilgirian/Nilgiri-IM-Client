@@ -626,7 +626,10 @@ enum HMVPrompt {
 /// named nothing (`None.`). The scrollback is never edited.
 ///
 /// The game prints a header and then one line per exit, with the dash in a
-/// fixed column. A closed door's destination is wrapped in parentheses:
+/// fixed column. A closed door's destination is the keyword in parentheses,
+/// as in `(portcullis)`. An open exit into an unlit room prints
+/// `(too dark to tell)`, optionally followed by an immortal suffix such as
+/// ` [vid]` or ` (hidden)`. Darkness belongs to that exit alone.
 ///
 /// ```
 /// Obvious exits:
@@ -641,6 +644,8 @@ struct RoomExitListing: Equatable {
     enum Door: Equatable {
         case open
         case closed
+        /// Open exit into an unlit room. The listing prints `(too dark to tell)`.
+        case dark
     }
 
     /// Keys are the move commands: `north`, `south`, `east`, `west`, `up`, `down`.
@@ -655,8 +660,9 @@ struct RoomExitListing: Equatable {
 /// Reads long-exit lines out of game text. ANSI is ignored. The string passed
 /// in is not modified, and nothing here is written back onto a transcript line.
 struct RoomExitScan {
-    /// Last listing committed by an exit line or `None.`. A header by itself
-    /// leaves this alone so the previous room stays up until the new lines arrive.
+    /// Last listing committed by an exit line, `None.`, or the pitch-black
+    /// room line. A header by itself leaves this alone so the previous room
+    /// stays up until the new lines arrive.
     private(set) var listing: RoomExitListing?
     private var collecting = false
     private var doors: [String: RoomExitListing.Door] = [:]
@@ -677,6 +683,12 @@ struct RoomExitScan {
 
     private mutating func consumeLine(_ line: String) {
         if line.isEmpty { return }
+        // `line` is already plain text, split, and trimmed, the same as an
+        // exit line. Exact equality: blindness is a different sentence.
+        if line == Self.pitchBlack {
+            notePitchBlackRoom()
+            return
+        }
         if Self.isHeader(line) {
             collecting = true
             doors = [:]
@@ -697,6 +709,22 @@ struct RoomExitScan {
         collecting = false
     }
 
+    /// Pitch black sends no exits block. Every compass command the direction
+    /// row can send is dark until the next real listing replaces this one.
+    private mutating func notePitchBlackRoom() {
+        collecting = false
+        var darkened: [String: RoomExitListing.Door] = [:]
+        for command in Self.directionCommands {
+            darkened[command] = .dark
+        }
+        doors = darkened
+        listing = RoomExitListing(doors: darkened)
+    }
+
+    /// `You cannot see a damn thing, it is pitch black!`
+    /// Blindness (`you are blind!`) is not this line.
+    private static let pitchBlack = "You cannot see a damn thing, it is pitch black!"
+
     /// `Obvious exits:` on its own line, as `EXITS_LONG` prints it.
     private static func isHeader(_ line: String) -> Bool {
         line.compare("Obvious exits:", options: [.caseInsensitive]) == .orderedSame
@@ -708,9 +736,13 @@ struct RoomExitScan {
         return folded == "none" || folded == "none."
     }
 
-    /// `North  - (portcullis)` or `East   - Ye Olde Reading Room`.
-    /// The direction word, then whitespace, a hyphen, whitespace, and the
-    /// destination. Parentheses around the whole destination are a closed door.
+    /// `North  - (portcullis)`, `East   - Ye Olde Reading Room`, or
+    /// `North  - (too dark to tell)`. The direction word, then whitespace,
+    /// a hyphen, whitespace, and the destination. A destination that is
+    /// `(too dark to tell)`, or starts with that phrase, is an open exit
+    /// into an unlit room. That check comes before the parentheses rule,
+    /// so an immortal suffix does not turn it into a door. Parentheses
+    /// around any other whole destination are a closed door.
     private static func exit(on line: String) -> (command: String, door: RoomExitListing.Door)? {
         let folded = line.lowercased()
         for command in directionCommands {
@@ -722,11 +754,18 @@ struct RoomExitScan {
             rest = rest.dropFirst().drop(while: \.isWhitespace)
             let destination = rest.trimmingCharacters(in: .whitespacesAndNewlines)
             guard destination.isEmpty == false else { continue }
+            let foldedDestination = destination.lowercased()
+            if foldedDestination == tooDarkToTell || foldedDestination.hasPrefix(tooDarkToTell) {
+                return (command, .dark)
+            }
             let closed = destination.first == "(" && destination.last == ")"
             return (command, closed ? .closed : .open)
         }
         return nil
     }
+
+    /// Open exit into an unlit room. An immortal suffix may follow this phrase.
+    private static let tooDarkToTell = "(too dark to tell)"
 
     private static let directionCommands = ["north", "south", "east", "west", "up", "down"]
 
