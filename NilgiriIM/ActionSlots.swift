@@ -137,6 +137,13 @@ final class ActionMenuStore: ObservableObject {
         let key = Self.matchKey(text)
         let taken = shortcuts.contains { $0.id != id && Self.matchKey($0.text) == key }
             || buttons.contains { Self.matchKey($0.text) == key }
+        // One blank only. Clearing this row while that blank already exists
+        // cannot be stored, and writing the old text back leaves the last
+        // character stuck. Drop the row instead.
+        if taken, key.isEmpty {
+            removeShortcut(id: id)
+            return
+        }
         guard taken == false else { return }
         var next = shortcuts
         next[index].text = text
@@ -147,6 +154,12 @@ final class ActionMenuStore: ObservableObject {
     func removeShortcut(id: UUID) {
         guard shortcuts.contains(where: { $0.id == id }) else { return }
         apply(buttons: buttons, shortcuts: shortcuts.filter { $0.id != id })
+    }
+
+    /// Drop one hot button. The words are not copied into Actions.
+    func removeButton(id: UUID) {
+        guard buttons.contains(where: { $0.id == id }) else { return }
+        apply(buttons: buttons.filter { $0.id != id }, shortcuts: shortcuts)
     }
 
     func moveShortcut(from: Int, to: Int) {
@@ -396,6 +409,9 @@ struct ActionSlotsDrawer: View {
     /// A system drop already placed this drag. The finger-up path must not
     /// place it a second time.
     @State private var dropClaimed = false
+    /// Match keys just deleted. The system-drag load finishes after the
+    /// finger lifts and would otherwise write that row back.
+    @State private var revokedDropKeys: Set<String> = []
     /// Hold-and-drag. While set, the card's own pan stays put.
     @State private var held: HeldDrag?
     /// True from the long-press began until the finger lifts.
@@ -593,20 +609,25 @@ struct ActionSlotsDrawer: View {
     }
 
     private var actionsHeader: some View {
-        HStack(alignment: .center, spacing: 0) {
-            sectionTitle("Actions")
-            if menu.canAdd {
-                Button(action: addShortcut) {
-                    Text("+")
-                        .font(.system(size: 22, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Color(white: 0.92))
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center, spacing: 0) {
+                sectionTitle("Actions")
+                if menu.canAdd {
+                    Button(action: addShortcut) {
+                        Text("+")
+                            .font(.system(size: 22, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Color(white: 0.92))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Add shortcut")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Add shortcut")
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 0)
+            Text("Hold and drag right to delete")
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(MatrixShade.display(Color(white: 0.62), enabled: matrixMode.enabled))
         }
     }
 
@@ -657,7 +678,8 @@ struct ActionSlotsDrawer: View {
                             if editingID == shortcut.id {
                                 editingID = nil
                             }
-                        }
+                        },
+                        onDelete: { deleteShortcut(shortcut.id) }
                     )
                     .accessibilityLabel("Shortcut text")
                 } else {
@@ -682,6 +704,14 @@ struct ActionSlotsDrawer: View {
                                 },
                                 onPressEnded: { translation, location, committed in
                                     finishDrag(translation: translation, location: location, committed: committed)
+                                },
+                                onDragEnded: { translation in
+                                    // The lift cancels the hold before the finger
+                                    // has moved the delete distance. Finish from
+                                    // where the drag actually ended.
+                                    guard translation.width >= Metrics.deleteDistance,
+                                          translation.width > abs(translation.height) * 1.25 else { return }
+                                    deleteShortcut(shortcut.id)
                                 }
                             )
                         }
@@ -766,8 +796,12 @@ struct ActionSlotsDrawer: View {
                     matrix: matrixMode.enabled,
                     onText: { menu.updateIcon(id: button.id, icon: $0) },
                     onCommit: {
-                        if editingIconID == button.id {
-                            editingIconID = nil
+                        // The trash sits outside this field. Resigning on the
+                        // touch down would remove it before the touch up lands.
+                        DispatchQueue.main.async {
+                            if editingIconID == button.id {
+                                editingIconID = nil
+                            }
                         }
                     }
                 )
@@ -782,6 +816,9 @@ struct ActionSlotsDrawer: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            if editingIconID == button.id {
+                rowDeleteButton { deleteHotButton(button.id) }
+            }
         }
         .frame(maxWidth: .infinity)
         .frame(height: Metrics.rowStride)
@@ -820,6 +857,7 @@ struct ActionSlotsDrawer: View {
             editingID = nil
             editingIconID = button.id
         }
+        .accessibilityAction(named: Text("Delete")) { deleteHotButton(button.id) }
         .accessibilityAction(named: Text("Move up")) { moveHotButton(button.id, by: -1) }
         .accessibilityAction(named: Text("Move down")) { moveHotButton(button.id, by: 1) }
         .accessibilityAction(named: Text("Move to actions")) {
@@ -928,6 +966,13 @@ struct ActionSlotsDrawer: View {
         if editingID == id {
             editingID = nil
         }
+        if let text = menu.shortcuts.first(where: { $0.id == id })?.text {
+            let key = ActionMenuStore.matchKey(text)
+            revokedDropKeys.insert(key)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                revokedDropKeys.remove(key)
+            }
+        }
         withAnimation(.easeOut(duration: 0.18)) {
             if held?.id == id {
                 held = nil
@@ -935,6 +980,32 @@ struct ActionSlotsDrawer: View {
             }
             menu.removeShortcut(id: id)
         }
+    }
+
+    private func deleteHotButton(_ id: UUID) {
+        if editingIconID == id {
+            editingIconID = nil
+        }
+        withAnimation(.easeOut(duration: 0.18)) {
+            if held?.id == id {
+                held = nil
+                heldActive = false
+            }
+            menu.removeButton(id: id)
+        }
+    }
+
+    /// Trailing trash. Shown while that row's field is up.
+    private func rowDeleteButton(action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: "trash.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(Color.red.opacity(0.9))
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Delete")
     }
 
     private func moveShortcut(_ id: UUID, by delta: Int) {
@@ -988,7 +1059,9 @@ struct ActionSlotsDrawer: View {
         if current.list == .actions, current.axis == nil {
             current.axis = lockedAxis(for: translation, current: nil)
         }
-        if committed, current.list == .actions, current.axis == .horizontal,
+        // Already past the line. A system drag can cancel the hold on the
+        // way out; the row should still go.
+        if current.list == .actions, current.axis == .horizontal,
            current.translation.width >= Metrics.deleteDistance {
             deleteShortcut(current.id)
             return
@@ -1243,13 +1316,13 @@ struct ActionSlotsDrawer: View {
     /// One move into Hot Buttons. A later handler for the same drag must not
     /// insert a second row: `reposition` is false for that follow-up.
     private func acceptActionDrop(_ items: [String], at index: Int, reposition: Bool) -> Bool {
-        guard let text = items.first else { return false }
+        guard let text = items.first, dropRevoked(text) == false else { return false }
         dropClaimed = true
         return menu.moveToHotButtons(text: text, at: index, reposition: reposition)
     }
 
     private func acceptActionReturn(_ items: [String], at index: Int) -> Bool {
-        guard let text = items.first else { return false }
+        guard let text = items.first, dropRevoked(text) == false else { return false }
         dropClaimed = true
         return menu.moveToActions(text: text, at: index, reposition: true)
     }
@@ -1260,15 +1333,23 @@ struct ActionSlotsDrawer: View {
     private func loadActionDrop(_ providers: [NSItemProvider], at index: Int) -> Bool {
         dropClaimed = true
         return loadTransferredText(providers) { text in
-            self.menu.moveToHotButtons(text: text, at: index, reposition: false)
+            if self.dropRevoked(text) { return false }
+            return self.menu.moveToHotButtons(text: text, at: index, reposition: false)
         }
     }
 
     private func loadActionReturn(_ providers: [NSItemProvider], at index: Int) -> Bool {
         dropClaimed = true
         return loadTransferredText(providers) { text in
-            self.menu.moveToActions(text: text, at: index, reposition: false)
+            if self.dropRevoked(text) { return false }
+            return self.menu.moveToActions(text: text, at: index, reposition: false)
         }
+    }
+
+    /// True when this text was deleted a moment ago. The in-flight drop
+    /// load must not insert it again.
+    private func dropRevoked(_ text: String) -> Bool {
+        revokedDropKeys.contains(ActionMenuStore.matchKey(text))
     }
 
     private func loadTransferredText(
@@ -1335,6 +1416,7 @@ private struct ShortcutEditor: UIViewRepresentable {
     var text: String
     var onText: (String) -> Void
     var onCommit: () -> Void
+    var onDelete: () -> Void
 
     func makeUIView(context: Context) -> UITextField {
         let field = UITextField()
@@ -1366,6 +1448,25 @@ private struct ShortcutEditor: UIViewRepresentable {
             action: #selector(Coordinator.changed(_:)),
             for: .editingChanged
         )
+        let trash = UIButton(type: .system)
+        let symbol = UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+        trash.setImage(UIImage(systemName: "trash.fill", withConfiguration: symbol), for: .normal)
+        trash.tintColor = UIColor.systemRed.withAlphaComponent(0.9)
+        trash.frame = CGRect(x: 0, y: 0, width: 44, height: 44)
+        trash.accessibilityLabel = "Delete"
+        trash.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.deleteTapped),
+            for: .touchUpInside
+        )
+        // A plain button's intrinsic size is the glyph. The container keeps
+        // a 44pt target, which is what the field uses for a right view.
+        // Inside the field, so the tap does not resign the editor first.
+        trash.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        let slot = UIView(frame: trash.frame)
+        slot.addSubview(trash)
+        field.rightView = slot
+        field.rightViewMode = .always
         return field
     }
 
@@ -1387,6 +1488,7 @@ private struct ShortcutEditor: UIViewRepresentable {
         let coordinator = context.coordinator
         coordinator.onText = onText
         coordinator.onCommit = onCommit
+        coordinator.onDelete = onDelete
         if field.markedTextRange == nil, field.text != text {
             coordinator.applying = true
             field.text = text
@@ -1412,8 +1514,13 @@ private struct ShortcutEditor: UIViewRepresentable {
     final class Coordinator: NSObject, UITextFieldDelegate {
         var onText: (String) -> Void = { _ in }
         var onCommit: () -> Void = {}
+        var onDelete: () -> Void = {}
         var applying = false
         var didFocus = false
+
+        @objc func deleteTapped() {
+            onDelete()
+        }
 
         @objc func changed(_ field: UITextField) {
             guard applying == false else { return }
@@ -1651,6 +1758,9 @@ private struct ShortcutRowGestures: UIViewRepresentable {
     var onPressBegan: (CGPoint) -> Void
     var onPressChanged: (CGSize, CGPoint) -> Void
     var onPressEnded: (CGSize, CGPoint, Bool) -> Void
+    /// Window translation of a system drag that started here, when it ends.
+    /// Nil on a row that should not finish a delete from that drag.
+    var onDragEnded: ((CGSize) -> Void)? = nil
 
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
@@ -1671,6 +1781,7 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         press.delegate = context.coordinator
         context.coordinator.yieldsToSystemDrag = yieldsToSystemDrag
         context.coordinator.dragText = dragText
+        context.coordinator.onDragEnded = onDragEnded
         if yieldsToSystemDrag {
             let drag = UIDragInteraction(delegate: context.coordinator)
             drag.isEnabled = true
@@ -1716,6 +1827,7 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         coordinator.onPressBegan = onPressBegan
         coordinator.onPressChanged = onPressChanged
         coordinator.onPressEnded = onPressEnded
+        coordinator.onDragEnded = onDragEnded
         if let press = uiView.gestureRecognizers?.compactMap({ $0 as? UILongPressGestureRecognizer }).first {
             press.cancelsTouchesInView = yieldsToSystemDrag == false
             press.delegate = coordinator
@@ -1732,7 +1844,9 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         var onPressBegan: (CGPoint) -> Void = { _ in }
         var onPressChanged: (CGSize, CGPoint) -> Void = { _, _ in }
         var onPressEnded: (CGSize, CGPoint, Bool) -> Void = { _, _, _ in }
+        var onDragEnded: ((CGSize) -> Void)?
         var origin: CGPoint?
+        var dragOrigin: CGPoint?
         var pressed = false
         var suppressTapsUntil = Date.distantPast
 
@@ -1766,6 +1880,31 @@ private struct ShortcutRowGestures: UIViewRepresentable {
             let item = UIDragItem(itemProvider: provider)
             item.localObject = text
             return [item]
+        }
+
+        func dragInteraction(_ interaction: UIDragInteraction, sessionWillBegin session: UIDragSession) {
+            dragOrigin = sessionWindowLocation(session, interaction: interaction)
+        }
+
+        func dragInteraction(
+            _ interaction: UIDragInteraction,
+            session: UIDragSession,
+            didEndWith _: UIDropOperation
+        ) {
+            defer { dragOrigin = nil }
+            guard let origin = dragOrigin,
+                  let location = sessionWindowLocation(session, interaction: interaction) else { return }
+            onDragEnded?(translation(from: origin, to: location))
+        }
+
+        /// The row may have slid under the finger. Window space stays put.
+        private func sessionWindowLocation(_ session: UIDragSession, interaction: UIDragInteraction) -> CGPoint? {
+            guard let view = interaction.view else { return nil }
+            let local = session.location(in: view)
+            if let window = view.window {
+                return view.convert(local, to: window)
+            }
+            return view.convert(local, to: nil)
         }
 
         @objc func singleTap(_ gesture: UITapGestureRecognizer) {
