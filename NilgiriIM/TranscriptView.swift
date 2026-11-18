@@ -3713,7 +3713,11 @@ private struct ActionPanel: View {
     }
 
     /// The slot width stays `maxWidth: .infinity` for every direction, so a
-    /// blank keeps the same place as a letter.
+    /// blank keeps the same place as a letter. The frame and the content
+    /// shape are the button's label. A plain button hit-tests that label
+    /// only, and a letter at opacity zero has no hit area, so those modifiers
+    /// have to sit inside the label or hiding it drops the tap. The command
+    /// is the direction word, not the letter on the plate.
     private func directionButton(_ direction: Direction) -> some View {
         let known = exits != nil
         let door = exits?.door(for: direction.command)
@@ -3725,24 +3729,24 @@ private struct ActionPanel: View {
             light(direction.command)
             send(direction.command)
         } label: {
-            // Opacity stops at the letter. The press light is on the button.
-            // Hidden labels and missing exits both drop the letter only.
+            // Opacity stops at the letter. The slot's frame is the hit
+            // target, so a hidden letter still sends `direction.command`.
             Text(verbatim: direction.label)
                 .opacity(showsLetter && hideLabels == false ? 1 : 0)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(usable == false)
         .font(.system(.body, design: .monospaced))
         .foregroundStyle(letterInk(closed: door == .closed, lit: lit))
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 10)
         .background {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(lit ? Chrome.hotButtonFlash : Chrome.hotButtonPlate)
                 .padding(.horizontal, 3)
                 .padding(.vertical, 3)
         }
-        .contentShape(Rectangle())
         .accessibilityLabel(direction.command)
         .accessibilityHidden(showsLetter == false)
     }
