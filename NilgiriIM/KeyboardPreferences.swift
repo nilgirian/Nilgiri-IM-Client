@@ -246,11 +246,7 @@ struct KeyboardSettingsDrawer: View {
                 Toggle("Keep last command", isOn: $preferences.keepLastCommand)
                 Toggle("Show action help", isOn: $preferences.showActionHelp)
                 VStack(alignment: .leading, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("To report issues, take a screenshot and you should have an option to \"Share Beta Feedback\" or use this link to")
-                            .fixedSize(horizontal: false, vertical: true)
-                        infoLink("Report issues", urlString: Self.reportIssuesURL)
-                    }
+                    reportIssuesLine
                     infoLink("Newbie guide", urlString: Self.newbieGuideURL)
                     infoLink("About Nilgiri IM", urlString: Self.aboutNilgiriIMURL)
                 }
@@ -291,6 +287,29 @@ struct KeyboardSettingsDrawer: View {
                 .frame(width: 1)
         }
         .shadow(color: .black.opacity(0.45), radius: 14, x: 8, y: 0)
+    }
+
+    /// One sentence. "Report issues" is the link, to the same page as before.
+    /// The rest is plain text, and the quotes are curly.
+    private var reportIssuesLine: some View {
+        (Text(reportIssuesLink) + Text(" or take a screenshot and “Share Beta Feedback”"))
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .environment(\.openURL, OpenURLAction { url in
+                UIApplication.shared.open(url)
+                return .handled
+            })
+            .accessibilityHint("Opens in Safari")
+    }
+
+    /// Underlined like the other menu links, in the menu's text colour.
+    private var reportIssuesLink: AttributedString {
+        var link = AttributedString("Report issues")
+        link.underlineStyle = .single
+        link.foregroundColor = Color(white: 0.92).matrix
+        link.link = URL(string: Self.reportIssuesURL)
+        return link
     }
 
     /// Same open path as a link in the log: `UIApplication.shared.open`, which
