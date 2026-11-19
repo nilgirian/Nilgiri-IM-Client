@@ -247,7 +247,6 @@ final class ActionMenuStore: ObservableObject {
         guard taken == false else { return }
         var next = buttons
         next[index].text = text
-        rememberedIcons[key] = next[index].icon
         apply(buttons: next, shortcuts: shortcuts)
     }
 
@@ -791,6 +790,8 @@ struct ActionSlotsDrawer: View {
     var logFrame: CGRect
     /// Word hilited in the log, appended when a shortcut is sent.
     var hilitedWord: String?
+    /// Left-menu switch. On shows the two lines under Actions.
+    var showActionHelp: Bool
     /// The card settled open or closed. Not called during the drag, so a swipe
     /// that slides back shut does not dismiss the keyboard and bring it back.
     var onOpenChange: (Bool) -> Void
@@ -1054,10 +1055,19 @@ struct ActionSlotsDrawer: View {
                 }
                 Spacer(minLength: 0)
             }
-            Text("Hold and drag right to delete")
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(MatrixShade.display(Color(white: 0.62), enabled: matrixMode.enabled))
+            if showActionHelp {
+                VStack(alignment: .leading, spacing: 2) {
+                    helpLine("Hold and drag right to delete")
+                    helpLine("Double tap to edit")
+                }
+            }
         }
+    }
+
+    private func helpLine(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 12, design: .monospaced))
+            .foregroundStyle(MatrixShade.display(Color(white: 0.62), enabled: matrixMode.enabled))
     }
 
     private var sectionDivider: some View {
