@@ -801,7 +801,6 @@ struct ActionSlotsDrawer: View {
     private enum Metrics {
         static let rowStride: CGFloat = 48
         static let deleteDistance: CGFloat = 64
-        static let iconHitWidth: CGFloat = 52
     }
 
     private enum DragList { case actions, hotButtons }
@@ -935,7 +934,7 @@ struct ActionSlotsDrawer: View {
                         shortcutRows(width: width)
                     }
                     sectionDivider
-                    hotButtonSection
+                    hotButtonSection(width: width)
                 }
                 .font(.system(size: 17))
                 .foregroundStyle(MatrixShade.display(Color(white: 0.92), enabled: matrixMode.enabled))
@@ -996,10 +995,10 @@ struct ActionSlotsDrawer: View {
     /// a `String` in `public.utf8-plain-text`, the same payload `.draggable`
     /// writes on an action row. An empty list keeps one row of height so the
     /// target does not collapse.
-    private var hotButtonSection: some View {
+    private func hotButtonSection(width: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionTitle("Hot Buttons")
-            hotButtonRows
+            hotButtonRows(width: width)
         }
     }
 
@@ -1135,7 +1134,11 @@ struct ActionSlotsDrawer: View {
                                 dragText: shortcut.text,
                                 dragLabel: trimmed.isEmpty ? "shortcut" : shortcut.text,
                                 dragLabelDimmed: trimmed.isEmpty,
-                                onTap: { _ in activate(shortcut, width: width) },
+                                onTap: { _ in
+                                    activate(text: shortcut.text, width: width) {
+                                        editShortcut(shortcut.id)
+                                    }
+                                },
                                 onDoubleTap: { editShortcut(shortcut.id) },
                                 onPressBegan: { location in
                                     beginDrag(shortcut.id, list: .actions, location: location)
@@ -1160,7 +1163,11 @@ struct ActionSlotsDrawer: View {
                         .accessibilityLabel(trimmed.isEmpty ? "Empty shortcut" : shortcut.text)
                         .accessibilityHint(shortcutHint)
                         .accessibilityAddTraits(.isButton)
-                        .accessibilityAction { activate(shortcut, width: width) }
+                        .accessibilityAction {
+                            activate(text: shortcut.text, width: width) {
+                                editShortcut(shortcut.id)
+                            }
+                        }
                         .accessibilityAction(named: Text("Edit")) { editShortcut(shortcut.id) }
                         .accessibilityAction(named: Text("Delete")) { deleteShortcut(shortcut.id) }
                         .accessibilityAction(named: Text("Move up")) { moveShortcut(shortcut.id, by: -1) }
@@ -1191,17 +1198,17 @@ struct ActionSlotsDrawer: View {
     }
 
     /// Icon plate and the action text, in list order. The plate is what the
-    /// play-screen button shows. Tap the plate to type 0, 1, or 2 characters.
-    /// Double tap the row to edit the words, the same field an action uses,
-    /// including Delete. Hold the row to reorder inside this list. A drag
-    /// that leaves the list removes only that hot button; the action row is
-    /// a different object.
+    /// play-screen button shows. A single tap sends the command and closes
+    /// the card, the same as an action. Double tap the row to edit the words,
+    /// the same field an action uses, including Delete. Hold the row to
+    /// reorder inside this list. A drag that leaves the list removes only
+    /// that hot button; the action row is a different object.
     /// The well keeps a row of height when the list is empty, and it accepts
     /// the action row's `String` drop there.
-    private var hotButtonRows: some View {
+    private func hotButtonRows(width: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(menu.buttons.enumerated()), id: \.element.id) { index, button in
-                hotButtonRow(index: index, button: button)
+                hotButtonRow(index: index, button: button, width: width)
             }
         }
         .frame(maxWidth: .infinity, minHeight: Metrics.rowStride, alignment: .topLeading)
@@ -1228,7 +1235,7 @@ struct ActionSlotsDrawer: View {
         return 0
     }
 
-    private func hotButtonRow(index: Int, button: HotButton) -> some View {
+    private func hotButtonRow(index: Int, button: HotButton, width: CGFloat) -> some View {
         let offset = hotRowOffset(index: index)
         let dragging = held?.list == .hotButtons && held?.id == button.id
         let trimmed = button.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1290,11 +1297,10 @@ struct ActionSlotsDrawer: View {
                     dragLabelDimmed: trimmed.isEmpty,
                     dragBadge: button.icon,
                     previewMatrix: matrixMode.enabled,
-                    onTap: { point in
-                        guard point.x <= Metrics.iconHitWidth else { return }
-                        editingID = nil
-                        editingButtonID = nil
-                        editingIconID = button.id
+                    onTap: { _ in
+                        activate(text: button.text, width: width) {
+                            editHotButtonText(button.id)
+                        }
                     },
                     onDoubleTap: { editHotButtonText(button.id) },
                     onPressBegan: { location in
@@ -1316,7 +1322,13 @@ struct ActionSlotsDrawer: View {
         .accessibilityElement(children: editingIconID == button.id || editingButtonID == button.id ? .contain : .ignore)
         .accessibilityLabel(trimmed.isEmpty ? "Empty hot button" : button.text)
         .accessibilityValue(button.icon.isEmpty ? "No icon" : "Icon \(button.icon)")
-        .accessibilityHint("Double tap to edit. Drag out of hot buttons to move it back to actions")
+        .accessibilityHint(hotButtonHint)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            activate(text: button.text, width: width) {
+                editHotButtonText(button.id)
+            }
+        }
         .accessibilityAction(named: Text("Edit")) { editHotButtonText(button.id) }
         .accessibilityAction(named: Text("Edit icon")) {
             editingID = nil
@@ -1427,12 +1439,19 @@ struct ActionSlotsDrawer: View {
         editingButtonID = id
     }
 
-    /// Single tap. A shortcut is sent and the card closes. The joined command
+    private var hotButtonHint: String {
+        let name = hilitedWord?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if name.isEmpty { return "Sends this hot button. Drag out of hot buttons to move it back to actions" }
+        return "Sends this hot button followed by \(name). Drag out of hot buttons to move it back to actions"
+    }
+
+    /// Single tap. The command is sent and the card closes. The joined command
     /// already includes the hilite. Blank text has nothing to send, so the
-    /// tap opens the inline editor instead of closing the card.
-    private func activate(_ shortcut: ActionShortcut, width: CGFloat) {
-        guard let command = ActionShortcut.command(text: shortcut.text, target: hilitedWord) else {
-            editShortcut(shortcut.id)
+    /// tap opens that row's editor instead of closing the card. An action
+    /// and a hot button both come through here.
+    private func activate(text: String, width: CGFloat, edit: () -> Void) {
+        guard let command = ActionShortcut.command(text: text, target: hilitedWord) else {
+            edit()
             return
         }
         editingID = nil
