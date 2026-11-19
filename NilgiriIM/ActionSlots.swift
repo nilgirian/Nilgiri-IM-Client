@@ -1236,84 +1236,17 @@ struct ActionSlotsDrawer: View {
     }
 
     private func hotButtonRow(index: Int, button: HotButton, width: CGFloat) -> some View {
-        let offset = hotRowOffset(index: index)
-        let dragging = held?.list == .hotButtons && held?.id == button.id
-        let trimmed = button.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let offset: CGSize = hotRowOffset(index: index)
+        let dragging: Bool = held?.list == .hotButtons && held?.id == button.id
+        let trimmed: String = button.text.trimmingCharacters(in: .whitespacesAndNewlines)
         return HStack(spacing: 10) {
-            if editingIconID == button.id {
-                IconEditor(
-                    text: button.icon,
-                    matrix: matrixMode.enabled,
-                    onText: { menu.updateIcon(id: button.id, icon: $0) },
-                    onCommit: {
-                        if editingIconID == button.id {
-                            editingIconID = nil
-                        }
-                    }
-                )
-                .frame(width: 40, height: 32)
-                .background(iconPlateFill)
-            } else if editingButtonID == button.id {
-                iconPlate(button.icon)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        editingButtonID = nil
-                        editingIconID = button.id
-                    }
-            } else {
-                iconPlate(button.icon)
-            }
-            if editingButtonID == button.id {
-                ShortcutEditor(
-                    text: button.text,
-                    placeholder: "action",
-                    fieldLabel: "Hot button text",
-                    onText: { menu.updateButtonText(id: button.id, text: $0) },
-                    onCommit: {
-                        if editingButtonID == button.id {
-                            editingButtonID = nil
-                        }
-                    },
-                    onDelete: { deleteHotButton(button.id) }
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            } else {
-                Text(verbatim: trimmed.isEmpty ? "action" : button.text)
-                    .font(.system(size: 17, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.92).opacity(trimmed.isEmpty ? 0.35 : 1))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            }
+            hotButtonIcon(button)
+            hotButtonTitle(button, trimmed: trimmed)
         }
         .frame(maxWidth: .infinity)
         .frame(height: Metrics.rowStride)
         .overlay {
-            if editingIconID != button.id, editingButtonID != button.id {
-                ShortcutRowGestures(
-                    yieldsToSystemDrag: true,
-                    dragText: button.text,
-                    dragLabel: trimmed.isEmpty ? "action" : button.text,
-                    dragLabelDimmed: trimmed.isEmpty,
-                    dragBadge: button.icon,
-                    previewMatrix: matrixMode.enabled,
-                    onTap: { _ in
-                        activate(text: button.text, width: width) {
-                            editHotButtonText(button.id)
-                        }
-                    },
-                    onDoubleTap: { editHotButtonText(button.id) },
-                    onPressBegan: { location in
-                        beginDrag(button.id, list: .hotButtons, location: location)
-                    },
-                    onPressChanged: { translation, location in
-                        updateDrag(translation, location)
-                    },
-                    onPressEnded: { translation, location, committed in
-                        finishDrag(translation: translation, location: location, committed: committed)
-                    }
-                )
-            }
+            hotButtonGestures(button: button, width: width, trimmed: trimmed)
         }
         .offset(offset)
         .opacity(hotRowOpacity(index: index))
@@ -1340,6 +1273,93 @@ struct ActionSlotsDrawer: View {
         .accessibilityAction(named: Text("Move down")) { moveHotButton(button.id, by: 1) }
         .accessibilityAction(named: Text("Move to actions")) {
             menu.moveToActions(id: button.id, at: menu.shortcuts.count, reposition: true)
+        }
+    }
+
+    /// Badge while this row is idle, in icon edit, or beside the command field.
+    /// Split out of the row so the icon branch type-checks on its own.
+    @ViewBuilder
+    private func hotButtonIcon(_ button: HotButton) -> some View {
+        if editingIconID == button.id {
+            IconEditor(
+                text: button.icon,
+                matrix: matrixMode.enabled,
+                onText: { menu.updateIcon(id: button.id, icon: $0) },
+                onCommit: {
+                    if editingIconID == button.id {
+                        editingIconID = nil
+                    }
+                }
+            )
+            .frame(width: 40, height: 32)
+            .background(iconPlateFill)
+        } else if editingButtonID == button.id {
+            iconPlate(button.icon)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    editingButtonID = nil
+                    editingIconID = button.id
+                }
+        } else {
+            iconPlate(button.icon)
+        }
+    }
+
+    /// Command field, or the label. Split out of the row so this branch
+    /// type-checks on its own.
+    @ViewBuilder
+    private func hotButtonTitle(_ button: HotButton, trimmed: String) -> some View {
+        if editingButtonID == button.id {
+            ShortcutEditor(
+                text: button.text,
+                placeholder: "action",
+                fieldLabel: "Hot button text",
+                onText: { menu.updateButtonText(id: button.id, text: $0) },
+                onCommit: {
+                    if editingButtonID == button.id {
+                        editingButtonID = nil
+                    }
+                },
+                onDelete: { deleteHotButton(button.id) }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        } else {
+            Text(verbatim: trimmed.isEmpty ? "action" : button.text)
+                .font(.system(size: 17, design: .monospaced))
+                .foregroundStyle(Color(white: 0.92).opacity(trimmed.isEmpty ? 0.35 : 1))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        }
+    }
+
+    /// Hold, tap, and double tap. Absent while a field on this row is open.
+    @ViewBuilder
+    private func hotButtonGestures(button: HotButton, width: CGFloat, trimmed: String) -> some View {
+        if editingIconID != button.id, editingButtonID != button.id {
+            ShortcutRowGestures(
+                yieldsToSystemDrag: true,
+                dragText: button.text,
+                dragLabel: trimmed.isEmpty ? "action" : button.text,
+                dragLabelDimmed: trimmed.isEmpty,
+                dragBadge: button.icon,
+                previewMatrix: matrixMode.enabled,
+                onTap: { _ in
+                    activate(text: button.text, width: width) {
+                        editHotButtonText(button.id)
+                    }
+                },
+                onDoubleTap: { editHotButtonText(button.id) },
+                onPressBegan: { location in
+                    beginDrag(button.id, list: .hotButtons, location: location)
+                },
+                onPressChanged: { translation, location in
+                    updateDrag(translation, location)
+                },
+                onPressEnded: { translation, location, committed in
+                    finishDrag(translation: translation, location: location, committed: committed)
+                }
+            )
         }
     }
 
