@@ -5,8 +5,9 @@ import UIKit
 /// Also whether the input line keeps the last command as grey placeholder text.
 /// Missing keys keep the device default. iPhone hides in landscape only.
 /// iPad keeps the keyboard up in both orientations. The hot-button switch
-/// hides letters only; a missing key leaves them showing. Keep last command defaults off.
-/// Moving a switch writes the key.
+/// hides letters only; a missing key leaves them showing. Keep last command
+/// defaults off. Show action help defaults on, so the line under Actions
+/// stays visible until the switch is turned off. Moving a switch writes the key.
 final class KeyboardHidePreferences: ObservableObject {
     @Published var hideInPortrait: Bool {
         didSet { UserDefaults.standard.set(hideInPortrait, forKey: Key.portrait) }
@@ -27,11 +28,18 @@ final class KeyboardHidePreferences: ObservableObject {
         didSet { UserDefaults.standard.set(keepLastCommand, forKey: Key.keepLastCommand) }
     }
 
+    /// The line under Actions: double tap to edit.
+    /// Missing key leaves it showing.
+    @Published var showActionHelp: Bool {
+        didSet { UserDefaults.standard.set(showActionHelp, forKey: Key.showActionHelp) }
+    }
+
     private enum Key {
         static let portrait = "im.hideKeyboardPortrait"
         static let landscape = "im.hideKeyboardLandscape"
         static let hotButtonLabels = "im.hideHotButtonLabels"
         static let keepLastCommand = "im.keepLastCommand"
+        static let showActionHelp = "im.showActionHelp"
     }
 
     init() {
@@ -41,6 +49,7 @@ final class KeyboardHidePreferences: ObservableObject {
         hideInLandscape = Self.stored(defaults, Key.landscape, fallback: phone)
         hideHotButtonLabels = Self.stored(defaults, Key.hotButtonLabels, fallback: false)
         keepLastCommand = Self.stored(defaults, Key.keepLastCommand, fallback: false)
+        showActionHelp = Self.stored(defaults, Key.showActionHelp, fallback: true)
     }
 
     func hidesKeyboard(isPortrait: Bool) -> Bool {
@@ -126,7 +135,7 @@ struct WindowPortraitProbe: UIViewRepresentable {
 
 /// Dark grey card on the left edge. A rightward swipe from that edge opens it.
 /// Portrait and landscape keyboard switches, Matrix Mode, Hide hot button
-/// labels, and Keep last command stay at the top. Report issues, the newbie
+/// labels, Keep last command, and Show action help stay at the top. Report issues, the newbie
 /// guide, and About Nilgiri IM open in Safari. Unlink, while the player is
 /// in the game, sits at the bottom of the card.
 struct KeyboardSettingsDrawer: View {
@@ -235,12 +244,9 @@ struct KeyboardSettingsDrawer: View {
                 Toggle("Matrix Mode", isOn: $matrixMode.enabled)
                 Toggle("Hide hot button labels", isOn: $preferences.hideHotButtonLabels)
                 Toggle("Keep last command", isOn: $preferences.keepLastCommand)
+                Toggle("Show action help", isOn: $preferences.showActionHelp)
                 VStack(alignment: .leading, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("To report issues, take a screenshot and you should have an option to \"Share Beta Feedback\" or use this link to")
-                            .fixedSize(horizontal: false, vertical: true)
-                        infoLink("Report issues", urlString: Self.reportIssuesURL)
-                    }
+                    reportIssuesLine
                     infoLink("Newbie guide", urlString: Self.newbieGuideURL)
                     infoLink("About Nilgiri IM", urlString: Self.aboutNilgiriIMURL)
                 }
@@ -281,6 +287,29 @@ struct KeyboardSettingsDrawer: View {
                 .frame(width: 1)
         }
         .shadow(color: .black.opacity(0.45), radius: 14, x: 8, y: 0)
+    }
+
+    /// One sentence. "Report issues" is the link, to the same page as before.
+    /// The rest is plain text, and the quotes are curly.
+    private var reportIssuesLine: some View {
+        (Text(reportIssuesLink) + Text(" or take a screenshot and “Share Beta Feedback”"))
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .environment(\.openURL, OpenURLAction { url in
+                UIApplication.shared.open(url)
+                return .handled
+            })
+            .accessibilityHint("Opens in Safari")
+    }
+
+    /// Underlined like the other menu links, in the menu's text colour.
+    private var reportIssuesLink: AttributedString {
+        var link = AttributedString("Report issues")
+        link.underlineStyle = .single
+        link.foregroundColor = Color(white: 0.92).matrix
+        link.link = URL(string: Self.reportIssuesURL)
+        return link
     }
 
     /// Same open path as a link in the log: `UIApplication.shared.open`, which

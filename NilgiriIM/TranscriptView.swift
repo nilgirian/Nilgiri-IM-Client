@@ -2861,6 +2861,7 @@ struct TranscriptView: View {
                     openRequest: $actionSlotsOpenRequest,
                     logFrame: logGlobalFrame,
                     hilitedWord: session.hilitedWord,
+                    showActionHelp: keyboardPrefs.showActionHelp,
                     onOpenChange: { open in
                         actionSlotsCardChanged(open: open)
                     },
