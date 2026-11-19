@@ -1095,6 +1095,8 @@ struct ActionSlotsDrawer: View {
                             ShortcutRowGestures(
                                 yieldsToSystemDrag: true,
                                 dragText: shortcut.text,
+                                dragLabel: trimmed.isEmpty ? "shortcut" : shortcut.text,
+                                dragLabelDimmed: trimmed.isEmpty,
                                 onTap: { _ in activate(shortcut, width: width) },
                                 onDoubleTap: { editingID = shortcut.id },
                                 onPressBegan: { location in
@@ -1228,6 +1230,10 @@ struct ActionSlotsDrawer: View {
                 ShortcutRowGestures(
                     yieldsToSystemDrag: true,
                     dragText: button.text,
+                    dragLabel: trimmed.isEmpty ? "action" : button.text,
+                    dragLabelDimmed: trimmed.isEmpty,
+                    dragBadge: button.icon,
+                    previewMatrix: matrixMode.enabled,
                     onTap: { point in
                         guard point.x <= Metrics.iconHitWidth else { return }
                         editingID = nil
@@ -2142,6 +2148,65 @@ private struct IconEditor: UIViewRepresentable {
     }
 }
 
+/// Lifted row. The gesture overlay is clear, and an opaque empty snapshot
+/// lifts as a black bar. This plate matches the row: dark fill, white
+/// label, and, for a hot button, the key badge. An empty badge is still drawn.
+private enum DragLiftPlate {
+    static let plateColor = UIColor(white: 0.22, alpha: 1)
+    static let cornerRadius: CGFloat = 8
+    private static let rowHeight: CGFloat = 48
+    private static let inset: CGFloat = 8
+    private static let badgeSize = CGSize(width: 40, height: 32)
+    private static let badgeGap: CGFloat = 10
+
+    static func view(
+        label: String,
+        dimmed: Bool,
+        badge: String?,
+        matrix: Bool,
+        width: CGFloat
+    ) -> UIView {
+        let font = UIFont.monospacedSystemFont(ofSize: 17, weight: .regular)
+        let measured = ceil((label as NSString).size(withAttributes: [.font: font]).width)
+        let badgeBlock: CGFloat = badge == nil ? 0 : badgeSize.width + badgeGap
+        let fitted = max(120, min(360, measured + badgeBlock + inset * 2))
+        let barWidth = width > 1 ? width : fitted
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: barWidth, height: rowHeight))
+        container.backgroundColor = plateColor
+        container.isOpaque = true
+        container.layer.cornerRadius = cornerRadius
+        container.clipsToBounds = true
+
+        var textX = inset
+        if let badge {
+            let originY = (rowHeight - badgeSize.height) / 2
+            let glyph = UILabel(frame: CGRect(x: inset, y: originY, width: badgeSize.width, height: badgeSize.height))
+            glyph.text = badge
+            glyph.font = UIFont.monospacedSystemFont(ofSize: 17, weight: .bold)
+            glyph.textColor = MatrixShade.display(UIColor(white: 0.92, alpha: 1), enabled: matrix)
+            glyph.textAlignment = .center
+            glyph.backgroundColor = UIColor(white: 1, alpha: 0.12)
+            glyph.isOpaque = false
+            glyph.layer.cornerRadius = cornerRadius
+            glyph.clipsToBounds = true
+            glyph.adjustsFontSizeToFitWidth = true
+            glyph.minimumScaleFactor = 0.5
+            container.addSubview(glyph)
+            textX = inset + badgeSize.width + badgeGap
+        }
+
+        let title = UILabel(frame: CGRect(x: textX, y: 0, width: max(0, barWidth - textX - inset), height: rowHeight))
+        title.text = label
+        title.font = font
+        title.textColor = UIColor(white: 0.92, alpha: dimmed ? 0.35 : 1)
+        title.lineBreakMode = .byTruncatingTail
+        title.backgroundColor = .clear
+        title.isOpaque = false
+        container.addSubview(title)
+        return container
+    }
+}
+
 /// Tap, double tap, and hold on one row. The single tap waits until the
 /// double tap fails, so an edit does not also send. A hold that already
 /// began swallows the tap that follows the finger lifting. A nil double tap
@@ -2154,6 +2219,12 @@ private struct ShortcutRowGestures: UIViewRepresentable {
     /// Action text published as `public.utf8-plain-text` and `public.plain-text`.
     /// The Hot Buttons well and the append bar both accept those types.
     var dragText: String = ""
+    /// Words on the lift preview. The overlay itself has no label.
+    var dragLabel: String = ""
+    var dragLabelDimmed: Bool = false
+    /// Nil on an action. A hot button passes its icon, which may be empty.
+    var dragBadge: String? = nil
+    var previewMatrix: Bool = false
     var onTap: (CGPoint) -> Void
     var onDoubleTap: (() -> Void)?
     var onPressBegan: (CGPoint) -> Void
@@ -2166,6 +2237,7 @@ private struct ShortcutRowGestures: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
         view.backgroundColor = .clear
+        view.isOpaque = false
         view.isAccessibilityElement = false
         let single = UITapGestureRecognizer(
             target: context.coordinator,
@@ -2182,6 +2254,10 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         press.delegate = context.coordinator
         context.coordinator.yieldsToSystemDrag = yieldsToSystemDrag
         context.coordinator.dragText = dragText
+        context.coordinator.dragLabel = dragLabel
+        context.coordinator.dragLabelDimmed = dragLabelDimmed
+        context.coordinator.dragBadge = dragBadge
+        context.coordinator.previewMatrix = previewMatrix
         context.coordinator.onDragEnded = onDragEnded
         if yieldsToSystemDrag {
             let drag = UIDragInteraction(delegate: context.coordinator)
@@ -2223,6 +2299,10 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         let coordinator = context.coordinator
         coordinator.yieldsToSystemDrag = yieldsToSystemDrag
         coordinator.dragText = dragText
+        coordinator.dragLabel = dragLabel
+        coordinator.dragLabelDimmed = dragLabelDimmed
+        coordinator.dragBadge = dragBadge
+        coordinator.previewMatrix = previewMatrix
         coordinator.onTap = onTap
         coordinator.onDoubleTap = onDoubleTap
         coordinator.onPressBegan = onPressBegan
@@ -2240,6 +2320,10 @@ private struct ShortcutRowGestures: UIViewRepresentable {
     final class Coordinator: NSObject, UIGestureRecognizerDelegate, UIDragInteractionDelegate {
         var yieldsToSystemDrag = false
         var dragText = ""
+        var dragLabel = ""
+        var dragLabelDimmed = false
+        var dragBadge: String?
+        var previewMatrix = false
         var onTap: (CGPoint) -> Void = { _ in }
         var onDoubleTap: (() -> Void)?
         var onPressBegan: (CGPoint) -> Void = { _ in }
@@ -2280,6 +2364,27 @@ private struct ShortcutRowGestures: UIViewRepresentable {
             }
             let item = UIDragItem(itemProvider: provider)
             item.localObject = text
+            let label = dragLabel.isEmpty ? text : dragLabel
+            let dimmed = dragLabelDimmed
+            let badge = dragBadge
+            let matrix = previewMatrix
+            let rowWidth = interaction.view?.bounds.width ?? 0
+            item.previewProvider = {
+                let plate = DragLiftPlate.view(
+                    label: label,
+                    dimmed: dimmed,
+                    badge: badge,
+                    matrix: matrix,
+                    width: rowWidth
+                )
+                let parameters = UIDragPreviewParameters()
+                parameters.backgroundColor = DragLiftPlate.plateColor
+                parameters.visiblePath = UIBezierPath(
+                    roundedRect: plate.bounds,
+                    cornerRadius: DragLiftPlate.cornerRadius
+                )
+                return UIDragPreview(view: plate, parameters: parameters)
+            }
             return [item]
         }
 
