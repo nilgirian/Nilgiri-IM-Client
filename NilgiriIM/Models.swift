@@ -660,9 +660,8 @@ struct RoomExitListing: Equatable {
 /// Reads long-exit lines out of game text. ANSI is ignored. The string passed
 /// in is not modified, and nothing here is written back onto a transcript line.
 struct RoomExitScan {
-    /// Last listing committed by an exit line, `None.`, or the pitch-black
-    /// room line. A header by itself leaves this alone so the previous room
-    /// stays up until the new lines arrive.
+    /// Last listing committed by an exit line or `None.`. A header by itself
+    /// leaves this alone so the previous room stays up until the new lines arrive.
     private(set) var listing: RoomExitListing?
     private var collecting = false
     private var doors: [String: RoomExitListing.Door] = [:]
@@ -683,12 +682,6 @@ struct RoomExitScan {
 
     private mutating func consumeLine(_ line: String) {
         if line.isEmpty { return }
-        // `line` is already plain text, split, and trimmed, the same as an
-        // exit line. Exact equality: blindness is a different sentence.
-        if line == Self.pitchBlack {
-            notePitchBlackRoom()
-            return
-        }
         if Self.isHeader(line) {
             collecting = true
             doors = [:]
@@ -708,22 +701,6 @@ struct RoomExitScan {
         }
         collecting = false
     }
-
-    /// Pitch black sends no exits block. Every compass command the direction
-    /// row can send is dark until the next real listing replaces this one.
-    private mutating func notePitchBlackRoom() {
-        collecting = false
-        var darkened: [String: RoomExitListing.Door] = [:]
-        for command in Self.directionCommands {
-            darkened[command] = .dark
-        }
-        doors = darkened
-        listing = RoomExitListing(doors: darkened)
-    }
-
-    /// `You cannot see a damn thing, it is pitch black!`
-    /// Blindness (`you are blind!`) is not this line.
-    private static let pitchBlack = "You cannot see a damn thing, it is pitch black!"
 
     /// `Obvious exits:` on its own line, as `EXITS_LONG` prints it.
     private static func isHeader(_ line: String) -> Bool {
