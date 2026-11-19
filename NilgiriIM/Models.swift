@@ -622,8 +622,8 @@ enum HMVPrompt {
 
 /// One `EXITS_LONG` room listing (`environment exits long_on`).
 /// Nil on the session means no listing has been read yet, so every compass
-/// letter stays available. An empty `doors` map means a listing arrived and
-/// named nothing (`None.`). The scrollback is never edited.
+/// letter stays available. `Obvious exits: none.` stores north, south, east,
+/// west, up, and down as `.dark`. The scrollback is never edited.
 ///
 /// The game prints a header and then one line per exit, with the dash in a
 /// fixed column. A closed door's destination is the keyword in parentheses,
@@ -644,7 +644,8 @@ struct RoomExitListing: Equatable {
     enum Door: Equatable {
         case open
         case closed
-        /// Open exit into an unlit room. The listing prints `(too dark to tell)`.
+        /// Open exit into an unlit room, printed as `(too dark to tell)`, or
+        /// every direction when the listing names none.
         case dark
     }
 
@@ -660,8 +661,9 @@ struct RoomExitListing: Equatable {
 /// Reads long-exit lines out of game text. ANSI is ignored. The string passed
 /// in is not modified, and nothing here is written back onto a transcript line.
 struct RoomExitScan {
-    /// Last listing committed by an exit line or `None.`. A header by itself
-    /// leaves this alone so the previous room stays up until the new lines arrive.
+    /// Last listing committed by an exit line or `Obvious exits: none.`. A
+    /// header by itself leaves this alone so the previous room stays up until
+    /// the new lines arrive.
     private(set) var listing: RoomExitListing?
     private var collecting = false
     private var doors: [String: RoomExitListing.Door] = [:]
@@ -687,13 +689,13 @@ struct RoomExitScan {
             doors = [:]
             return
         }
-        guard collecting else { return }
-        if Self.isNone(line) {
-            doors = [:]
-            collecting = false
-            listing = RoomExitListing(doors: doors)
+        // `Obvious exits: none.` is the whole listing on one line, so it
+        // commits with no header open. `None.` still commits only while one is.
+        if Self.isNone(line), collecting || Self.isEmptyExitsLine(line) {
+            noteNoExits()
             return
         }
+        guard collecting else { return }
         if let exit = Self.exit(on: line) {
             doors[exit.command] = exit.door
             listing = RoomExitListing(doors: doors)
@@ -707,10 +709,31 @@ struct RoomExitScan {
         line.compare("Obvious exits:", options: [.caseInsensitive]) == .orderedSame
     }
 
-    /// A listing that names no direction.
+    /// The game's empty exit list, after the ANSI strip and trim.
+    /// `exitsLong` appends `none.` to `Obvious exits: `, and `exitsShort`
+    /// appends ` none.` to `Obvious exits:`. Both are this one line.
+    private static func isEmptyExitsLine(_ line: String) -> Bool {
+        line.compare("Obvious exits: none.", options: [.caseInsensitive]) == .orderedSame
+    }
+
+    /// A listing that names no direction: the one-line empty list, or
+    /// `None.` on the line after a header.
     private static func isNone(_ line: String) -> Bool {
+        if isEmptyExitsLine(line) { return true }
         let folded = line.lowercased()
         return folded == "none" || folded == "none."
+    }
+
+    /// No direction was named. Every compass command is dark until a later
+    /// listing replaces this one. The transcript text is left as it was.
+    private mutating func noteNoExits() {
+        collecting = false
+        var darkened: [String: RoomExitListing.Door] = [:]
+        for command in Self.directionCommands {
+            darkened[command] = .dark
+        }
+        doors = darkened
+        listing = RoomExitListing(doors: darkened)
     }
 
     /// `North  - (portcullis)`, `East   - Ye Olde Reading Room`, or
