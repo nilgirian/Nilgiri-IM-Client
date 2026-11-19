@@ -1239,12 +1239,8 @@ struct ActionSlotsDrawer: View {
                     matrix: matrixMode.enabled,
                     onText: { menu.updateIcon(id: button.id, icon: $0) },
                     onCommit: {
-                        // The trash sits outside this field. Resigning on the
-                        // touch down would remove it before the touch up lands.
-                        DispatchQueue.main.async {
-                            if editingIconID == button.id {
-                                editingIconID = nil
-                            }
+                        if editingIconID == button.id {
+                            editingIconID = nil
                         }
                     }
                 )
@@ -1281,9 +1277,6 @@ struct ActionSlotsDrawer: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            }
-            if editingIconID == button.id {
-                rowDeleteButton { deleteHotButton(button.id) }
             }
         }
         .frame(maxWidth: .infinity)
@@ -1483,19 +1476,6 @@ struct ActionSlotsDrawer: View {
             }
             menu.removeButton(id: id)
         }
-    }
-
-    /// Trailing trash. Shown while that row's field is up.
-    private func rowDeleteButton(action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: "trash.fill")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(Color.red.opacity(0.9))
-                .frame(width: 44, height: 44)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Delete")
     }
 
     private func moveShortcut(_ id: UUID, by delta: Int) {
