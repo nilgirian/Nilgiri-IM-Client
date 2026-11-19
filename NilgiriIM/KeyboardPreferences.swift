@@ -6,8 +6,8 @@ import UIKit
 /// Missing keys keep the device default. iPhone hides in landscape only.
 /// iPad keeps the keyboard up in both orientations. The hot-button switch
 /// hides letters only; a missing key leaves them showing. Keep last command
-/// defaults off. Show action help defaults on, so the two lines under Actions
-/// stay visible until the switch is turned off. Moving a switch writes the key.
+/// defaults off. Show action help defaults on, so the line under Actions
+/// stays visible until the switch is turned off. Moving a switch writes the key.
 final class KeyboardHidePreferences: ObservableObject {
     @Published var hideInPortrait: Bool {
         didSet { UserDefaults.standard.set(hideInPortrait, forKey: Key.portrait) }
@@ -28,8 +28,8 @@ final class KeyboardHidePreferences: ObservableObject {
         didSet { UserDefaults.standard.set(keepLastCommand, forKey: Key.keepLastCommand) }
     }
 
-    /// The two lines under Actions: hold to delete, double tap to edit.
-    /// Missing key leaves them showing.
+    /// The line under Actions: double tap to edit.
+    /// Missing key leaves it showing.
     @Published var showActionHelp: Bool {
         didSet { UserDefaults.standard.set(showActionHelp, forKey: Key.showActionHelp) }
     }

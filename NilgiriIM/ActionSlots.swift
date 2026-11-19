@@ -790,7 +790,7 @@ struct ActionSlotsDrawer: View {
     var logFrame: CGRect
     /// Word hilited in the log, appended when a shortcut is sent.
     var hilitedWord: String?
-    /// Left-menu switch. On shows the two lines under Actions.
+    /// Left-menu switch. On shows the line under Actions.
     var showActionHelp: Bool
     /// The card settled open or closed. Not called during the drag, so a swipe
     /// that slides back shut does not dismiss the keyboard and bring it back.
@@ -1055,10 +1055,7 @@ struct ActionSlotsDrawer: View {
                 Spacer(minLength: 0)
             }
             if showActionHelp {
-                VStack(alignment: .leading, spacing: 2) {
-                    helpLine("Hold and drag right to delete")
-                    helpLine("Double tap to edit")
-                }
+                helpLine("Double tap to edit")
             }
         }
     }
