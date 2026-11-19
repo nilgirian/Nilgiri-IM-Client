@@ -124,7 +124,26 @@ final class ActionMenuStore: ObservableObject {
         var icon: String
     }
 
+    /// Used only when `im.actionShortcuts` has never been saved. Order is the
+    /// list order. `seedText` stays the legacy loot rewrite target.
+    private static let actionSeed = [
+        seedText,
+        "inventory",
+        "drink water",
+        "eat bread",
+        "yibble",
+    ]
+
+    /// Used only when `im.hotButtons` has never been saved.
     private static let hotSeed: [HotButton] = [
+        HotButton(text: "smile", icon: "S"),
+        HotButton(text: "hit", icon: "H"),
+        HotButton(text: "look", icon: "L"),
+        HotButton(text: "flee", icon: "F"),
+    ]
+
+    /// Factory hot buttons from before smile was added. Still not a player edit.
+    private static let priorHotSeed: [HotButton] = [
         HotButton(text: "hit", icon: "H"),
         HotButton(text: "look", icon: "L"),
         HotButton(text: "flee", icon: "F"),
@@ -132,19 +151,26 @@ final class ActionMenuStore: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
+        let storedShortcuts = defaults.stringArray(forKey: Key.shortcuts)
+        let buttonsMissing = defaults.object(forKey: Key.buttons) == nil
         let loadedButtons: [HotButton]
-        if defaults.object(forKey: Key.buttons) == nil {
-            loadedButtons = Self.hotSeed
-        } else {
-            loadedButtons = Self.migrateLegacyLoot(Self.readButtons(defaults))
-        }
         let loadedShortcuts: [ActionShortcut]
-        if let stored = defaults.stringArray(forKey: Key.shortcuts) {
-            // Count cap plus the legacy loot rewrite. Other saved strings and
-            // their order are kept, and a list at or under the limit is whole.
-            loadedShortcuts = stored.prefix(Self.shortcutLimit).map { ActionShortcut(text: Self.migratedActionText($0)) }
+        // Both keys absent: this device has never saved lists. A saved key,
+        // even an empty one, is left alone. The missing half stays empty.
+        if storedShortcuts == nil && buttonsMissing {
+            loadedButtons = Self.hotSeed
+            loadedShortcuts = Self.actionSeed.map { ActionShortcut(text: $0) }
         } else {
-            loadedShortcuts = [ActionShortcut(text: Self.seedText)]
+            loadedButtons = buttonsMissing ? [] : Self.migrateLegacyLoot(Self.readButtons(defaults))
+            if let storedShortcuts {
+                // Count cap plus the legacy loot rewrite. Other saved strings
+                // and their order are kept, and a list at or under the limit is whole.
+                loadedShortcuts = storedShortcuts.prefix(Self.shortcutLimit).map {
+                    ActionShortcut(text: Self.migratedActionText($0))
+                }
+            } else {
+                loadedShortcuts = []
+            }
         }
         apply(buttons: loadedButtons, shortcuts: loadedShortcuts)
         saveShortcuts()
@@ -469,13 +495,24 @@ final class ActionMenuStore: ObservableObject {
         defaults.set(updatedAt, forKey: SyncKey.updatedAt)
     }
 
-    /// hit / look / flee, in that order, plus the one loot shortcut.
-    /// Text and icon, not row id. A player who edited and then landed
-    /// back on these rows is not a seed: the stored flag says so.
+    /// The current factory lists, or the previous ones (loot plus hit / look /
+    /// flee). Text and icon, not row id. Either pair stays `seeded`, so it is
+    /// not uploaded and a cloud player list replaces it. A player who edited
+    /// and then landed back on these rows is not a seed: the stored flag says so.
     private static func isFactorySeed(buttons: [HotButton], shortcuts: [ActionShortcut]) -> Bool {
-        guard shortcuts.map(\.text) == [seedText] else { return false }
-        guard buttons.count == hotSeed.count else { return false }
-        for (button, seed) in zip(buttons, hotSeed) {
+        matchesSeed(buttons: buttons, shortcuts: shortcuts, hot: hotSeed, actions: actionSeed)
+            || matchesSeed(buttons: buttons, shortcuts: shortcuts, hot: priorHotSeed, actions: [seedText])
+    }
+
+    private static func matchesSeed(
+        buttons: [HotButton],
+        shortcuts: [ActionShortcut],
+        hot: [HotButton],
+        actions: [String]
+    ) -> Bool {
+        guard shortcuts.map(\.text) == actions else { return false }
+        guard buttons.count == hot.count else { return false }
+        for (button, seed) in zip(buttons, hot) {
             if button.text != seed.text || button.icon != seed.icon { return false }
         }
         return true
