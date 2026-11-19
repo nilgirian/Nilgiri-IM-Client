@@ -229,6 +229,28 @@ final class ActionMenuStore: ObservableObject {
         apply(buttons: next, shortcuts: shortcuts)
     }
 
+    /// Rewrite one hot button's words in place. The icon and the slot stay.
+    /// A key already used by another row is refused, so the command stays in
+    /// this list only. Clearing onto the empty key that already exists
+    /// removes the button, the same as an action. `apply` writes the button
+    /// and syncs `im.sync.hotButtons` with the other edits.
+    func updateButtonText(id: UUID, text: String) {
+        guard let index = buttons.firstIndex(where: { $0.id == id }) else { return }
+        guard buttons[index].text != text else { return }
+        let key = Self.matchKey(text)
+        let taken = buttons.contains { $0.id != id && Self.matchKey($0.text) == key }
+            || shortcuts.contains { Self.matchKey($0.text) == key }
+        if taken, key.isEmpty {
+            removeButton(id: id)
+            return
+        }
+        guard taken == false else { return }
+        var next = buttons
+        next[index].text = text
+        rememberedIcons[key] = next[index].icon
+        apply(buttons: next, shortcuts: shortcuts)
+    }
+
     func moveHotButton(from: Int, to: Int) {
         guard buttons.indices.contains(from), buttons.indices.contains(to), from != to else { return }
         var next = buttons
@@ -807,6 +829,8 @@ struct ActionSlotsDrawer: View {
     @State private var editingID: UUID?
     /// Hot-button icon in inline edit. Nil shows every icon as a plate.
     @State private var editingIconID: UUID?
+    /// Hot-button words in inline edit. Same field as an action, including Delete.
+    @State private var editingButtonID: UUID?
     /// A system drop already placed this drag. The finger-up path must not
     /// place it a second time.
     @State private var dropClaimed = false
@@ -933,6 +957,10 @@ struct ActionSlotsDrawer: View {
                 scrollEditingRow(id, proxy: proxy)
             }
             .onChange(of: editingIconID) { _, id in
+                guard let id else { return }
+                scrollEditingRow(id, proxy: proxy)
+            }
+            .onChange(of: editingButtonID) { _, id in
                 guard let id else { return }
                 scrollEditingRow(id, proxy: proxy)
             }
@@ -1098,7 +1126,7 @@ struct ActionSlotsDrawer: View {
                                 dragLabel: trimmed.isEmpty ? "shortcut" : shortcut.text,
                                 dragLabelDimmed: trimmed.isEmpty,
                                 onTap: { _ in activate(shortcut, width: width) },
-                                onDoubleTap: { editingID = shortcut.id },
+                                onDoubleTap: { editShortcut(shortcut.id) },
                                 onPressBegan: { location in
                                     beginDrag(shortcut.id, list: .actions, location: location)
                                 },
@@ -1123,7 +1151,7 @@ struct ActionSlotsDrawer: View {
                         .accessibilityHint(shortcutHint)
                         .accessibilityAddTraits(.isButton)
                         .accessibilityAction { activate(shortcut, width: width) }
-                        .accessibilityAction(named: Text("Edit")) { editingID = shortcut.id }
+                        .accessibilityAction(named: Text("Edit")) { editShortcut(shortcut.id) }
                         .accessibilityAction(named: Text("Delete")) { deleteShortcut(shortcut.id) }
                         .accessibilityAction(named: Text("Move up")) { moveShortcut(shortcut.id, by: -1) }
                         .accessibilityAction(named: Text("Move down")) { moveShortcut(shortcut.id, by: 1) }
@@ -1154,8 +1182,10 @@ struct ActionSlotsDrawer: View {
 
     /// Icon plate and the action text, in list order. The plate is what the
     /// play-screen button shows. Tap the plate to type 0, 1, or 2 characters.
-    /// Hold the row to reorder inside this list. A drag that leaves the list
-    /// removes only that hot button; the action row is a different object.
+    /// Double tap the row to edit the words, the same field an action uses,
+    /// including Delete. Hold the row to reorder inside this list. A drag
+    /// that leaves the list removes only that hot button; the action row is
+    /// a different object.
     /// The well keeps a row of height when the list is empty, and it accepts
     /// the action row's `String` drop there.
     private var hotButtonRows: some View {
@@ -1210,15 +1240,38 @@ struct ActionSlotsDrawer: View {
                 )
                 .frame(width: 40, height: 32)
                 .background(iconPlateFill)
+            } else if editingButtonID == button.id {
+                iconPlate(button.icon)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        editingButtonID = nil
+                        editingIconID = button.id
+                    }
             } else {
                 iconPlate(button.icon)
             }
-            Text(verbatim: trimmed.isEmpty ? "action" : button.text)
-                .font(.system(size: 17, design: .monospaced))
-                .foregroundStyle(Color(white: 0.92).opacity(trimmed.isEmpty ? 0.35 : 1))
-                .lineLimit(1)
-                .truncationMode(.tail)
+            if editingButtonID == button.id {
+                ShortcutEditor(
+                    text: button.text,
+                    placeholder: "action",
+                    fieldLabel: "Hot button text",
+                    onText: { menu.updateButtonText(id: button.id, text: $0) },
+                    onCommit: {
+                        if editingButtonID == button.id {
+                            editingButtonID = nil
+                        }
+                    },
+                    onDelete: { deleteHotButton(button.id) }
+                )
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            } else {
+                Text(verbatim: trimmed.isEmpty ? "action" : button.text)
+                    .font(.system(size: 17, design: .monospaced))
+                    .foregroundStyle(Color(white: 0.92).opacity(trimmed.isEmpty ? 0.35 : 1))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            }
             if editingIconID == button.id {
                 rowDeleteButton { deleteHotButton(button.id) }
             }
@@ -1226,7 +1279,7 @@ struct ActionSlotsDrawer: View {
         .frame(maxWidth: .infinity)
         .frame(height: Metrics.rowStride)
         .overlay {
-            if editingIconID != button.id {
+            if editingIconID != button.id, editingButtonID != button.id {
                 ShortcutRowGestures(
                     yieldsToSystemDrag: true,
                     dragText: button.text,
@@ -1237,9 +1290,10 @@ struct ActionSlotsDrawer: View {
                     onTap: { point in
                         guard point.x <= Metrics.iconHitWidth else { return }
                         editingID = nil
+                        editingButtonID = nil
                         editingIconID = button.id
                     },
-                    onDoubleTap: nil,
+                    onDoubleTap: { editHotButtonText(button.id) },
                     onPressBegan: { location in
                         beginDrag(button.id, list: .hotButtons, location: location)
                     },
@@ -1256,12 +1310,14 @@ struct ActionSlotsDrawer: View {
         .opacity(hotRowOpacity(index: index))
         .zIndex(dragging ? 1 : 0)
         .id(button.id)
-        .accessibilityElement(children: editingIconID == button.id ? .contain : .ignore)
+        .accessibilityElement(children: editingIconID == button.id || editingButtonID == button.id ? .contain : .ignore)
         .accessibilityLabel(trimmed.isEmpty ? "Empty hot button" : button.text)
         .accessibilityValue(button.icon.isEmpty ? "No icon" : "Icon \(button.icon)")
-        .accessibilityHint("Drag out of hot buttons to move it back to actions")
+        .accessibilityHint("Double tap to edit. Drag out of hot buttons to move it back to actions")
+        .accessibilityAction(named: Text("Edit")) { editHotButtonText(button.id) }
         .accessibilityAction(named: Text("Edit icon")) {
             editingID = nil
+            editingButtonID = nil
             editingIconID = button.id
         }
         .accessibilityAction(named: Text("Delete")) { deleteHotButton(button.id) }
@@ -1335,6 +1391,7 @@ struct ActionSlotsDrawer: View {
         if open == false {
             editingID = nil
             editingIconID = nil
+            editingButtonID = nil
             heldActive = false
             held = nil
             hotDropTargeted = false
@@ -1350,8 +1407,21 @@ struct ActionSlotsDrawer: View {
 
     private func addShortcut() {
         guard let id = menu.addBlank() else { return }
+        editShortcut(id)
+    }
+
+    /// One editor at a time. Opening an action closes a hot-button field.
+    private func editShortcut(_ id: UUID) {
         editingIconID = nil
+        editingButtonID = nil
         editingID = id
+    }
+
+    /// Same field an action uses, on this hot button. The slot does not move.
+    private func editHotButtonText(_ id: UUID) {
+        editingID = nil
+        editingIconID = nil
+        editingButtonID = id
     }
 
     /// Single tap. A shortcut is sent and the card closes. The joined command
@@ -1359,12 +1429,12 @@ struct ActionSlotsDrawer: View {
     /// tap opens the inline editor instead of closing the card.
     private func activate(_ shortcut: ActionShortcut, width: CGFloat) {
         guard let command = ActionShortcut.command(text: shortcut.text, target: hilitedWord) else {
-            editingIconID = nil
-            editingID = shortcut.id
+            editShortcut(shortcut.id)
             return
         }
         editingID = nil
         editingIconID = nil
+        editingButtonID = nil
         settleCard(open: false, width: width)
         onSend(command)
     }
@@ -1392,6 +1462,9 @@ struct ActionSlotsDrawer: View {
     private func deleteHotButton(_ id: UUID) {
         if editingIconID == id {
             editingIconID = nil
+        }
+        if editingButtonID == id {
+            editingButtonID = nil
         }
         withAnimation(.easeOut(duration: 0.18)) {
             if held?.id == id {
@@ -1426,7 +1499,7 @@ struct ActionSlotsDrawer: View {
     }
 
     private func beginDrag(_ id: UUID, list: DragList, location: CGPoint) {
-        guard editingID == nil, editingIconID == nil else { return }
+        guard editingID == nil, editingIconID == nil, editingButtonID == nil else { return }
         let index: Int?
         switch list {
         case .actions:
@@ -1807,7 +1880,7 @@ struct ActionSlotsDrawer: View {
     /// under the keys on a short landscape window.
     private func scrollEditingRow(_ id: UUID, proxy: ScrollViewProxy) {
         func align() {
-            guard editingID == id || editingIconID == id else { return }
+            guard editingID == id || editingIconID == id || editingButtonID == id else { return }
             proxy.scrollTo(id, anchor: UnitPoint(x: 0, y: 0.12))
         }
         DispatchQueue.main.async(execute: align)
@@ -1821,6 +1894,8 @@ struct ActionSlotsDrawer: View {
 /// so the command field stays resigned until the card closes.
 private struct ShortcutEditor: UIViewRepresentable {
     var text: String
+    var placeholder: String = "shortcut"
+    var fieldLabel: String = "Shortcut text"
     var onText: (String) -> Void
     var onCommit: () -> Void
     var onDelete: () -> Void
@@ -1843,11 +1918,7 @@ private struct ShortcutEditor: UIViewRepresentable {
         field.autocapitalizationType = .none
         field.keyboardAppearance = .dark
         field.adjustsFontForContentSizeCategory = false
-        field.attributedPlaceholder = NSAttributedString(
-            string: "shortcut",
-            attributes: [.foregroundColor: UIColor(white: 0.92, alpha: 0.35)]
-        )
-        field.accessibilityLabel = "Shortcut text"
+        applyChrome(field)
         field.setContentHuggingPriority(.defaultLow, for: .horizontal)
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         field.addTarget(
@@ -1891,11 +1962,20 @@ private struct ShortcutEditor: UIViewRepresentable {
         return CGSize(width: width, height: 48)
     }
 
+    private func applyChrome(_ field: UITextField) {
+        field.accessibilityLabel = fieldLabel
+        field.attributedPlaceholder = NSAttributedString(
+            string: placeholder,
+            attributes: [.foregroundColor: UIColor(white: 0.92, alpha: 0.35)]
+        )
+    }
+
     func updateUIView(_ field: UITextField, context: Context) {
         let coordinator = context.coordinator
         coordinator.onText = onText
         coordinator.onCommit = onCommit
         coordinator.onDelete = onDelete
+        applyChrome(field)
         if field.markedTextRange == nil, field.text != text {
             coordinator.applying = true
             field.text = text
