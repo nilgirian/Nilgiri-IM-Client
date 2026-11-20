@@ -3087,7 +3087,7 @@ struct TranscriptView: View {
         Button {
             session.openCharacterPicker()
         } label: {
-            Text(session.character ?? (session.choosingCharacter ? "Choose" : "IM"))
+            Text(session.displayedCharacter ?? (session.choosingCharacter ? "Choose" : "IM"))
                 .font(.system(size: 12, weight: .semibold, design: .monospaced))
                 .foregroundStyle(Color.primary.matrix)
                 .lineLimit(1)
@@ -4176,7 +4176,7 @@ private struct CharacterPickerSheet: View {
     private var characterRows: some View {
         ForEach(session.rosterNames, id: \.self) { name in
             CharacterPickerRow(
-                name: name,
+                name: session.displayedName(for: name),
                 current: session.isCurrentCharacter(name),
                 matrix: matrixMode.enabled
             ) {
