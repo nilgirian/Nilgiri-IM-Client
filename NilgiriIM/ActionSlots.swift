@@ -168,8 +168,9 @@ final class ActionMenuStore: ObservableObject {
     private var rememberedIcons: [String: String] = [:]
 
     /// True while this device still has the untouched factory lists.
-    /// A player edit clears it, and it is never set again. Factory seeds
-    /// are not uploaded.
+    /// A player edit of either list clears it, and it is never set again.
+    /// Factory lists are not uploaded. A menu switch does not clear it:
+    /// an untouched switch is a missing key, and that default is not uploaded.
     private var seeded = true
     /// True after this launch, or an earlier one, has reconciled against
     /// a known cloud snapshot. Later updates follow `updatedAt`.
@@ -187,6 +188,9 @@ final class ActionMenuStore: ObservableObject {
     private var cloudSyncScheduled = false
     private var cloudObserver: NSObjectProtocol?
     private var identityObserver: NSObjectProtocol?
+    private var settingsObserver: NSObjectProtocol?
+    /// A switch moved while a reconcile was already on the stack.
+    private var settingsEditPending = false
     /// Character whose lists are loaded. Switching reloads that character's keys.
     private var loadedFor = ""
 
@@ -197,7 +201,8 @@ final class ActionMenuStore: ObservableObject {
 
     /// Cloud copy of the two local payloads, plus the stamp and the seed
     /// flag. `merged` stays in UserDefaults: it is this device's memory
-    /// that the first reconciliation already happened.
+    /// that the first reconciliation already happened. Menu switches use
+    /// the same `updatedAt` and are stored beside these keys.
     private enum SyncKey {
         static let shortcuts = "im.sync.actionShortcuts"
         static let buttons = "im.sync.hotButtons"
@@ -297,6 +302,9 @@ final class ActionMenuStore: ObservableObject {
         }
         if let identityObserver {
             center.removeObserver(identityObserver)
+        }
+        if let settingsObserver {
+            center.removeObserver(settingsObserver)
         }
     }
 
@@ -661,10 +669,16 @@ final class ActionMenuStore: ObservableObject {
         var updatedAt: TimeInterval
         var seeded: Bool
         var exists: Bool
+        /// True when an Actions or Hot Buttons key is present. Switch keys
+        /// alone are not a list blob.
+        var hasListPayload: Bool
+        /// Switch bases present in iCloud. Absent keys were never changed.
+        var switches: [String: Bool]
 
-        /// Player data. A blob still marked as the factory seed is not one,
-        /// and neither is a store that has never been written.
-        var hasPlayerData: Bool { exists && seeded == false }
+        /// Player lists. A factory seed, a missing list payload, and a store
+        /// that has never been written are not player lists. Switch keys
+        /// alone must not replace Actions or Hot Buttons.
+        var hasPlayerData: Bool { hasListPayload && seeded == false }
     }
 
     /// The flag is missing on the first launch after this sync ships.
@@ -743,6 +757,15 @@ final class ActionMenuStore: ObservableObject {
             ) { [weak self] _ in
                 self?.iCloudAccountChanged()
             }
+            // Synchronous so the stamp is updated before any reconcile that
+            // the toggle's own turn might already be inside.
+            settingsObserver = center.addObserver(
+                forName: .imMenuSettingsEdited,
+                object: nil,
+                queue: nil
+            ) { [weak self] _ in
+                self?.noteSettingEdit()
+            }
         }
         pullCloud()
     }
@@ -756,7 +779,7 @@ final class ActionMenuStore: ObservableObject {
     /// that already has keys can merge now. An empty cache waits for
     /// `didChangeExternallyNotification`, which is the initial download.
     private func pullCloud() {
-        guard iCloudAvailable else { return }
+        guard iCloudAvailable, CharacterPreferenceScope.key.isEmpty == false else { return }
         let store = NSUbiquitousKeyValueStore.default
         _ = store.synchronize()
         let cloud = readCloud()
@@ -774,7 +797,7 @@ final class ActionMenuStore: ObservableObject {
             }
             return
         }
-        guard iCloudAvailable else { return }
+        guard iCloudAvailable, CharacterPreferenceScope.key.isEmpty == false else { return }
         let reason = Self.changeReason(in: note)
         if reason == NSUbiquitousKeyValueStoreQuotaViolationChange { return }
         // A different iCloud account replaces the store. Reconcile once
@@ -791,7 +814,9 @@ final class ActionMenuStore: ObservableObject {
     }
 
     /// First snapshot: upload, adopt, or union. After `merged`, the newer
-    /// `updatedAt` replaces both lists. A tied stamp changes nothing.
+    /// `updatedAt` replaces both lists. A tied stamp does not replace lists.
+    /// Menu switches use that same stamp. A switch the player never changed
+    /// is left out, so the default cannot overwrite a synced value.
     private func reconcile(_ cloud: CloudLists, cloudKnown: Bool) {
         if reconciling {
             reconcileAgain = true
@@ -799,12 +824,20 @@ final class ActionMenuStore: ObservableObject {
         }
         reconciling = true
         reconcileAgain = false
+        if cloudKnown {
+            absorbRemoteSwitches(cloud, preferRemote: cloud.updatedAt > updatedAt)
+        }
         if merged == false {
             if cloudKnown {
-                let upload: Bool
+                let uploadLists: Bool
                 if cloud.hasPlayerData && seeded {
+                    let localStamp = updatedAt
                     adopt(cloud)
-                    upload = false
+                    if switchesNeedUpload(cloud), localStamp > cloud.updatedAt {
+                        updatedAt = localStamp
+                        UserDefaults.standard.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
+                    }
+                    uploadLists = false
                 } else if cloud.hasPlayerData {
                     let united = Self.unionLists(
                         localButtons: buttons,
@@ -815,41 +848,95 @@ final class ActionMenuStore: ObservableObject {
                     replaceFromSync(buttons: united.buttons, shortcuts: united.shortcuts)
                     seeded = false
                     updatedAt = Date().timeIntervalSince1970
-                    upload = true
+                    uploadLists = true
                 } else if seeded == false {
                     if updatedAt <= 0 {
                         updatedAt = Date().timeIntervalSince1970
                     }
-                    upload = true
+                    uploadLists = true
                 } else {
-                    upload = false
+                    uploadLists = false
                 }
                 merged = true
                 storeSyncFlags()
-                if upload {
+                if uploadLists {
                     writeCloud(updatedAt: updatedAt)
+                } else {
+                    uploadSwitchesIfNeeded(cloud)
                 }
             }
         } else if cloud.hasPlayerData == false {
-            // No player blob in the cloud. A customized device still uploads,
+            // No player lists in the cloud. A customized device still uploads,
             // including when this device has never stamped a write.
+            // Switch-only keys are not player lists.
             if seeded == false && updatedAt <= cloud.updatedAt {
                 updatedAt = Date().timeIntervalSince1970
                 UserDefaults.standard.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
             }
             if seeded == false && updatedAt > cloud.updatedAt {
                 writeCloud(updatedAt: updatedAt)
+            } else {
+                uploadSwitchesIfNeeded(cloud)
             }
         } else if cloud.updatedAt > updatedAt {
             adopt(cloud)
+            uploadSwitchesIfNeeded(cloud)
         } else if cloud.updatedAt < updatedAt && seeded == false {
             writeCloud(updatedAt: updatedAt)
+        } else {
+            uploadSwitchesIfNeeded(cloud)
         }
         reconciling = false
+        if settingsEditPending {
+            settingsEditPending = false
+            noteSettingEdit()
+        }
         if reconcileAgain {
             reconcileAgain = false
             reconcile(readCloud(), cloudKnown: true)
         }
+    }
+
+    /// Takes synced switches this character has never stored. When the cloud
+    /// stamp is newer, a stored switch takes the cloud value too. A local
+    /// default is never written, and a missing cloud key is never cleared.
+    private func absorbRemoteSwitches(_ cloud: CloudLists, preferRemote: Bool) {
+        guard cloud.switches.isEmpty == false else { return }
+        guard CharacterPreferenceScope.key.isEmpty == false else { return }
+        let defaults = UserDefaults.standard
+        var incoming: [String: Bool] = [:]
+        for (base, value) in cloud.switches {
+            let key = localKey(base)
+            let present = defaults.object(forKey: key) != nil
+            if present == false || (preferRemote && defaults.bool(forKey: key) != value) {
+                incoming[base] = value
+            }
+        }
+        guard CharacterMenuSwitch.apply(incoming) else { return }
+        NotificationCenter.default.post(name: .imMenuSettingsApplied, object: nil)
+    }
+
+    /// True when a stored switch is missing from the cloud or differs from it.
+    /// Untouched defaults are not stored, so they cannot ask for an upload.
+    private func switchesNeedUpload(_ cloud: CloudLists) -> Bool {
+        for (base, value) in CharacterMenuSwitch.stored() {
+            guard let remote = cloud.switches[base] else { return true }
+            if remote != value { return true }
+        }
+        return false
+    }
+
+    /// Publishes stored switches without sending the list payloads. Used when
+    /// the lists are still the factory seed, or when a tied list stamp must
+    /// stay put. Never rewinds `updatedAt`.
+    private func uploadSwitchesIfNeeded(_ cloud: CloudLists) {
+        guard switchesNeedUpload(cloud) else { return }
+        if updatedAt <= cloud.updatedAt {
+            updatedAt = Date().timeIntervalSince1970
+            UserDefaults.standard.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
+        }
+        guard updatedAt > cloud.updatedAt else { return }
+        writeCloud(updatedAt: updatedAt, includeLists: false)
     }
 
     /// Take the cloud lists. The seed flag clears first so a crash in
@@ -966,6 +1053,22 @@ final class ActionMenuStore: ObservableObject {
         scheduleCloudPush()
     }
 
+    /// A left-menu switch moved. Factory lists stay out because `seeded` is
+    /// still set. Lists the player has edited ride along, so an edit made
+    /// while iCloud was unreachable is not left behind. The stamp is the
+    /// same `updatedAt` the lists use.
+    private func noteSettingEdit() {
+        guard tracksEdits, CharacterPreferenceScope.key.isEmpty == false else { return }
+        if reconciling {
+            settingsEditPending = true
+            return
+        }
+        updatedAt = Date().timeIntervalSince1970
+        UserDefaults.standard.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
+        writeCloud(updatedAt: updatedAt, push: false)
+        scheduleCloudPush()
+    }
+
     private func scheduleCloudPush() {
         guard cloudSyncScheduled == false, iCloudAvailable else { return }
         cloudSyncScheduled = true
@@ -977,17 +1080,28 @@ final class ActionMenuStore: ObservableObject {
         }
     }
 
-    /// No-op when iCloud is signed out, or while the lists are still the
-    /// factory seed. Payloads go out first and `updatedAt` last. Nothing
-    /// is written unless the hot-button JSON encodes, so a partial blob
-    /// cannot wipe the other list.
-    private func writeCloud(updatedAt stamp: TimeInterval, push: Bool = true) {
-        guard iCloudAvailable, seeded == false else { return }
-        guard let data = Self.buttonData(buttons) else { return }
+    /// No-op when iCloud is signed out. Factory lists stay out while `seeded`
+    /// is set, and `includeLists` is false for a switch-only upload so those
+    /// lists are not rewritten. A switch is written only when this character
+    /// has stored it. Payloads go out first and `updatedAt` last. Nothing
+    /// is written unless the hot-button JSON encodes when lists go out, so a
+    /// partial blob cannot wipe the other list.
+    private func writeCloud(updatedAt stamp: TimeInterval, push: Bool = true, includeLists: Bool = true) {
+        guard iCloudAvailable, CharacterPreferenceScope.key.isEmpty == false else { return }
         let store = NSUbiquitousKeyValueStore.default
-        store.set(Self.shortcutPayload(shortcuts), forKey: localKey(SyncKey.shortcuts))
-        store.set(data, forKey: localKey(SyncKey.buttons))
-        store.set(false, forKey: localKey(SyncKey.seeded))
+        var wrote = false
+        if includeLists && seeded == false {
+            guard let data = Self.buttonData(buttons) else { return }
+            store.set(Self.shortcutPayload(shortcuts), forKey: localKey(SyncKey.shortcuts))
+            store.set(data, forKey: localKey(SyncKey.buttons))
+            store.set(false, forKey: localKey(SyncKey.seeded))
+            wrote = true
+        }
+        for (base, value) in CharacterMenuSwitch.stored() {
+            store.set(value, forKey: localKey(CharacterMenuSwitch.syncBase(base)))
+            wrote = true
+        }
+        guard wrote else { return }
         store.set(stamp, forKey: localKey(SyncKey.updatedAt))
         if push {
             _ = store.synchronize()
@@ -1002,7 +1116,8 @@ final class ActionMenuStore: ObservableObject {
         let shortcutsValue = store.object(forKey: localKey(SyncKey.shortcuts))
         let buttonsValue = store.object(forKey: localKey(SyncKey.buttons))
         let updatedValue = store.object(forKey: localKey(SyncKey.updatedAt))
-        let exists = shortcutsValue != nil || buttonsValue != nil || updatedValue != nil
+        let switches = cloudSwitches(in: store)
+        let exists = shortcutsValue != nil || buttonsValue != nil || updatedValue != nil || switches.isEmpty == false
         let cloudShortcuts = Self.shortcuts(from: shortcutsValue)
         let cloudButtons = Self.migrateLegacyLoot(Self.buttons(from: store.data(forKey: localKey(SyncKey.buttons))))
         return CloudLists(
@@ -1010,8 +1125,22 @@ final class ActionMenuStore: ObservableObject {
             shortcuts: cloudShortcuts,
             updatedAt: store.double(forKey: localKey(SyncKey.updatedAt)),
             seeded: store.bool(forKey: localKey(SyncKey.seeded)),
-            exists: exists
+            exists: exists,
+            hasListPayload: shortcutsValue != nil || buttonsValue != nil,
+            switches: switches
         )
+    }
+
+    /// Switch keys present for this character. A missing key is not the
+    /// default: the player on the other device never changed that switch.
+    private func cloudSwitches(in store: NSUbiquitousKeyValueStore) -> [String: Bool] {
+        var values: [String: Bool] = [:]
+        for base in CharacterMenuSwitch.bases {
+            let key = localKey(CharacterMenuSwitch.syncBase(base))
+            guard store.object(forKey: key) != nil else { continue }
+            values[base] = store.bool(forKey: key)
+        }
+        return values
     }
 
     private static func changeReason(in note: Notification) -> Int? {

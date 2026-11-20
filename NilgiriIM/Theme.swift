@@ -28,31 +28,61 @@ final class MatrixMode: ObservableObject {
     static let shared = MatrixMode()
 
     @Published var enabled: Bool {
-        didSet { UserDefaults.standard.set(enabled, forKey: Self.scopedKey) }
+        didSet {
+            guard enabled != oldValue else { return }
+            storeEnabled()
+        }
     }
 
     private enum Key {
-        static let enabled = "im.matrixMode"
+        static let enabled = CharacterMenuSwitch.matrixMode
     }
 
     /// Character whose key is loaded. A switch reads that character's value.
     private var loadedFor = ""
+    /// False while applying a load or a cloud value, so the default is not
+    /// stored for a character who has never moved the switch.
+    private var stores = false
+    private var appliedObserver: NSObjectProtocol?
 
     private init() {
         enabled = Self.read()
         loadedFor = CharacterPreferenceScope.key
+        stores = true
+        appliedObserver = NotificationCenter.default.addObserver(
+            forName: .imMenuSettingsApplied,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.reload(force: true)
+        }
+    }
+
+    deinit {
+        if let appliedObserver {
+            NotificationCenter.default.removeObserver(appliedObserver)
+        }
     }
 
     /// Loads Matrix Mode for the character currently in scope.
     /// A missing key stays off, which is the fresh-install default.
-    func reload() {
+    /// `force` rereads after iCloud applied a newer value for this same character.
+    func reload(force: Bool = false) {
         let key = CharacterPreferenceScope.key
-        guard key != loadedFor else { return }
+        guard force || key != loadedFor else { return }
         loadedFor = key
         let next = Self.read()
-        if enabled != next {
-            enabled = next
-        }
+        guard enabled != next else { return }
+        stores = false
+        enabled = next
+        stores = true
+    }
+
+    /// A player edit. Loading another character must not create their key.
+    private func storeEnabled() {
+        guard stores else { return }
+        UserDefaults.standard.set(enabled, forKey: Self.scopedKey)
+        NotificationCenter.default.post(name: .imMenuSettingsEdited, object: nil)
     }
 
     private static var scopedKey: String {

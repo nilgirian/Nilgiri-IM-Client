@@ -103,6 +103,68 @@ enum CharacterPreferenceScope {
     }
 }
 
+extension Notification.Name {
+    /// A player moved a left-menu switch. The menu store uploads that character.
+    static let imMenuSettingsEdited = Notification.Name("im.menuSettingsEdited")
+    /// iCloud applied switch values for the character in scope. Readers reload.
+    static let imMenuSettingsApplied = Notification.Name("im.menuSettingsApplied")
+}
+
+/// Left-menu switches that sync with Actions and Hot Buttons. A missing
+/// UserDefaults key is the untouched default: it is not uploaded and it
+/// does not replace a value iCloud already has for this character.
+enum CharacterMenuSwitch {
+    static let portrait = "im.hideKeyboardPortrait"
+    static let landscape = "im.hideKeyboardLandscape"
+    static let hotButtonLabels = "im.hideHotButtonLabels"
+    static let keepLastCommand = "im.keepLastCommand"
+    static let showActionHelp = "im.showActionHelp"
+    static let matrixMode = "im.matrixMode"
+
+    static let bases = [
+        portrait,
+        landscape,
+        hotButtonLabels,
+        keepLastCommand,
+        showActionHelp,
+        matrixMode,
+    ]
+
+    /// Cloud key before the per-character suffix. `im.matrixMode` becomes
+    /// `im.sync.matrixMode`, then `.<lowercased character>` like the list keys.
+    static func syncBase(_ base: String) -> String {
+        "im.sync.\(base.dropFirst(3))"
+    }
+
+    /// Switches this character has actually stored. Missing keys are omitted.
+    static func stored() -> [String: Bool] {
+        let defaults = UserDefaults.standard
+        var values: [String: Bool] = [:]
+        for base in bases {
+            let key = CharacterPreferenceScope.storageKey(base)
+            guard defaults.object(forKey: key) != nil else { continue }
+            values[base] = defaults.bool(forKey: key)
+        }
+        return values
+    }
+
+    /// Writes synced values for this character. Returns whether any key changed.
+    @discardableResult
+    static func apply(_ values: [String: Bool]) -> Bool {
+        let defaults = UserDefaults.standard
+        var changed = false
+        for base in bases {
+            guard let value = values[base] else { continue }
+            let key = CharacterPreferenceScope.storageKey(base)
+            if defaults.object(forKey: key) == nil || defaults.bool(forKey: key) != value {
+                defaults.set(value, forKey: key)
+                changed = true
+            }
+        }
+        return changed
+    }
+}
+
 /// Whether sending a command, or turning the window, dismisses the keyboard.
 /// Also whether the input line keeps the last command as grey placeholder text.
 /// Missing keys keep the device default. iPhone hides in landscape only.
@@ -117,30 +179,46 @@ final class KeyboardHidePreferences: ObservableObject {
     /// `load` also clears this so a character switch does not write the
     /// previous character's values into the new keys.
     private var saves = false
+    private var appliedObserver: NSObjectProtocol?
 
     @Published var hideInPortrait = false {
-        didSet { store(hideInPortrait, Key.portrait) }
+        didSet {
+            guard hideInPortrait != oldValue else { return }
+            store(hideInPortrait, Key.portrait)
+        }
     }
 
     @Published var hideInLandscape = false {
-        didSet { store(hideInLandscape, Key.landscape) }
+        didSet {
+            guard hideInLandscape != oldValue else { return }
+            store(hideInLandscape, Key.landscape)
+        }
     }
 
     /// Hide the letter on each on-screen hot button. The plate stays, and it still lights.
     @Published var hideHotButtonLabels = false {
-        didSet { store(hideHotButtonLabels, Key.hotButtonLabels) }
+        didSet {
+            guard hideHotButtonLabels != oldValue else { return }
+            store(hideHotButtonLabels, Key.hotButtonLabels)
+        }
     }
 
     /// Grey placeholder of the last command sent from the input line.
     /// Return on an empty field sends that text. Off leaves the placeholder blank.
     @Published var keepLastCommand = false {
-        didSet { store(keepLastCommand, Key.keepLastCommand) }
+        didSet {
+            guard keepLastCommand != oldValue else { return }
+            store(keepLastCommand, Key.keepLastCommand)
+        }
     }
 
     /// The line under Actions: double tap to edit.
     /// Missing key leaves it showing.
     @Published var showActionHelp = true {
-        didSet { store(showActionHelp, Key.showActionHelp) }
+        didSet {
+            guard showActionHelp != oldValue else { return }
+            store(showActionHelp, Key.showActionHelp)
+        }
     }
 
     private enum Key {
@@ -158,13 +236,27 @@ final class KeyboardHidePreferences: ObservableObject {
         load()
         loadedFor = CharacterPreferenceScope.key
         saves = true
+        appliedObserver = NotificationCenter.default.addObserver(
+            forName: .imMenuSettingsApplied,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.reload(force: true)
+        }
+    }
+
+    deinit {
+        if let appliedObserver {
+            NotificationCenter.default.removeObserver(appliedObserver)
+        }
     }
 
     /// Loads the character `CharacterPreferenceScope` currently names.
     /// A missing key uses the fresh-install default, not another character's value.
-    func reload() {
+    /// `force` rereads after iCloud applied a newer value for this same character.
+    func reload(force: Bool = false) {
         let key = CharacterPreferenceScope.key
-        guard key != loadedFor else { return }
+        guard force || key != loadedFor else { return }
         load()
         loadedFor = key
     }
@@ -183,10 +275,12 @@ final class KeyboardHidePreferences: ObservableObject {
     }
 
     /// A switch the player moved. `load` turns this off so reading a character
-    /// does not write that character's keys.
+    /// does not write that character's keys. Writing the key is what makes the
+    /// value eligible to sync. A missing key stays the untouched default.
     private func store(_ value: Bool, _ base: String) {
         guard saves else { return }
         UserDefaults.standard.set(value, forKey: scoped(base))
+        NotificationCenter.default.post(name: .imMenuSettingsEdited, object: nil)
     }
 
     private func scoped(_ base: String) -> String {
