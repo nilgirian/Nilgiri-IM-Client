@@ -137,6 +137,23 @@ private enum CommunicationCommand {
     }
 }
 
+/// TinTin++ command separator. Only a command-mode submit (Return or Send)
+/// splits on `;`. Whitespace around each piece is dropped, and empty pieces
+/// are dropped, so `n;;  ;n ;` is `n` then `n`. A line of only separators
+/// has no pieces. Say, hot buttons, compass directions, and saved actions
+/// do not use this. Text from the server is never passed through it.
+private enum CommandSeparator {
+    static func pieces(in line: String) -> [String] {
+        var pieces: [String] = []
+        for piece in line.split(separator: ";", omittingEmptySubsequences: false) {
+            let trimmed = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.isEmpty == false else { continue }
+            pieces.append(trimmed)
+        }
+        return pieces
+    }
+}
+
 /// SGR colour carried across transcript rows. Keyed by line id so a 4000-line
 /// buffer is not reparsed on scroll: only a changed suffix is scanned, and a
 /// separator passes the previous colour through. Surviving ids keep the end
@@ -2360,10 +2377,18 @@ private final class CommandTextField: UITextField {
 /// Return still calls `onSubmit`; the caller sends the hint when the field
 /// is empty.
 ///
+/// The line holds at most `maxCommandLength` UTF-16 code units. Command and
+/// say share this field. A keystroke past the cap is refused. A paste that
+/// would pass it keeps the leading characters that still fit, at the caret.
+///
 /// Traits are set once. `textInputMode` is not overridden, and
 /// `becomeFirstResponder` is not called from `updateUIView`: doing either
 /// restarts the input session, the caret blinks, and the keyboard never attaches.
 private struct CommandLineField: UIViewRepresentable {
+    /// Typed and pasted text, in UTF-16 code units. `shouldChangeCharactersIn`
+    /// reports its range in those units.
+    static let maxCommandLength = 512
+
     @Binding var text: String
     @Binding var isFocused: Bool
     /// Hide switch for the orientation on screen. Return dismisses only then.
@@ -2509,6 +2534,76 @@ private struct CommandLineField: UIViewRepresentable {
         @objc func editingChanged(_ field: UITextField) {
             guard applyingText == false else { return }
             textChanged(field.text ?? "")
+        }
+
+        /// Cap the line at `maxCommandLength` UTF-16 units. A change that
+        /// fits is left to the field. A keystroke that does not fit is
+        /// refused. A longer paste keeps the leading characters that fit
+        /// in the room left by the replaced range, inserted there.
+        func textField(
+            _ textField: UITextField,
+            shouldChangeCharactersIn range: NSRange,
+            replacementString string: String
+        ) -> Bool {
+            if applyingText { return false }
+            let current = textField.text ?? ""
+            let nsCurrent = current as NSString
+            guard range.location != NSNotFound, NSMaxRange(range) <= nsCurrent.length else {
+                return false
+            }
+            let currentLength = nsCurrent.length
+            let replacementLength = (string as NSString).length
+            let resulting = currentLength - range.length + replacementLength
+            if resulting <= CommandLineField.maxCommandLength {
+                return true
+            }
+            // Still over the cap. A delete, or a replacement that does not
+            // grow the line, stays so an over-long value can be edited down.
+            if resulting <= currentLength {
+                return true
+            }
+            let room = CommandLineField.maxCommandLength - (currentLength - range.length)
+            let clipped = Self.prefixFitting(string, maxUnits: room)
+            guard clipped.isEmpty == false else { return false }
+            if (clipped as NSString).length >= replacementLength {
+                return true
+            }
+            let next = nsCurrent.replacingCharacters(in: range, with: clipped)
+            let caret = range.location + (clipped as NSString).length
+            applyingText = true
+            textField.text = next
+            applyingText = false
+            textChanged(next)
+            // UIKit restores the pre-change selection after this method
+            // returns false. Place the caret after the kept paste once that
+            // settles, without resigning the field.
+            DispatchQueue.main.async { [weak textField] in
+                guard let textField, textField.text == next else { return }
+                guard let position = textField.position(
+                    from: textField.beginningOfDocument,
+                    offset: caret
+                ), let selection = textField.textRange(from: position, to: position) else {
+                    return
+                }
+                textField.selectedTextRange = selection
+            }
+            return false
+        }
+
+        /// Leading Swift characters of `string` whose UTF-16 length is at
+        /// most `maxUnits`. A character that would pass the budget is left
+        /// out whole, so a surrogate pair is never split.
+        private static func prefixFitting(_ string: String, maxUnits: Int) -> String {
+            guard maxUnits > 0, string.isEmpty == false else { return "" }
+            var fitted = ""
+            var used = 0
+            for character in string {
+                let units = character.utf16.count
+                if used + units > maxUnits { break }
+                fitted.append(character)
+                used += units
+            }
+            return fitted
         }
 
         /// Hide-off: any log tap must not resign. Returning false leaves this
@@ -2664,10 +2759,11 @@ struct TranscriptView: View {
     @StateObject private var keyboardPrefs = KeyboardHidePreferences()
     @StateObject private var matrixMode = MatrixMode.shared
     /// Last non-communication line posted from the input bar (Return or Send).
-    /// Speech, channels, and the Say button leave this unchanged. Compass
-    /// directions and hot buttons do not replace it. Shown greyed out, and
-    /// repeated from an empty field, only while Keep last command is on.
-    /// Kept for this play screen, not on disk.
+    /// A line split on `;` is stored whole, once, not as each piece. Speech,
+    /// channels, and the Say button leave this unchanged. Compass directions
+    /// and hot buttons do not replace it. Shown greyed out, and repeated from
+    /// an empty field, only while Keep last command is on. A repeat splits on
+    /// `;` again. Kept for this play screen, not on disk.
     @State private var lastCommand = ""
     /// The command field should be first responder. Set when this orientation
     /// keeps the keyboard, cleared when the player swipes it away or a switch hides it.
@@ -3097,11 +3193,64 @@ struct TranscriptView: View {
                 await session.send()
                 return
             }
-            await session.send(fallback: lastCommand)
+            await repeatLastCommand()
+            return
+        }
+        let pieces = CommandSeparator.pieces(in: typed)
+        // Separators only (`;;;`). Nothing is posted, and the stored command
+        // is left as it was. A blank field is the path that repeats it.
+        guard pieces.isEmpty == false else {
+            await discardSeparatorOnlyLine()
             return
         }
         rememberLastCommand(typed)
+        // One piece that is the whole line: `send()` trims and posts the field.
+        if pieces.count == 1, pieces[0] == typed {
+            await session.send()
+            return
+        }
+        await postCommandPieces(pieces)
+    }
+
+    /// Empty field, Keep last command on. One stored line with no `;` still
+    /// uses `send(fallback:)`, which does not write the placeholder into the
+    /// field. A stored line with `;` is split and each piece is posted.
+    private func repeatLastCommand() async {
+        let pieces = CommandSeparator.pieces(in: lastCommand)
+        if pieces.count == 1, pieces[0] == lastCommand {
+            await session.send(fallback: lastCommand)
+            return
+        }
+        guard pieces.isEmpty == false else {
+            await session.send()
+            return
+        }
+        await postCommandPieces(pieces)
+    }
+
+    /// The field held only `;` and whitespace. Clear it and take the empty
+    /// `send()`, which posts nothing. The welcome menu leaves the field alone.
+    private func discardSeparatorOnlyLine() async {
+        guard session.atMenu == false else { return }
+        if session.command.isEmpty == false {
+            session.command = ""
+        }
         await session.send()
+    }
+
+    /// Each piece goes through `sendLine`, the post `send()` uses, awaited so
+    /// the server sees them in order. The field is cleared once when it still
+    /// holds the typed line. A placeholder repeat leaves the field blank, so
+    /// writing a piece would restart the keyboard.
+    private func postCommandPieces(_ pieces: [String]) async {
+        guard session.atMenu == false else { return }
+        if session.command.isEmpty == false {
+            session.command = ""
+        }
+        for piece in pieces {
+            guard session.atMenu == false else { return }
+            await session.sendLine(piece)
+        }
     }
 
     /// Posts `say` plus the field. Text that already starts with `say` is sent
@@ -3280,7 +3429,8 @@ struct TranscriptView: View {
     }
 
     /// Remembers a typed Send/Return line unless it is speech or a channel.
-    /// The Say button never calls this.
+    /// The whole typed line is stored once. A `;` inside it does not make a
+    /// separate entry for each piece. The Say button never calls this.
     private func rememberLastCommand(_ text: String) {
         guard CommunicationCommand.isOutgoing(text) == false else { return }
         lastCommand = text
@@ -3825,13 +3975,14 @@ private struct ActionPanel: View {
 
 /// Hot buttons, stacked above the command bar in list order. Every entry is
 /// drawn, including one whose icon is empty. The glyph is a bold monospaced
-/// face, at most two characters. The plate is the bar frost plus
-/// `Chrome.hotButtonPlate`, and a tap lights it the same way a compass letter
-/// does: the shared flash, white for a quarter second. A hidden label, or an
-/// empty icon, leaves that plate and the light in place. Spacing shrinks
-/// before the plate does, so six fit in the log in either orientation. The
-/// log ends where the input bar begins, so the plates stay above the
-/// direction buttons.
+/// face, at most two characters, and it stays the white (or Matrix ink) it
+/// already was. A white plate is the bar frost plus `Chrome.hotButtonPlate`,
+/// and a tap lights it the same way a compass letter does: the shared flash,
+/// white for a quarter second. Any other colour tints that plate and that
+/// flash. A hidden label, or an empty icon, leaves the plate and the light
+/// in place. Spacing shrinks before the plate does, so six fit in the log
+/// in either orientation. The log ends where the input bar begins, so the
+/// plates stay above the direction buttons.
 private struct HotButtonStack: View {
     @ObservedObject private var matrixMode = MatrixMode.shared
     var buttons: [HotButton]
@@ -3889,36 +4040,53 @@ private struct HotButtonStack: View {
     private func column(_ metrics: Metrics) -> some View {
         VStack(spacing: metrics.spacing) {
             ForEach(buttons) { button in
-                let lit = litButtons.contains(button.id)
-                let showsGlyph = hideLabels == false && button.icon.isEmpty == false
-                let spoken = ActionShortcut.command(text: button.text, target: target)
-                    ?? button.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                Button {
-                    guard ActionShortcut.command(text: button.text, target: target) != nil else { return }
-                    light(button.id)
-                    send(button)
-                } label: {
-                    Text(verbatim: button.icon)
-                        .font(.system(size: metrics.font, weight: .bold, design: .monospaced))
-                        .foregroundStyle(MatrixShade.display(lit ? Color.white : ink, enabled: matrixMode.enabled))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.5)
-                        // Opacity stops at the glyph. The frost and the press light sit outside it.
-                        .opacity(showsGlyph ? 1 : 0)
-                        .frame(width: metrics.side, height: metrics.side)
-                        .background {
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(lit ? Chrome.hotButtonFlash : Color.clear)
-                                .padding(3)
-                        }
-                        .background(Chrome.hotButtonPlate, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .background(Chrome.barBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(spoken.isEmpty ? "Hot button" : spoken)
+                stackedButton(button, metrics: metrics)
             }
         }
+    }
+
+    private func stackedButton(_ button: HotButton, metrics: Metrics) -> some View {
+        let lit = litButtons.contains(button.id)
+        let showsGlyph = hideLabels == false && button.icon.isEmpty == false
+        let spoken = ActionShortcut.command(text: button.text, target: target)
+            ?? button.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Button {
+            guard ActionShortcut.command(text: button.text, target: target) != nil else { return }
+            light(button.id)
+            send(button)
+        } label: {
+            stackedFace(button, lit: lit, showsGlyph: showsGlyph, metrics: metrics)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(spoken.isEmpty ? "Hot button" : spoken)
+    }
+
+    /// Glyph stays white. A white plate is the shared chrome; any other
+    /// colour tints the resting plate and the press flash.
+    private func stackedFace(
+        _ button: HotButton,
+        lit: Bool,
+        showsGlyph: Bool,
+        metrics: Metrics
+    ) -> some View {
+        let flash = lit ? button.color.playFlash : Color.clear
+        let plate = button.color.playPlate
+        return Text(verbatim: button.icon)
+            .font(.system(size: metrics.font, weight: .bold, design: .monospaced))
+            .foregroundStyle(MatrixShade.display(lit ? Color.white : ink, enabled: matrixMode.enabled))
+            .lineLimit(1)
+            .minimumScaleFactor(0.5)
+            // Opacity stops at the glyph. The frost and the press light sit outside it.
+            .opacity(showsGlyph ? 1 : 0)
+            .frame(width: metrics.side, height: metrics.side)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(flash)
+                    .padding(3)
+            }
+            .background(plate, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background(Chrome.barBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(Rectangle())
     }
 
     /// Brighten this plate for a quarter second. The button still sends the action.

@@ -72,6 +72,10 @@ enum CharacterPreferenceScope {
         "im.sync.seeded",
     ]
 
+    /// Copies the stored object as-is. `im.actionShortcuts` may be the older
+    /// string array or the `{text, color}` rows. `im.hotButtons` is the JSON
+    /// blob, including `color` when a plate was tinted. A text-only row has
+    /// no color field; the loader treats that as white.
     private static func copyDefault(_ base: String, slug: String, defaults: UserDefaults) {
         guard defaults.object(forKey: base) != nil else { return }
         let dest = base + "." + slug
@@ -80,7 +84,9 @@ enum CharacterPreferenceScope {
     }
 
     /// The pre-multi iCloud blob is this character's synced lists. Copy it
-    /// once under their name. Later characters read only their own keys.
+    /// once under their name, color payload included. A string-array shortcut
+    /// list is the older shape and decodes as white. Later characters read
+    /// only their own keys.
     private static func copyCloud(slug: String) {
         let store = NSUbiquitousKeyValueStore.default
         _ = store.synchronize()
