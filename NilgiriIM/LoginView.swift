@@ -103,6 +103,13 @@ struct LoginView: View {
             .navigationBarTitleDisplayMode(.inline)
             .navigationTitle("Nilgiri the Forgotten World")
             .toolbar {
+                if session.addingCharacter {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") {
+                            session.cancelAddingCharacter()
+                        }
+                    }
+                }
                 ToolbarItem(placement: .principal) {
                     Text("Nilgiri the Forgotten World")
                         .font(.headline)

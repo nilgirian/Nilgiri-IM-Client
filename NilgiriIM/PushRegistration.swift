@@ -29,6 +29,12 @@ enum PushRegistration {
         token.map { String(format: "%02x", $0) }.joined()
     }
 
+    /// The APNs token already delivered to this process, if registration has finished.
+    static func currentDevice() -> (hex: String, environment: String)? {
+        guard let pendingHex, let pendingEnv, pendingHex.isEmpty == false else { return nil }
+        return (pendingHex, pendingEnv)
+    }
+
     fileprivate static func remember(hex: String, environment: String) {
         pendingHex = hex
         pendingEnv = environment

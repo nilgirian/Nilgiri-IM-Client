@@ -103,6 +103,18 @@ final class IMSession: ObservableObject {
     /// `name` stored with `suppressNameClear`.
     private var nameAssignedByApp: String?
     @Published private(set) var savedTokenAvailable = false
+    /// Characters this device still has a bearer for. The on-screen name is first.
+    @Published private(set) var rosterNames: [String] = []
+    /// Name-bar list. Locked after Unlink when more than one character remains.
+    @Published var characterPickerPresented = false
+    @Published var characterPickerLocked = false
+    /// Login cover for another character. The character on screen stays connected.
+    @Published var addingCharacter = false
+    /// Unlink closed the on-screen character and more than one is still logged in.
+    @Published private(set) var choosingCharacter = false
+    /// From `GET /characters`, when that request has answered.
+    @Published private(set) var reportedDeviceCount: Int?
+    @Published private(set) var reportedDeviceLimit = 6
     /// Set before the resume or catch-up lines are published, and cleared only
     /// after the transcript finishes easing. While this is true the view must not
     /// snap to the bottom.
@@ -154,6 +166,11 @@ final class IMSession: ObservableObject {
     /// stays across appends. A replaced transcript starts it over.
     private var exitScan = RoomExitScan()
     private let defaults = UserDefaults.standard
+    /// In-memory transcript and secrets for characters that are not on screen.
+    private var held: [String: HeldCharacter] = [:]
+    /// A character this phone just created, whose `/device` has not succeeded.
+    /// A device-limit 409 menu-parks only that session.
+    private var createdUnbound = false
 
     private enum StoreKey {
         static let name = "im.name"
@@ -172,6 +189,47 @@ final class IMSession: ObservableObject {
         static let hmvName = "im.hmvName"
         /// Draft id while creation is open. Cleared on finish and on cancel.
         static let createCID = "createCID"
+    }
+
+    private enum RosterKey {
+        static let names = "im.roster"
+        static let active = "im.activeCharacter"
+    }
+
+    /// One logged-in character. The live `IMSession` fields mirror whoever is on screen.
+    private struct HeldCharacter {
+        var name: String
+        var password: String
+        var token: String
+        var sessionId: String
+        var lines: [LineDTO]
+        var lastSeq: Int64
+        var vitals: HMVPrompt.Vitals?
+        var headerSeq: Int64
+        var atMenu: Bool
+        var parked: Bool
+        var roomExits: RoomExitListing?
+        var exitScan: RoomExitScan
+        var command: String
+        var didApplyEntryBacklog: Bool
+        var menuExit: Bool
+        var liveDeathEpoch: Int
+        var menuDeathEpoch: Int
+    }
+
+    private static let maxCharacters = 6
+    private static let deviceFullMessage = "This device already has 6 characters."
+
+    /// Per-character UserDefaults key. The base stays `im.lastSeq` and the
+    /// character's lowercased name is the suffix, so two transcripts do not share a cursor.
+    private func scopedKey(_ base: String, character owner: String? = nil) -> String {
+        let name = (owner ?? character ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard name.isEmpty == false else { return base + ".unset" }
+        return base + "." + name
+    }
+
+    private func characterKey(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private enum ResumeOutcome: Equatable {
@@ -193,23 +251,58 @@ final class IMSession: ObservableObject {
 
     init() {
         defaults.removeObject(forKey: "im.serverURL")
-        if let storedName = defaults.string(forKey: StoreKey.name), storedName.isEmpty == false {
+        let storedName = defaults.string(forKey: StoreKey.name) ?? ""
+        let storedCharacter = defaults.string(forKey: StoreKey.character) ?? ""
+        let legacyToken = SessionSecrets.get(SessionSecrets.Account.token)
+        let legacySession = SessionSecrets.get(SessionSecrets.Account.sessionId)
+        let loggedIn = legacyToken != nil && legacySession != nil
+        let migrationName = storedCharacter.isEmpty == false ? storedCharacter : storedName
+        if loggedIn, migrationName.isEmpty == false {
+            SessionSecrets.migrateSingleEntry(into: migrationName)
+            CharacterPreferenceScope.migrateLoggedInCharacter(migrationName)
+            if defaults.stringArray(forKey: RosterKey.names) == nil {
+                defaults.set([migrationName], forKey: RosterKey.names)
+                defaults.set(migrationName, forKey: RosterKey.active)
+            }
+        } else {
+            if migrationName.isEmpty == false {
+                SessionSecrets.migrateSingleEntry(into: migrationName)
+            }
+            CharacterPreferenceScope.migrateLoggedInCharacter(nil)
+        }
+        loadRoster()
+        let activeName = resolvedActiveName(fallback: storedCharacter.isEmpty ? storedName : storedCharacter)
+        if activeName.isEmpty == false {
+            assignNameFromApp(activeName)
+            savedName = activeName
+            character = activeName
+            CharacterPreferenceScope.adopt(activeName)
+        } else if storedName.isEmpty == false {
             assignNameFromApp(storedName)
             savedName = storedName
         }
-        if let storedCharacter = defaults.string(forKey: StoreKey.character), storedCharacter.isEmpty == false {
-            character = storedCharacter
-        }
-        if let rawSeq = defaults.string(forKey: StoreKey.lastSeq), let seq = Int64(rawSeq) {
-            lastSeq = seq
-        }
-        if let storedPassword = SessionSecrets.get(SessionSecrets.Account.password) {
+        let passwordOwner = character ?? (storedName.isEmpty ? nil : storedName)
+        if let passwordOwner,
+           let storedPassword = SessionSecrets.get(SessionSecrets.slot(SessionSecrets.Account.password, passwordOwner)) {
             password = storedPassword
+        } else if let legacyPassword = SessionSecrets.get(SessionSecrets.Account.password) {
+            password = legacyPassword
         }
-        token = SessionSecrets.get(SessionSecrets.Account.token)
-        sessionId = SessionSecrets.get(SessionSecrets.Account.sessionId)
+        if let character, character.isEmpty == false {
+            token = SessionSecrets.get(SessionSecrets.slot(SessionSecrets.Account.token, character))
+            sessionId = SessionSecrets.get(SessionSecrets.slot(SessionSecrets.Account.sessionId, character))
+            if let rawSeq = defaults.string(forKey: scopedKey(StoreKey.lastSeq)), let seq = Int64(rawSeq) {
+                lastSeq = seq
+            }
+            restoreVitals()
+        }
+        if token == nil,
+           let legacyToken = SessionSecrets.get(SessionSecrets.Account.token),
+           let legacySession = SessionSecrets.get(SessionSecrets.Account.sessionId) {
+            token = legacyToken
+            sessionId = legacySession
+        }
         savedTokenAvailable = token != nil && sessionId != nil
-        restoreVitals()
     }
 
     /// Restore and the name taken after creation. Login must not clear Password for this write.
@@ -237,8 +330,22 @@ final class IMSession: ObservableObject {
         hilitedWord = word
     }
 
+    /// True when the picker can offer another login. Six logged-in characters,
+    /// or a server count already at the cap, hides the row entirely.
+    var canAddCharacter: Bool {
+        if rosterNames.count >= Self.maxCharacters { return false }
+        if let reportedDeviceCount, reportedDeviceCount >= reportedDeviceLimit { return false }
+        return true
+    }
+
+    func isCurrentCharacter(_ name: String) -> Bool {
+        guard let character else { return false }
+        return namesEqual(character, name)
+    }
+
     /// True when Enter should try the saved bearer token before posting a login.
     var offersResume: Bool {
+        if addingCharacter { return false }
         guard savedTokenAvailable || (token != nil && sessionId != nil) else { return false }
         if savedName.isEmpty { return false }
         if namesEqual(name, savedName) { return true }
@@ -507,7 +614,7 @@ final class IMSession: ObservableObject {
             // A since poll may have already dropped this menu session.
             guard token != nil else { return }
             if responseClosed(data) {
-                finishMenuUnlink()
+                await finishMenuUnlink()
                 return
             }
             noteMenuFlag(data)
@@ -537,7 +644,15 @@ final class IMSession: ObservableObject {
             let object = jsonObject(data) ?? [:]
             if boolValue(object, "ok") == true {
                 password = newPassword
-                SessionSecrets.set(newPassword, account: SessionSecrets.Account.password)
+                let owner = character ?? name
+                SessionSecrets.set(newPassword, account: SessionSecrets.slot(SessionSecrets.Account.password, owner))
+                if owner.isEmpty == false {
+                    let key = characterKey(owner)
+                    if var slot = held[key] {
+                        slot.password = newPassword
+                        held[key] = slot
+                    }
+                }
                 status = "Password changed."
                 return nil
             }
@@ -570,7 +685,7 @@ final class IMSession: ObservableObject {
             guard token != nil else { return true }
             // Parking on the menu sends choice 0 and answers {"closed":true}.
             if responseClosed(data) {
-                finishMenuUnlink()
+                await finishMenuUnlink()
                 return true
             }
             if closingMenu {
@@ -593,46 +708,80 @@ final class IMSession: ObservableObject {
         }
     }
 
+    /// Binds every logged-in character. The one on screen is the active character.
+    /// `multi` is always true, so a bind does not unlink the others.
     func registerDevice(token hex: String, environment: String) async {
-        do {
-            try await post("/device", ["token": hex, "environment": environment])
-        } catch {
-            status = failureMessage(error)
+        let activeId = sessionId
+        var pending: [(id: String, bearer: String, active: Bool)] = []
+        for slot in held.values where slot.sessionId != activeId {
+            pending.append((slot.sessionId, slot.token, false))
+        }
+        if let activeId, let token {
+            pending.append((activeId, token, true))
+        }
+        for item in pending {
+            let body: [String: Any] = [
+                "token": hex,
+                "environment": environment,
+                "multi": true,
+                "active": item.active
+            ]
+            do {
+                _ = try await post("/device", body, sessionId: item.id, bearer: item.bearer)
+                if item.active {
+                    createdUnbound = false
+                }
+            } catch let failure as HTTPFailure {
+                if failure.status == 409, Self.isDeviceLimit(message: failure.message) {
+                    if item.active, createdUnbound {
+                        createdUnbound = false
+                        if atMenu {
+                            await park(true)
+                        } else {
+                            status = Self.deviceFullMessage
+                        }
+                        return
+                    }
+                    if item.active {
+                        status = Self.deviceFullMessage
+                    }
+                    continue
+                }
+                if item.active {
+                    status = failure.message
+                }
+            } catch {
+                if item.active {
+                    status = failureMessage(error)
+                }
+            }
+        }
+        if token != nil, sessionId != nil, createdUnbound == false {
+            await claimActive()
         }
     }
 
     func logout(closeMud: Bool) async {
-        stopLive()
         if closeMud {
+            stopLive()
             do {
                 try await post("/close", [:])
             } catch {
                 status = failureMessage(error)
+                if token != nil {
+                    startLive()
+                }
                 return
             }
-            cancelResumeReveal()
-            lines = []
-            forgetRoomExits()
-            lastSeq = 0
-            token = nil
-            sessionId = nil
-            character = nil
-            atMenu = false
-            menuBusy = false
-            clearSessionSecrets()
-            clearDisconnectMarker()
-            clearShownDisconnect()
-            defaults.set("0", forKey: StoreKey.lastSeq)
-            defaults.removeObject(forKey: StoreKey.character)
-            status = "Unlinked. The MUD session is closed."
-        } else {
-            persistAccount()
-            await setParked(true)
-            // Leave the Keychain pair in place so the next enter can resume.
-            cancelResumeReveal()
-            token = nil
-            status = "Parked. Resume keeps this character where they are."
+            await retireActiveCharacter(statusMessage: "Unlinked. The MUD session is closed.")
+            return
         }
+        persistAccount()
+        await setParked(true)
+        // Leave the Keychain pair in place so the next enter can resume.
+        cancelResumeReveal()
+        token = nil
+        status = "Parked. Resume keeps this character where they are."
     }
 
     /// Resume clears park on the server, so backgrounding has to park again.
@@ -728,7 +877,9 @@ final class IMSession: ObservableObject {
         characterMissing = false
         guard name.isEmpty == false else { return }
         guard password.isEmpty == false else {
-            token = nil
+            if addingCharacter == false {
+                token = nil
+            }
             status = "Enter the password to reattach the parked character."
             return
         }
@@ -736,7 +887,17 @@ final class IMSession: ObservableObject {
         didAutoLogin = true
         let sameCharacter = nameMatchesHeld()
         let includeSince = sameCharacter && lines.isEmpty == false && lastSeq > 0
-        var body: [String: Any] = ["name": name, "password": password, "color": true]
+        var body: [String: Any] = [
+            "name": name,
+            "password": password,
+            "color": true,
+            "multi": true,
+            "active": true
+        ]
+        if let device = PushRegistration.currentDevice() {
+            body["deviceToken"] = device.hex
+            body["environment"] = device.environment
+        }
         if includeSince {
             body["since"] = NSNumber(value: lastSeq)
         }
@@ -761,36 +922,56 @@ final class IMSession: ObservableObject {
                 cancelReentry()
                 return
             }
+            if http.statusCode == 409, Self.isDeviceLimit(respData) {
+                // No session was created. Do not /close, and do not drop whoever is on screen.
+                status = Self.deviceFullMessage
+                cancelReentry()
+                return
+            }
             if http.statusCode == 401 {
                 // Wrong password leaves the parked session alone. Do not close it.
                 status = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
                     ?? "Login failed (401)"
                 characterMissing = Self.indicatesMissingCharacter(status)
+                cancelReentry()
+                if addingCharacter {
+                    return
+                }
                 atMenu = false
                 menuBusy = false
                 stopLive()
                 token = nil
-                cancelReentry()
                 return
             }
             if http.statusCode != 200 {
                 status = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
                     ?? "Login failed (\(http.statusCode))"
                 characterMissing = Self.indicatesMissingCharacter(status) || http.statusCode == 404
+                cancelReentry()
+                if addingCharacter {
+                    return
+                }
                 atMenu = false
                 menuBusy = false
                 token = nil
-                cancelReentry()
                 return
             }
             let login = try JSONDecoder().decode(LoginResponse.self, from: respData)
-            let switching = isDifferentCharacter(login.character)
+            let previous = character
+            let switching = previous != nil && namesEqual(previous ?? "", login.character) == false
             if switching {
-                resetPreviousCharacterMemory()
+                snapshotActive()
+                stopLive()
             }
+            createdUnbound = false
+            noteDeviceCounts(bound: login.deviceBound, count: login.deviceCount, limit: login.deviceLimit)
+            addingCharacter = false
+            choosingCharacter = false
+            characterPickerPresented = false
+            characterPickerLocked = false
+            adoptCharacter(login.character)
             token = login.token
             sessionId = login.sessionId
-            adoptCharacter(login.character)
             parked = login.parked ?? false
             savedName = name
             // A fresh login stops on the menu. A resumed reattach is linkdead:
@@ -958,6 +1139,7 @@ final class IMSession: ObservableObject {
         outageLatched = false
         outageAlert = nil
         persistAccount()
+        await claimActive()
         let foreground = inForeground
         pendingUnpark = foreground == false
         await setParked(foreground ? false : true)
@@ -976,10 +1158,13 @@ final class IMSession: ObservableObject {
     private func autoPasswordLogin() async {
         guard didAutoLogin == false else {
             token = nil
-            status = "Could not reattach the parked session."
+            await showRemainingOrLogin(statusMessage: "Could not reattach the parked session.")
             return
         }
         await passwordLogin()
+        if token == nil, rosterNames.isEmpty == false {
+            await showRemainingOrLogin(statusMessage: status)
+        }
     }
 
     /// Keeps the last park request aligned with the latest foreground or background.
@@ -1006,45 +1191,42 @@ final class IMSession: ObservableObject {
     }
 
     private func dropClosedSession() async {
-        cancelResumeReveal()
-        lines = []
-        forgetRoomExits()
-        lastSeq = 0
-        atMenu = false
-        menuBusy = false
-        token = nil
-        sessionId = nil
-        character = nil
-        clearSessionSecrets()
-        clearDisconnectMarker()
-        clearShownDisconnect()
-        defaults.set("0", forKey: StoreKey.lastSeq)
-        defaults.removeObject(forKey: StoreKey.character)
-        if password.isEmpty == false && name.isEmpty == false {
-            await autoPasswordLogin()
-        } else {
-            status = "MUD session closed (idle, unlink, or logout)."
+        let keepName = character ?? name
+        let keepPassword = resolvedPassword(for: keepName)
+        forgetActiveToken()
+        name = keepName
+        password = keepPassword
+        if keepPassword.isEmpty == false && keepName.isEmpty == false {
+            assignNameFromApp(keepName)
+            await passwordLogin()
+            if token != nil { return }
         }
+        await showRemainingOrLogin(statusMessage: "MUD session closed (idle, unlink, or logout).")
     }
 
     private func hydrateSavedSession() {
+        let owner = character ?? name
+        guard owner.isEmpty == false else { return }
         if token == nil {
-            token = SessionSecrets.get(SessionSecrets.Account.token)
+            token = SessionSecrets.get(SessionSecrets.slot(SessionSecrets.Account.token, owner))
         }
         if sessionId == nil {
-            sessionId = SessionSecrets.get(SessionSecrets.Account.sessionId)
+            sessionId = SessionSecrets.get(SessionSecrets.slot(SessionSecrets.Account.sessionId, owner))
         }
     }
 
     private func persistAccount() {
-        if let token, token.isEmpty == false {
-            SessionSecrets.set(token, account: SessionSecrets.Account.token)
-        }
-        if let sessionId, sessionId.isEmpty == false {
-            SessionSecrets.set(sessionId, account: SessionSecrets.Account.sessionId)
-        }
-        if password.isEmpty == false {
-            SessionSecrets.set(password, account: SessionSecrets.Account.password)
+        let owner = character ?? name
+        if owner.isEmpty == false {
+            if let token, token.isEmpty == false {
+                SessionSecrets.set(token, account: SessionSecrets.slot(SessionSecrets.Account.token, owner))
+            }
+            if let sessionId, sessionId.isEmpty == false {
+                SessionSecrets.set(sessionId, account: SessionSecrets.slot(SessionSecrets.Account.sessionId, owner))
+            }
+            if password.isEmpty == false {
+                SessionSecrets.set(password, account: SessionSecrets.slot(SessionSecrets.Account.password, owner))
+            }
         }
         if name.isEmpty == false {
             defaults.set(name, forKey: StoreKey.name)
@@ -1052,17 +1234,23 @@ final class IMSession: ObservableObject {
         }
         if let character, character.isEmpty == false {
             defaults.set(character, forKey: StoreKey.character)
+            rememberCharacter(character)
         }
         persistCursor()
-        savedTokenAvailable = SessionSecrets.get(SessionSecrets.Account.token) != nil
-            && SessionSecrets.get(SessionSecrets.Account.sessionId) != nil
+        savedTokenAvailable = token != nil && sessionId != nil
+        snapshotActive()
     }
 
     private func persistCursor() {
-        defaults.set(String(lastSeq), forKey: StoreKey.lastSeq)
+        defaults.set(String(lastSeq), forKey: scopedKey(StoreKey.lastSeq))
     }
 
     private func clearSessionSecrets() {
+        let owner = character ?? name
+        if owner.isEmpty == false {
+            SessionSecrets.set(nil, account: SessionSecrets.slot(SessionSecrets.Account.token, owner))
+            SessionSecrets.set(nil, account: SessionSecrets.slot(SessionSecrets.Account.sessionId, owner))
+        }
         SessionSecrets.set(nil, account: SessionSecrets.Account.token)
         SessionSecrets.set(nil, account: SessionSecrets.Account.sessionId)
         savedTokenAvailable = false
@@ -1257,32 +1445,32 @@ final class IMSession: ObservableObject {
     /// device clock and the last seq the user had seen.
     private func noteDisconnect() {
         guard token != nil, sessionId != nil else { return }
-        guard defaults.object(forKey: StoreKey.disconnectAt) == nil else { return }
-        defaults.set(Date().timeIntervalSince1970, forKey: StoreKey.disconnectAt)
-        defaults.set(String(lastSeq), forKey: StoreKey.disconnectSeq)
-        defaults.set(character ?? name, forKey: StoreKey.disconnectName)
-        defaults.removeObject(forKey: StoreKey.disconnectServerMs)
+        guard defaults.object(forKey: scopedKey(StoreKey.disconnectAt)) == nil else { return }
+        defaults.set(Date().timeIntervalSince1970, forKey: scopedKey(StoreKey.disconnectAt))
+        defaults.set(String(lastSeq), forKey: scopedKey(StoreKey.disconnectSeq))
+        defaults.set(character ?? name, forKey: scopedKey(StoreKey.disconnectName))
+        defaults.removeObject(forKey: scopedKey(StoreKey.disconnectServerMs))
     }
 
     private func clearDisconnectMarker() {
-        defaults.removeObject(forKey: StoreKey.disconnectAt)
-        defaults.removeObject(forKey: StoreKey.disconnectSeq)
-        defaults.removeObject(forKey: StoreKey.disconnectName)
-        defaults.removeObject(forKey: StoreKey.disconnectServerMs)
+        defaults.removeObject(forKey: scopedKey(StoreKey.disconnectAt))
+        defaults.removeObject(forKey: scopedKey(StoreKey.disconnectSeq))
+        defaults.removeObject(forKey: scopedKey(StoreKey.disconnectName))
+        defaults.removeObject(forKey: scopedKey(StoreKey.disconnectServerMs))
     }
 
     private func clearShownDisconnect() {
-        defaults.removeObject(forKey: StoreKey.shownDisconnectMs)
+        defaults.removeObject(forKey: scopedKey(StoreKey.shownDisconnectMs))
     }
 
     private func shownDisconnectMs() -> Int64? {
-        guard let raw = defaults.string(forKey: StoreKey.shownDisconnectMs),
+        guard let raw = defaults.string(forKey: scopedKey(StoreKey.shownDisconnectMs)),
               let ms = Int64(raw), ms > 0 else { return nil }
         return ms
     }
 
     private func storedServerDisconnectMs() -> Int64? {
-        guard let raw = defaults.string(forKey: StoreKey.disconnectServerMs),
+        guard let raw = defaults.string(forKey: scopedKey(StoreKey.disconnectServerMs)),
               let ms = Int64(raw), ms > 0 else { return nil }
         return ms
     }
@@ -1290,7 +1478,7 @@ final class IMSession: ObservableObject {
     /// Remembers a server instant only when it is newer than the last separator drawn.
     private func stashServerDisconnect(_ reportedMs: Int64?) {
         guard let reportedMs, isNewerServerInstant(reportedMs) else { return }
-        defaults.set(String(reportedMs), forKey: StoreKey.disconnectServerMs)
+        defaults.set(String(reportedMs), forKey: scopedKey(StoreKey.disconnectServerMs))
     }
 
     /// A missing record is older than any positive `disconnectedAt`.
@@ -1315,18 +1503,18 @@ final class IMSession: ObservableObject {
         if disconnectMarkerNameMismatch() {
             clearDisconnectMarker()
         }
-        if defaults.object(forKey: StoreKey.disconnectAt) != nil {
+        if defaults.object(forKey: scopedKey(StoreKey.disconnectAt)) != nil {
             stashServerDisconnect(reportedMs)
         } else if let reportedMs, isNewerServerInstant(reportedMs), seenSeq > 0 {
             // Server restart or a drop this process never observed. Remember the
             // instant so a later line can still land under the same gap.
-            defaults.set(Double(reportedMs) / 1000, forKey: StoreKey.disconnectAt)
-            defaults.set(String(seenSeq), forKey: StoreKey.disconnectSeq)
-            defaults.set(character ?? name, forKey: StoreKey.disconnectName)
-            defaults.set(String(reportedMs), forKey: StoreKey.disconnectServerMs)
+            defaults.set(Double(reportedMs) / 1000, forKey: scopedKey(StoreKey.disconnectAt))
+            defaults.set(String(seenSeq), forKey: scopedKey(StoreKey.disconnectSeq))
+            defaults.set(character ?? name, forKey: scopedKey(StoreKey.disconnectName))
+            defaults.set(String(reportedMs), forKey: scopedKey(StoreKey.disconnectServerMs))
         }
-        guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return source }
-        let disconnectSeq = Int64(defaults.string(forKey: StoreKey.disconnectSeq) ?? "") ?? 0
+        guard defaults.object(forKey: scopedKey(StoreKey.disconnectAt)) != nil else { return source }
+        let disconnectSeq = Int64(defaults.string(forKey: scopedKey(StoreKey.disconnectSeq)) ?? "") ?? 0
         let hasNewLine = source.contains { $0.isServerLine && $0.seq > disconnectSeq }
         let hasAnchor = source.contains { $0.isServerLine && $0.seq <= disconnectSeq }
         // Device-only gaps wait for a line after the drop. A newer server instant
@@ -1336,7 +1524,7 @@ final class IMSession: ObservableObject {
         }
         // Both instants are absolute. The device clock is the fallback when the
         // server omits `disconnectedAt`. Display formats either one in TimeZone.current.
-        let deviceDate = Date(timeIntervalSince1970: defaults.double(forKey: StoreKey.disconnectAt))
+        let deviceDate = Date(timeIntervalSince1970: defaults.double(forKey: scopedKey(StoreKey.disconnectAt)))
         let serverMs = storedServerDisconnectMs()
         let disconnected = serverMs.map(DisconnectSeparator.date(epochMilliseconds:)) ?? deviceDate
         let stamp = DisconnectSeparator.stamp(at: disconnected)
@@ -1348,7 +1536,7 @@ final class IMSession: ObservableObject {
         // instant must not each add a line.
         let alreadyShown = next.contains { $0.isSeparator && $0.text == stamp }
         if (next.indices.contains(insertAt) && next[insertAt].isSeparator) || alreadyShown {
-            if let serverMs { defaults.set(String(serverMs), forKey: StoreKey.shownDisconnectMs) }
+            if let serverMs { defaults.set(String(serverMs), forKey: scopedKey(StoreKey.shownDisconnectMs)) }
             clearDisconnectMarker()
             return next
         }
@@ -1364,14 +1552,14 @@ final class IMSession: ObservableObject {
             ),
             at: insertAt
         )
-        if let serverMs { defaults.set(String(serverMs), forKey: StoreKey.shownDisconnectMs) }
+        if let serverMs { defaults.set(String(serverMs), forKey: scopedKey(StoreKey.shownDisconnectMs)) }
         clearDisconnectMarker()
         return next
     }
 
     private func disconnectMarkerNameMismatch() -> Bool {
-        guard defaults.object(forKey: StoreKey.disconnectAt) != nil else { return false }
-        let heldName = defaults.string(forKey: StoreKey.disconnectName) ?? ""
+        guard defaults.object(forKey: scopedKey(StoreKey.disconnectAt)) != nil else { return false }
+        let heldName = defaults.string(forKey: scopedKey(StoreKey.disconnectName)) ?? ""
         let currentName = character ?? name
         return heldName.isEmpty == false && namesEqual(heldName, currentName) == false
     }
@@ -1558,10 +1746,10 @@ final class IMSession: ObservableObject {
             // inherit a previous DEAD condition or the old negative count.
             if vitals != found {
                 vitals = found
-                defaults.set(found.stored, forKey: StoreKey.hmv)
+                defaults.set(found.stored, forKey: scopedKey(StoreKey.hmv))
                 let owner = character ?? name
                 if owner.isEmpty == false {
-                    defaults.set(owner, forKey: StoreKey.hmvName)
+                    defaults.set(owner, forKey: scopedKey(StoreKey.hmvName))
                 }
             }
         }
@@ -1575,8 +1763,8 @@ final class IMSession: ObservableObject {
     }
 
     private func restoreVitals() {
-        guard let raw = defaults.string(forKey: StoreKey.hmv),
-              let held = defaults.string(forKey: StoreKey.hmvName),
+        guard let raw = defaults.string(forKey: scopedKey(StoreKey.hmv)),
+              let held = defaults.string(forKey: scopedKey(StoreKey.hmvName)),
               let found = HMVPrompt.Vitals.parse(raw) else { return }
         let owner = character ?? name
         guard owner.isEmpty == false, namesEqual(held, owner) else { return }
@@ -1584,8 +1772,8 @@ final class IMSession: ObservableObject {
         // bar does not keep `-9h DEAD` while wear commands have no prompt yet.
         // Stun and incapacitated still restore; those alarms are separate.
         guard found.isDead == false else {
-            defaults.removeObject(forKey: StoreKey.hmv)
-            defaults.removeObject(forKey: StoreKey.hmvName)
+            defaults.removeObject(forKey: scopedKey(StoreKey.hmv))
+            defaults.removeObject(forKey: scopedKey(StoreKey.hmvName))
             return
         }
         vitals = found
@@ -1626,31 +1814,45 @@ final class IMSession: ObservableObject {
         guard vitals?.isDead == true else { return }
         vitals = nil
         pendingVitals = nil
-        defaults.removeObject(forKey: StoreKey.hmv)
-        defaults.removeObject(forKey: StoreKey.hmvName)
+        defaults.removeObject(forKey: scopedKey(StoreKey.hmv))
+        defaults.removeObject(forKey: scopedKey(StoreKey.hmvName))
     }
 
     /// Another character's saved prompt is not this header.
     private func adoptCharacter(_ next: String?) {
+        CharacterPreferenceScope.adopt(next)
         character = next
         guard let next, next.isEmpty == false else { return }
-        guard let held = defaults.string(forKey: StoreKey.hmvName),
-              namesEqual(held, next) == false else { return }
+        guard let heldName = defaults.string(forKey: scopedKey(StoreKey.hmvName)),
+              namesEqual(heldName, next) == false else { return }
         vitals = nil
         headerSeq = 0
-        defaults.removeObject(forKey: StoreKey.hmv)
-        defaults.removeObject(forKey: StoreKey.hmvName)
+        defaults.removeObject(forKey: scopedKey(StoreKey.hmv))
+        defaults.removeObject(forKey: scopedKey(StoreKey.hmvName))
     }
 
     @discardableResult
     private func post(_ action: String, _ body: [String: Any]) async throws -> Data {
-        guard let requestURL = sessionURL(action) else {
+        guard let sessionId, let token else {
+            throw HTTPFailure(status: 0, message: "No session to update.")
+        }
+        return try await post(action, body, sessionId: sessionId, bearer: token)
+    }
+
+    @discardableResult
+    private func post(
+        _ action: String,
+        _ body: [String: Any],
+        sessionId: String,
+        bearer: String
+    ) async throws -> Data {
+        guard let requestURL = sessionURL(action, sessionId: sessionId) else {
             throw HTTPFailure(status: 0, message: "No session to update.")
         }
         var req = URLRequest(url: requestURL)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Bearer \(token ?? "")", forHTTPHeaderField: "Authorization")
+        req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else {
@@ -1789,82 +1991,18 @@ final class IMSession: ObservableObject {
         }
     }
 
-    /// A different character replaces the one this device was holding.
-    /// The server drops the other session; the transcript, ids, menu, and badge go too.
-    private func isDifferentCharacter(_ next: String) -> Bool {
-        guard next.isEmpty == false, let held = heldCharacterName() else { return false }
-        return namesEqual(held, next) == false
-    }
-
-    private func heldCharacterName() -> String? {
-        if let character, character.isEmpty == false { return character }
-        if savedName.isEmpty == false { return savedName }
-        return nil
-    }
-
-    private func resetPreviousCharacterMemory() {
-        stopLive()
-        cancelResumeReveal()
-        resumeSeparatorID = nil
-        lines = []
-        forgetRoomExits()
-        lastSeq = 0
-        pendingVitals = nil
-        vitals = nil
-        headerSeq = 0
-        deathBannerAt = nil
-        liveDeathInBatch = false
-        liveProgress = []
-        progressPulse = nil
-        atMenu = false
-        menuBusy = false
-        menuExit = false
-        command = ""
-        parked = false
-        token = nil
-        sessionId = nil
-        character = nil
-        clearSessionSecrets()
-        clearDisconnectMarker()
-        clearShownDisconnect()
-        defaults.set("0", forKey: StoreKey.lastSeq)
-        defaults.removeObject(forKey: StoreKey.character)
-        defaults.removeObject(forKey: StoreKey.hmv)
-        defaults.removeObject(forKey: StoreKey.hmvName)
-        zeroLocalBadge()
-    }
-
     /// Menu quit, or park while the menu is up (`{"closed":true}`).
-    /// The Keychain token and session id go. The password stays for the next enter.
-    private func finishMenuUnlink() {
+    /// Only this character is logged out. Anyone else stays connected.
+    private func finishMenuUnlink() async {
         menuExit = false
-        stopLive()
-        cancelResumeReveal()
-        resumeSeparatorID = nil
-        lines = []
-        forgetRoomExits()
-        lastSeq = 0
-        atMenu = false
-        menuBusy = false
-        command = ""
-        parked = false
-        token = nil
-        sessionId = nil
-        character = nil
-        clearSessionSecrets()
-        clearDisconnectMarker()
-        clearShownDisconnect()
-        defaults.set("0", forKey: StoreKey.lastSeq)
-        defaults.removeObject(forKey: StoreKey.character)
-        zeroLocalBadge()
-        status = "Unlinked. The MUD session is closed."
+        await retireActiveCharacter(statusMessage: "Unlinked. The MUD session is closed.")
     }
 
     /// Playing sessions still reattach. A close while the menu is up, or a quit
     /// that already dropped the menu flag, stays on the login screen.
     private func handleClosedSession() async {
         if atMenu || menuExit {
-            finishMenuUnlink()
+            await finishMenuUnlink()
             return
         }
         await dropClosedSession()
@@ -1873,12 +2011,14 @@ final class IMSession: ObservableObject {
     /// True when the caller must stop. Menu rejects do not log in again.
     private func handleRejectedSession(thenLogin: Bool) async -> Bool {
         if atMenu || menuExit {
-            finishMenuUnlink()
+            await finishMenuUnlink()
             return true
         }
-        token = nil
+        forgetActiveToken()
         if thenLogin {
             await autoPasswordLogin()
+        } else if rosterNames.isEmpty == false {
+            await showRemainingOrLogin(statusMessage: "That character's session ended.")
         }
         return false
     }
@@ -1893,11 +2033,12 @@ final class IMSession: ObservableObject {
         }
     }
 
-    private func sessionURL(_ suffix: String) -> URL? {
-        guard let sessionId, sessionId.isEmpty == false else { return nil }
+    private func sessionURL(_ suffix: String, sessionId id: String? = nil) -> URL? {
+        let resolved = id ?? sessionId
+        guard let resolved, resolved.isEmpty == false else { return nil }
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
-        let escaped = sessionId.addingPercentEncoding(withAllowedCharacters: allowed) ?? sessionId
+        let escaped = resolved.addingPercentEncoding(withAllowedCharacters: allowed) ?? resolved
         return url("/v1/sessions/\(escaped)\(suffix)")
     }
 
@@ -1945,6 +2086,10 @@ final class IMSession: ObservableObject {
         generation: Int
     ) async {
         guard generation == createGeneration else { return }
+        if Self.isDeviceLimit(http.data) {
+            presentCreateFailure(Self.deviceFullMessage, phase: phase)
+            return
+        }
         let object = jsonObject(http.data) ?? [:]
         if phase == .answer, http.status == 404 || http.status == 410 {
             returnToLogin(errorText(from: http.data, status: http.status))
@@ -1999,6 +2144,14 @@ final class IMSession: ObservableObject {
         let keptName = createName.trimmingCharacters(in: .whitespacesAndNewlines)
         // Clear the id before the wizard view leaves, so its disappear hook does not DELETE.
         setCreateCID(nil)
+        let nextCharacter = login.character.isEmpty ? keptName : login.character
+        let switching = character != nil && namesEqual(character ?? "", nextCharacter) == false
+        if switching {
+            snapshotActive()
+            stopLive()
+            lastSeq = 0
+            lines = []
+        }
         creating = false
         createGreeting = nil
         createStep = nil
@@ -2007,19 +2160,20 @@ final class IMSession: ObservableObject {
         createError = nil
         createBusy = false
         characterMissing = false
-        assignNameFromApp(login.character.isEmpty ? keptName : login.character)
+        assignNameFromApp(nextCharacter)
         if let keptPassword, keptPassword.isEmpty == false {
             password = keptPassword
         }
         didAutoLogin = true
-        let nextCharacter = login.character.isEmpty ? keptName : login.character
-        let switching = isDifferentCharacter(nextCharacter)
-        if switching {
-            resetPreviousCharacterMemory()
-        }
+        createdUnbound = login.deviceBound != true
+        noteDeviceCounts(bound: login.deviceBound, count: login.deviceCount, limit: login.deviceLimit)
+        addingCharacter = false
+        choosingCharacter = false
+        characterPickerPresented = false
+        characterPickerLocked = false
+        adoptCharacter(nextCharacter)
         token = login.token
         sessionId = login.sessionId
-        adoptCharacter(login.character)
         parked = login.parked ?? false
         savedName = name
         // Finished creation stops on the menu, same as a fresh login.
@@ -2267,6 +2421,430 @@ final class IMSession: ObservableObject {
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
         return raw.addingPercentEncoding(withAllowedCharacters: allowed) ?? raw
+    }
+
+    /// Opens the name-bar list and refreshes it from the server when a bearer is available.
+    func openCharacterPicker() {
+        characterPickerLocked = choosingCharacter && token == nil
+        characterPickerPresented = true
+        Task { await refreshDeviceCharacters() }
+    }
+
+    /// Puts `name` on screen, catches its transcript up with `GET /since`, and claims pushes.
+    func switchToCharacter(_ name: String) async {
+        let key = characterKey(name)
+        if token != nil, let character, namesEqual(character, name) {
+            characterPickerPresented = false
+            characterPickerLocked = false
+            choosingCharacter = false
+            await claimActive()
+            return
+        }
+        if token != nil {
+            snapshotActive()
+            stopLive()
+        }
+        guard let slot = held[key] else { return }
+        choosingCharacter = false
+        characterPickerLocked = false
+        characterPickerPresented = false
+        addingCharacter = false
+        install(slot)
+        beginReentry()
+        let outcome = await fetchSince(adoptDeath: false)
+        switch outcome {
+        case .ready, .detached, .closed:
+            endReentry()
+        default:
+            cancelReentry()
+        }
+        switch outcome {
+        case .closed:
+            await retireActiveCharacter(statusMessage: "MUD session closed (idle, unlink, or logout).")
+            return
+        case .rejected:
+            forgetActiveToken()
+            await showRemainingOrLogin(statusMessage: "That character's session ended.")
+            return
+        case .detached:
+            await passwordLogin()
+            if token == nil {
+                forgetActiveToken()
+                await showRemainingOrLogin(statusMessage: "Could not reattach the parked session.")
+                return
+            }
+            if pollTask == nil {
+                startLive()
+            }
+            return
+        case .outage(let kind):
+            reportOutage(kind)
+        case .ready, .offline:
+            break
+        }
+        guard token != nil else { return }
+        persistAccount()
+        await claimActive()
+        let foreground = inForeground
+        await setParked(foreground ? false : true)
+        guard token != nil else { return }
+        if foreground, desiredParked == false {
+            startLive()
+        }
+        if atMenu, let character {
+            status = "At the menu as \(character)."
+        } else if let character {
+            status = "Playing as \(character)"
+        }
+        await PushRegistration.flush(session: self)
+    }
+
+    /// Login cover. The character on screen stays connected, including their password.
+    func beginAddingCharacter() {
+        snapshotActive()
+        addingCharacter = true
+        characterPickerPresented = false
+        assignNameFromApp("")
+        password = ""
+        characterMissing = false
+        status = "Log in another character."
+    }
+
+    /// Leaves the login cover and restores the on-screen character's name and password.
+    func cancelAddingCharacter() {
+        addingCharacter = false
+        characterMissing = false
+        if let character, character.isEmpty == false {
+            assignNameFromApp(character)
+            password = resolvedPassword(for: character)
+        }
+        if choosingCharacter {
+            characterPickerLocked = true
+            characterPickerPresented = true
+        }
+    }
+
+    private func loadRoster() {
+        let stored = defaults.stringArray(forKey: RosterKey.names) ?? []
+        var names: [String] = []
+        for entry in stored {
+            let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.isEmpty == false else { continue }
+            guard names.contains(where: { namesEqual($0, trimmed) }) == false else { continue }
+            guard let savedToken = SessionSecrets.get(SessionSecrets.slot(SessionSecrets.Account.token, trimmed)),
+                  let savedSession = SessionSecrets.get(SessionSecrets.slot(SessionSecrets.Account.sessionId, trimmed)) else {
+                continue
+            }
+            names.append(trimmed)
+            let seq = Int64(defaults.string(forKey: scopedKey(StoreKey.lastSeq, character: trimmed)) ?? "") ?? 0
+            let savedPassword = SessionSecrets.get(SessionSecrets.slot(SessionSecrets.Account.password, trimmed)) ?? ""
+            held[characterKey(trimmed)] = HeldCharacter(
+                name: trimmed,
+                password: savedPassword,
+                token: savedToken,
+                sessionId: savedSession,
+                lines: [],
+                lastSeq: seq,
+                vitals: nil,
+                headerSeq: 0,
+                atMenu: false,
+                parked: true,
+                roomExits: nil,
+                exitScan: RoomExitScan(),
+                command: "",
+                didApplyEntryBacklog: false,
+                menuExit: false,
+                liveDeathEpoch: 0,
+                menuDeathEpoch: 0
+            )
+        }
+        rosterNames = names
+    }
+
+    private func resolvedActiveName(fallback: String) -> String {
+        let saved = defaults.string(forKey: RosterKey.active) ?? ""
+        if saved.isEmpty == false, let match = rosterNames.first(where: { namesEqual($0, saved) }) {
+            return match
+        }
+        if fallback.isEmpty == false, let match = rosterNames.first(where: { namesEqual($0, fallback) }) {
+            return match
+        }
+        return rosterNames.first ?? ""
+    }
+
+    private func rememberCharacter(_ name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else { return }
+        if let index = rosterNames.firstIndex(where: { namesEqual($0, trimmed) }) {
+            rosterNames[index] = trimmed
+        } else {
+            rosterNames.append(trimmed)
+        }
+        rosterNames.sort { lhs, rhs in
+            let lhsActive = character.map { namesEqual($0, lhs) } ?? false
+            let rhsActive = character.map { namesEqual($0, rhs) } ?? false
+            if lhsActive != rhsActive { return lhsActive }
+            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }
+        defaults.set(rosterNames, forKey: RosterKey.names)
+        if let character, character.isEmpty == false {
+            defaults.set(character, forKey: RosterKey.active)
+        }
+    }
+
+    /// Copies the on-screen character into the roster without closing their MUD session.
+    private func snapshotActive() {
+        guard let token, token.isEmpty == false,
+              let sessionId, sessionId.isEmpty == false,
+              let character, character.isEmpty == false else { return }
+        persistCursor()
+        let savedPassword = resolvedPassword(for: character)
+        if savedPassword.isEmpty == false {
+            SessionSecrets.set(savedPassword, account: SessionSecrets.slot(SessionSecrets.Account.password, character))
+        }
+        SessionSecrets.set(token, account: SessionSecrets.slot(SessionSecrets.Account.token, character))
+        SessionSecrets.set(sessionId, account: SessionSecrets.slot(SessionSecrets.Account.sessionId, character))
+        held[characterKey(character)] = HeldCharacter(
+            name: character,
+            password: savedPassword,
+            token: token,
+            sessionId: sessionId,
+            lines: lines,
+            lastSeq: lastSeq,
+            vitals: vitals,
+            headerSeq: headerSeq,
+            atMenu: atMenu,
+            parked: parked,
+            roomExits: roomExits,
+            exitScan: exitScan,
+            command: command,
+            didApplyEntryBacklog: didApplyEntryBacklog,
+            menuExit: menuExit,
+            liveDeathEpoch: liveDeathEpoch,
+            menuDeathEpoch: menuDeathEpoch
+        )
+        rememberCharacter(character)
+    }
+
+    private func resolvedPassword(for owner: String) -> String {
+        let stored = held[characterKey(owner)]?.password ?? ""
+        let keychain = SessionSecrets.get(SessionSecrets.slot(SessionSecrets.Account.password, owner)) ?? ""
+        if addingCharacter {
+            if stored.isEmpty == false { return stored }
+            return keychain
+        }
+        if let character, namesEqual(character, owner), password.isEmpty == false {
+            return password
+        }
+        if stored.isEmpty == false { return stored }
+        return keychain
+    }
+
+    private func install(_ slot: HeldCharacter) {
+        CharacterPreferenceScope.adopt(slot.name)
+        assignNameFromApp(slot.name)
+        savedName = slot.name
+        password = slot.password.isEmpty ? resolvedPassword(for: slot.name) : slot.password
+        token = slot.token
+        sessionId = slot.sessionId
+        character = slot.name
+        lines = slot.lines
+        lastSeq = slot.lastSeq
+        vitals = slot.vitals
+        headerSeq = slot.headerSeq
+        atMenu = slot.atMenu
+        parked = slot.parked
+        roomExits = slot.roomExits
+        exitScan = slot.exitScan
+        command = slot.command
+        didApplyEntryBacklog = slot.didApplyEntryBacklog
+        menuExit = false
+        menuBusy = false
+        liveDeathEpoch = slot.liveDeathEpoch
+        menuDeathEpoch = slot.menuDeathEpoch
+        pendingVitals = nil
+        liveDeathInBatch = false
+        liveProgress = []
+        progressPulse = nil
+        hilitedWord = nil
+        cancelResumeReveal()
+        savedTokenAvailable = true
+        defaults.set(slot.name, forKey: StoreKey.character)
+        defaults.set(slot.name, forKey: StoreKey.name)
+        defaults.set(slot.name, forKey: RosterKey.active)
+        rememberCharacter(slot.name)
+    }
+
+    /// Drops the on-screen bearer. The password stays so the name can be entered again.
+    private func forgetActiveToken() {
+        let retiring = character
+        stopLive()
+        cancelResumeReveal()
+        if let retiring, retiring.isEmpty == false {
+            SessionSecrets.set(nil, account: SessionSecrets.slot(SessionSecrets.Account.token, retiring))
+            SessionSecrets.set(nil, account: SessionSecrets.slot(SessionSecrets.Account.sessionId, retiring))
+            held.removeValue(forKey: characterKey(retiring))
+            rosterNames.removeAll { namesEqual($0, retiring) }
+            defaults.set(rosterNames, forKey: RosterKey.names)
+        }
+        clearSessionSecrets()
+        token = nil
+        sessionId = nil
+        savedTokenAvailable = false
+    }
+
+    /// The on-screen character's MUD session is already closed. Someone else may still be logged in.
+    private func retireActiveCharacter(statusMessage: String) async {
+        let retiring = character
+        let retiringPassword = resolvedPassword(for: retiring ?? name)
+        reportedDeviceCount = nil
+        stopLive()
+        cancelResumeReveal()
+        resumeSeparatorID = nil
+        if let retiring, retiring.isEmpty == false {
+            if retiringPassword.isEmpty == false {
+                SessionSecrets.set(retiringPassword, account: SessionSecrets.slot(SessionSecrets.Account.password, retiring))
+            }
+            SessionSecrets.set(nil, account: SessionSecrets.slot(SessionSecrets.Account.token, retiring))
+            SessionSecrets.set(nil, account: SessionSecrets.slot(SessionSecrets.Account.sessionId, retiring))
+            held.removeValue(forKey: characterKey(retiring))
+            rosterNames.removeAll { namesEqual($0, retiring) }
+            defaults.set(rosterNames, forKey: RosterKey.names)
+        }
+        SessionSecrets.set(nil, account: SessionSecrets.Account.token)
+        SessionSecrets.set(nil, account: SessionSecrets.Account.sessionId)
+        lines = []
+        forgetRoomExits()
+        lastSeq = 0
+        atMenu = false
+        menuBusy = false
+        menuExit = false
+        command = ""
+        parked = false
+        pendingVitals = nil
+        vitals = nil
+        headerSeq = 0
+        hilitedWord = nil
+        let remaining = rosterNames
+        if remaining.isEmpty == false {
+            choosingCharacter = true
+        }
+        token = nil
+        sessionId = nil
+        savedTokenAvailable = remaining.isEmpty == false
+        if remaining.isEmpty {
+            character = nil
+            choosingCharacter = false
+            characterPickerPresented = false
+            characterPickerLocked = false
+            addingCharacter = false
+            defaults.removeObject(forKey: StoreKey.character)
+            defaults.removeObject(forKey: RosterKey.active)
+            zeroLocalBadge()
+            status = statusMessage
+            return
+        }
+        if remaining.count == 1 {
+            await switchToCharacter(remaining[0])
+            return
+        }
+        character = nil
+        characterPickerLocked = true
+        characterPickerPresented = true
+        status = "Choose a character."
+        await refreshDeviceCharacters()
+    }
+
+    private func showRemainingOrLogin(statusMessage: String) async {
+        let remaining = rosterNames
+        if remaining.isEmpty {
+            character = nil
+            choosingCharacter = false
+            characterPickerPresented = false
+            characterPickerLocked = false
+            token = nil
+            sessionId = nil
+            defaults.removeObject(forKey: StoreKey.character)
+            defaults.removeObject(forKey: RosterKey.active)
+            status = statusMessage
+            return
+        }
+        choosingCharacter = true
+        if remaining.count == 1 {
+            await switchToCharacter(remaining[0])
+            return
+        }
+        character = nil
+        token = nil
+        sessionId = nil
+        characterPickerLocked = true
+        characterPickerPresented = true
+        status = "Choose a character."
+        await refreshDeviceCharacters()
+    }
+
+    /// `POST /active`. A 409 before the device token exists is ignored; `/device` claims again.
+    private func claimActive() async {
+        guard token != nil, sessionId != nil else { return }
+        do {
+            _ = try await post("/active", [:])
+        } catch let failure as HTTPFailure {
+            if failure.status == 409 || failure.status == 400 {
+                return
+            }
+        } catch {
+            return
+        }
+    }
+
+    private func refreshDeviceCharacters() async {
+        let bearer: String
+        let id: String
+        if let token, let sessionId {
+            bearer = token
+            id = sessionId
+        } else if let slot = held.values.first(where: { $0.token.isEmpty == false && $0.sessionId.isEmpty == false }) {
+            bearer = slot.token
+            id = slot.sessionId
+        } else {
+            return
+        }
+        guard let requestURL = sessionURL("/characters", sessionId: id) else { return }
+        var req = URLRequest(url: requestURL)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let list = try? JSONDecoder().decode(DeviceCharacterList.self, from: data) else { return }
+            reportedDeviceCount = list.count
+            if list.limit > 0 {
+                reportedDeviceLimit = list.limit
+            }
+        } catch {
+            return
+        }
+    }
+
+    private func noteDeviceCounts(bound: Bool?, count: Int?, limit: Int?) {
+        if let limit, limit > 0 {
+            reportedDeviceLimit = limit
+        }
+        if bound == true, let count {
+            reportedDeviceCount = count
+        }
+    }
+
+    private static func isDeviceLimit(_ data: Data) -> Bool {
+        guard data.isEmpty == false,
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let error = object["error"] as? String else { return false }
+        return isDeviceLimit(message: error)
+    }
+
+    private static func isDeviceLimit(message: String) -> Bool {
+        message.trimmingCharacters(in: .whitespacesAndNewlines)
+            .compare("device limit", options: .caseInsensitive) == .orderedSame
     }
 
     /// Login copy that means the name is not a character yet. The create

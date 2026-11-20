@@ -187,6 +187,8 @@ final class ActionMenuStore: ObservableObject {
     private var cloudSyncScheduled = false
     private var cloudObserver: NSObjectProtocol?
     private var identityObserver: NSObjectProtocol?
+    /// Character whose lists are loaded. Switching reloads that character's keys.
+    private var loadedFor = ""
 
     private enum Key {
         static let shortcuts = "im.actionShortcuts"
@@ -237,29 +239,55 @@ final class ActionMenuStore: ObservableObject {
     ]
 
     init() {
+        loadLocal()
+        loadSyncFlags()
+        startCloudSync()
+        loadedFor = CharacterPreferenceScope.key
+        tracksEdits = true
+    }
+
+    /// Loads lists for the character currently in scope. A character this
+    /// install has never saved starts from the factory seed. iCloud for that
+    /// same character replaces the seed when it already has their lists.
+    /// The seed is not uploaded.
+    func reload() {
+        let key = CharacterPreferenceScope.key
+        guard key != loadedFor else { return }
+        tracksEdits = false
+        reconciling = false
+        rememberedIcons = [:]
+        loadLocal()
+        loadSyncFlags()
+        pullCloud()
+        loadedFor = key
+        tracksEdits = true
+    }
+
+    /// Both keys absent: this character has never saved lists, so the factory
+    /// seed is used. A saved key, even an empty one, is left alone.
+    private func loadLocal() {
         let defaults = UserDefaults.standard
-        let storedShortcuts = defaults.object(forKey: Key.shortcuts)
-        let buttonsMissing = defaults.object(forKey: Key.buttons) == nil
+        let storedShortcuts = defaults.object(forKey: localKey(Key.shortcuts))
+        let buttonsMissing = defaults.object(forKey: localKey(Key.buttons)) == nil
         let loadedButtons: [HotButton]
         let loadedShortcuts: [ActionShortcut]
-        // Both keys absent: this device has never saved lists. A saved key,
-        // even an empty one, is left alone. The missing half stays empty.
         if storedShortcuts == nil && buttonsMissing {
             loadedButtons = Self.hotSeed
             loadedShortcuts = Self.actionSeed.map { ActionShortcut(text: $0) }
         } else {
             loadedButtons = buttonsMissing ? [] : Self.migrateLegacyLoot(Self.readButtons(defaults))
             // Count cap plus the legacy loot rewrite. A string array is the
-            // older payload. A dictionary array carries text and a color id.
-            // Other saved rows and their order are kept.
+            // older payload and decodes as white. A dictionary array carries
+            // text and a color id. Other saved rows and their order are kept.
             loadedShortcuts = Self.shortcuts(from: storedShortcuts)
         }
         apply(buttons: loadedButtons, shortcuts: loadedShortcuts)
         saveShortcuts()
         saveButtons()
-        loadSyncFlags()
-        startCloudSync()
-        tracksEdits = true
+    }
+
+    private func localKey(_ base: String) -> String {
+        CharacterPreferenceScope.storageKey(base)
     }
 
     deinit {
@@ -534,12 +562,12 @@ final class ActionMenuStore: ObservableObject {
     }
 
     private func saveShortcuts() {
-        UserDefaults.standard.set(Self.shortcutPayload(shortcuts), forKey: Key.shortcuts)
+        UserDefaults.standard.set(Self.shortcutPayload(shortcuts), forKey: localKey(Key.shortcuts))
     }
 
     private func saveButtons() {
         guard let data = Self.buttonData(buttons) else { return }
-        UserDefaults.standard.set(data, forKey: Key.buttons)
+        UserDefaults.standard.set(data, forKey: localKey(Key.buttons))
     }
 
     /// `im.actionShortcuts` and `im.sync.actionShortcuts`. Each entry is
@@ -612,7 +640,7 @@ final class ActionMenuStore: ObservableObject {
     /// A present key that does not decode stays empty. That is not the
     /// missing-key case, so the seed is not written back over it.
     private static func readButtons(_ defaults: UserDefaults) -> [HotButton] {
-        buttons(from: defaults.data(forKey: Key.buttons))
+        buttons(from: defaults.data(forKey: CharacterPreferenceScope.storageKey(Key.buttons)))
     }
 
     private static func buttons(from data: Data?) -> [HotButton] {
@@ -644,21 +672,21 @@ final class ActionMenuStore: ObservableObject {
     /// was edited before sync existed, so it is eligible to upload.
     private func loadSyncFlags() {
         let defaults = UserDefaults.standard
-        if defaults.object(forKey: SyncKey.seeded) == nil {
+        if defaults.object(forKey: localKey(SyncKey.seeded)) == nil {
             seeded = Self.isFactorySeed(buttons: buttons, shortcuts: shortcuts)
-            defaults.set(seeded, forKey: SyncKey.seeded)
+            defaults.set(seeded, forKey: localKey(SyncKey.seeded))
         } else {
-            seeded = defaults.bool(forKey: SyncKey.seeded)
+            seeded = defaults.bool(forKey: localKey(SyncKey.seeded))
         }
-        merged = defaults.bool(forKey: SyncKey.merged)
-        updatedAt = defaults.double(forKey: SyncKey.updatedAt)
+        merged = defaults.bool(forKey: localKey(SyncKey.merged))
+        updatedAt = defaults.double(forKey: localKey(SyncKey.updatedAt))
     }
 
     private func storeSyncFlags() {
         let defaults = UserDefaults.standard
-        defaults.set(seeded, forKey: SyncKey.seeded)
-        defaults.set(merged, forKey: SyncKey.merged)
-        defaults.set(updatedAt, forKey: SyncKey.updatedAt)
+        defaults.set(seeded, forKey: localKey(SyncKey.seeded))
+        defaults.set(merged, forKey: localKey(SyncKey.merged))
+        defaults.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
     }
 
     /// The current factory lists, or the previous ones (loot plus hit / look /
@@ -753,7 +781,7 @@ final class ActionMenuStore: ObservableObject {
         // against that snapshot instead of treating it as a later write.
         if reason == NSUbiquitousKeyValueStoreAccountChange {
             merged = false
-            UserDefaults.standard.set(false, forKey: SyncKey.merged)
+            UserDefaults.standard.set(false, forKey: localKey(SyncKey.merged))
         }
         let initial = reason == NSUbiquitousKeyValueStoreInitialSyncChange
         let cloud = readCloud()
@@ -807,7 +835,7 @@ final class ActionMenuStore: ObservableObject {
             // including when this device has never stamped a write.
             if seeded == false && updatedAt <= cloud.updatedAt {
                 updatedAt = Date().timeIntervalSince1970
-                UserDefaults.standard.set(updatedAt, forKey: SyncKey.updatedAt)
+                UserDefaults.standard.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
             }
             if seeded == false && updatedAt > cloud.updatedAt {
                 writeCloud(updatedAt: updatedAt)
@@ -828,12 +856,12 @@ final class ActionMenuStore: ObservableObject {
     /// between cannot later treat the adopted rows as an untouched seed.
     private func adopt(_ cloud: CloudLists) {
         seeded = false
-        UserDefaults.standard.set(false, forKey: SyncKey.seeded)
+        UserDefaults.standard.set(false, forKey: localKey(SyncKey.seeded))
         if sameLists(buttons: cloud.buttons, shortcuts: cloud.shortcuts) == false {
             replaceFromSync(buttons: cloud.buttons, shortcuts: cloud.shortcuts)
         }
         updatedAt = cloud.updatedAt
-        UserDefaults.standard.set(updatedAt, forKey: SyncKey.updatedAt)
+        UserDefaults.standard.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
     }
 
     /// `apply` enforces one text per list and `hotLimit`. `cappedLists`
@@ -957,10 +985,10 @@ final class ActionMenuStore: ObservableObject {
         guard iCloudAvailable, seeded == false else { return }
         guard let data = Self.buttonData(buttons) else { return }
         let store = NSUbiquitousKeyValueStore.default
-        store.set(Self.shortcutPayload(shortcuts), forKey: SyncKey.shortcuts)
-        store.set(data, forKey: SyncKey.buttons)
-        store.set(false, forKey: SyncKey.seeded)
-        store.set(stamp, forKey: SyncKey.updatedAt)
+        store.set(Self.shortcutPayload(shortcuts), forKey: localKey(SyncKey.shortcuts))
+        store.set(data, forKey: localKey(SyncKey.buttons))
+        store.set(false, forKey: localKey(SyncKey.seeded))
+        store.set(stamp, forKey: localKey(SyncKey.updatedAt))
         if push {
             _ = store.synchronize()
         }
@@ -971,17 +999,17 @@ final class ActionMenuStore: ObservableObject {
     /// only when its key is present; absent keys mean the store is empty.
     private func readCloud() -> CloudLists {
         let store = NSUbiquitousKeyValueStore.default
-        let shortcutsValue = store.object(forKey: SyncKey.shortcuts)
-        let buttonsValue = store.object(forKey: SyncKey.buttons)
-        let updatedValue = store.object(forKey: SyncKey.updatedAt)
+        let shortcutsValue = store.object(forKey: localKey(SyncKey.shortcuts))
+        let buttonsValue = store.object(forKey: localKey(SyncKey.buttons))
+        let updatedValue = store.object(forKey: localKey(SyncKey.updatedAt))
         let exists = shortcutsValue != nil || buttonsValue != nil || updatedValue != nil
         let cloudShortcuts = Self.shortcuts(from: shortcutsValue)
-        let cloudButtons = Self.migrateLegacyLoot(Self.buttons(from: store.data(forKey: SyncKey.buttons)))
+        let cloudButtons = Self.migrateLegacyLoot(Self.buttons(from: store.data(forKey: localKey(SyncKey.buttons))))
         return CloudLists(
             buttons: cloudButtons,
             shortcuts: cloudShortcuts,
-            updatedAt: store.double(forKey: SyncKey.updatedAt),
-            seeded: store.bool(forKey: SyncKey.seeded),
+            updatedAt: store.double(forKey: localKey(SyncKey.updatedAt)),
+            seeded: store.bool(forKey: localKey(SyncKey.seeded)),
             exists: exists
         )
     }

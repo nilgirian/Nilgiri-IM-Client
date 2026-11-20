@@ -17,9 +17,18 @@ struct LoginResponse: Decodable {
     let menu: Bool?
     /// `menu` or `playing`. The boolean `menu` wins when both are present.
     let state: String?
+    /// Whether this session may receive pushes. Omitted by older servers.
+    let active: Bool?
+    /// False when this call did not store a device token. The session still stands.
+    let deviceBound: Bool?
+    /// Characters already on this device when `deviceBound` is true, else 0.
+    let deviceCount: Int?
+    /// Server cap. The app also refuses a seventh character locally.
+    let deviceLimit: Int?
 
     private enum CodingKeys: String, CodingKey {
         case token, sessionId, character, lines, resumed, parked, disconnectedAt, menu, state
+        case active, deviceBound, deviceCount, deviceLimit
     }
 
     init(from decoder: Decoder) throws {
@@ -33,6 +42,61 @@ struct LoginResponse: Decodable {
         disconnectedAt = EpochMillis.decodeIfPresent(container, forKey: .disconnectedAt)
         menu = JSONBool.decodeIfPresent(container, forKey: .menu)
         state = JSONBool.stringIfPresent(container, forKey: .state)
+        active = JSONBool.decodeIfPresent(container, forKey: .active)
+        deviceBound = JSONBool.decodeIfPresent(container, forKey: .deviceBound)
+        deviceCount = Self.decodeCount(container, forKey: .deviceCount)
+        deviceLimit = Self.decodeCount(container, forKey: .deviceLimit)
+    }
+
+    private static func decodeCount(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        forKey key: CodingKeys
+    ) -> Int? {
+        guard container.contains(key) else { return nil }
+        if (try? container.decodeNil(forKey: key)) == true { return nil }
+        if let value = try? container.decode(Int.self, forKey: key) { return value }
+        if let value = try? container.decode(Double.self, forKey: key), value.isFinite {
+            return Int(value)
+        }
+        return nil
+    }
+}
+
+/// `GET /v1/sessions/{id}/characters`. Bearers stay on this phone; the list
+/// only names who is already logged in on the device.
+struct DeviceCharacterList: Decodable {
+    let limit: Int
+    let count: Int
+    let deviceBound: Bool
+    let characters: [DeviceCharacter]
+
+    private enum CodingKeys: String, CodingKey {
+        case limit, count, deviceBound, characters
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        limit = (try? container.decode(Int.self, forKey: .limit)) ?? 6
+        count = (try? container.decode(Int.self, forKey: .count)) ?? 0
+        deviceBound = JSONBool.decodeIfPresent(container, forKey: .deviceBound) ?? false
+        characters = (try? container.decode([DeviceCharacter].self, forKey: .characters)) ?? []
+    }
+}
+
+struct DeviceCharacter: Decodable {
+    let sessionId: String
+    let character: String
+    let active: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionId, character, active
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = (try? container.decode(String.self, forKey: .sessionId)) ?? ""
+        character = (try? container.decode(String.self, forKey: .character)) ?? ""
+        active = JSONBool.decodeIfPresent(container, forKey: .active) ?? false
     }
 }
 
