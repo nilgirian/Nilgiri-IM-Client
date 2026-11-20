@@ -111,29 +111,36 @@ enum CharacterPreferenceScope {
 /// defaults off. Show action help defaults on, so the line under Actions
 /// stays visible until the switch is turned off. Moving a switch writes the key.
 final class KeyboardHidePreferences: ObservableObject {
-    @Published var hideInPortrait: Bool {
-        didSet { UserDefaults.standard.set(hideInPortrait, forKey: scoped(Key.portrait)) }
+    /// False until `init` has finished `load()`. The default values below are
+    /// only so the properties exist before that call. `didSet` must not write
+    /// them, or a missing key would be stored before the saved value is read.
+    /// `load` also clears this so a character switch does not write the
+    /// previous character's values into the new keys.
+    private var saves = false
+
+    @Published var hideInPortrait = false {
+        didSet { store(hideInPortrait, Key.portrait) }
     }
 
-    @Published var hideInLandscape: Bool {
-        didSet { UserDefaults.standard.set(hideInLandscape, forKey: scoped(Key.landscape)) }
+    @Published var hideInLandscape = false {
+        didSet { store(hideInLandscape, Key.landscape) }
     }
 
     /// Hide the letter on each on-screen hot button. The plate stays, and it still lights.
-    @Published var hideHotButtonLabels: Bool {
-        didSet { UserDefaults.standard.set(hideHotButtonLabels, forKey: scoped(Key.hotButtonLabels)) }
+    @Published var hideHotButtonLabels = false {
+        didSet { store(hideHotButtonLabels, Key.hotButtonLabels) }
     }
 
     /// Grey placeholder of the last command sent from the input line.
     /// Return on an empty field sends that text. Off leaves the placeholder blank.
-    @Published var keepLastCommand: Bool {
-        didSet { UserDefaults.standard.set(keepLastCommand, forKey: scoped(Key.keepLastCommand)) }
+    @Published var keepLastCommand = false {
+        didSet { store(keepLastCommand, Key.keepLastCommand) }
     }
 
     /// The line under Actions: double tap to edit.
     /// Missing key leaves it showing.
-    @Published var showActionHelp: Bool {
-        didSet { UserDefaults.standard.set(showActionHelp, forKey: scoped(Key.showActionHelp)) }
+    @Published var showActionHelp = true {
+        didSet { store(showActionHelp, Key.showActionHelp) }
     }
 
     private enum Key {
@@ -150,6 +157,7 @@ final class KeyboardHidePreferences: ObservableObject {
     init() {
         load()
         loadedFor = CharacterPreferenceScope.key
+        saves = true
     }
 
     /// Loads the character `CharacterPreferenceScope` currently names.
@@ -162,6 +170,9 @@ final class KeyboardHidePreferences: ObservableObject {
     }
 
     private func load() {
+        let resume = saves
+        saves = false
+        defer { saves = resume }
         let defaults = UserDefaults.standard
         let phone = UIDevice.current.userInterfaceIdiom == .phone
         hideInPortrait = Self.stored(defaults, scoped(Key.portrait), fallback: false)
@@ -169,6 +180,13 @@ final class KeyboardHidePreferences: ObservableObject {
         hideHotButtonLabels = Self.stored(defaults, scoped(Key.hotButtonLabels), fallback: false)
         keepLastCommand = Self.stored(defaults, scoped(Key.keepLastCommand), fallback: false)
         showActionHelp = Self.stored(defaults, scoped(Key.showActionHelp), fallback: true)
+    }
+
+    /// A switch the player moved. `load` turns this off so reading a character
+    /// does not write that character's keys.
+    private func store(_ value: Bool, _ base: String) {
+        guard saves else { return }
+        UserDefaults.standard.set(value, forKey: scoped(base))
     }
 
     private func scoped(_ base: String) -> String {
