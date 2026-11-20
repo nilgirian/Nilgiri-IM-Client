@@ -453,7 +453,9 @@ final class IMSession: ObservableObject {
     /// Posts the command line. `fallback` is sent only when the field is blank,
     /// and it is not written into the field, so a repeated command can stay
     /// a grey placeholder. The welcome menu is the panel; a typed line would
-    /// answer it.
+    /// answer it. Semicolons are not special here: Say, hot buttons, and
+    /// saved actions send their text whole. Command mode splits before it
+    /// calls `sendLine`.
     func send(fallback: String? = nil) async {
         guard atMenu == false else { return }
         menuExit = false
@@ -467,8 +469,20 @@ final class IMSession: ObservableObject {
         if command.isEmpty == false {
             command = ""
         }
+        await sendLine(text)
+    }
+
+    /// One command on the input post `send()` uses. Does not read the field
+    /// and does not split on `;`. Command mode calls this once per piece,
+    /// after the field has already been cleared, so a later piece is not
+    /// written into the line.
+    func sendLine(_ text: String) async {
+        let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard line.isEmpty == false else { return }
+        guard atMenu == false else { return }
+        menuExit = false
         do {
-            let data = try await post("/input", ["text": text])
+            let data = try await post("/input", ["text": line])
             noteMenuFlag(data)
         } catch {
             status = failureMessage(error)

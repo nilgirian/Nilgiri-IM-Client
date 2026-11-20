@@ -137,6 +137,23 @@ private enum CommunicationCommand {
     }
 }
 
+/// TinTin++ command separator. Only a command-mode submit (Return or Send)
+/// splits on `;`. Whitespace around each piece is dropped, and empty pieces
+/// are dropped, so `n;;  ;n ;` is `n` then `n`. A line of only separators
+/// has no pieces. Say, hot buttons, compass directions, and saved actions
+/// do not use this. Text from the server is never passed through it.
+private enum CommandSeparator {
+    static func pieces(in line: String) -> [String] {
+        var pieces: [String] = []
+        for piece in line.split(separator: ";", omittingEmptySubsequences: false) {
+            let trimmed = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.isEmpty == false else { continue }
+            pieces.append(trimmed)
+        }
+        return pieces
+    }
+}
+
 /// SGR colour carried across transcript rows. Keyed by line id so a 4000-line
 /// buffer is not reparsed on scroll: only a changed suffix is scanned, and a
 /// separator passes the previous colour through. Surviving ids keep the end
@@ -2664,10 +2681,11 @@ struct TranscriptView: View {
     @StateObject private var keyboardPrefs = KeyboardHidePreferences()
     @StateObject private var matrixMode = MatrixMode.shared
     /// Last non-communication line posted from the input bar (Return or Send).
-    /// Speech, channels, and the Say button leave this unchanged. Compass
-    /// directions and hot buttons do not replace it. Shown greyed out, and
-    /// repeated from an empty field, only while Keep last command is on.
-    /// Kept for this play screen, not on disk.
+    /// A line split on `;` is stored whole, once, not as each piece. Speech,
+    /// channels, and the Say button leave this unchanged. Compass directions
+    /// and hot buttons do not replace it. Shown greyed out, and repeated from
+    /// an empty field, only while Keep last command is on. A repeat splits on
+    /// `;` again. Kept for this play screen, not on disk.
     @State private var lastCommand = ""
     /// The command field should be first responder. Set when this orientation
     /// keeps the keyboard, cleared when the player swipes it away or a switch hides it.
@@ -3080,11 +3098,64 @@ struct TranscriptView: View {
                 await session.send()
                 return
             }
-            await session.send(fallback: lastCommand)
+            await repeatLastCommand()
+            return
+        }
+        let pieces = CommandSeparator.pieces(in: typed)
+        // Separators only (`;;;`). Nothing is posted, and the stored command
+        // is left as it was. A blank field is the path that repeats it.
+        guard pieces.isEmpty == false else {
+            await discardSeparatorOnlyLine()
             return
         }
         rememberLastCommand(typed)
+        // One piece that is the whole line: `send()` trims and posts the field.
+        if pieces.count == 1, pieces[0] == typed {
+            await session.send()
+            return
+        }
+        await postCommandPieces(pieces)
+    }
+
+    /// Empty field, Keep last command on. One stored line with no `;` still
+    /// uses `send(fallback:)`, which does not write the placeholder into the
+    /// field. A stored line with `;` is split and each piece is posted.
+    private func repeatLastCommand() async {
+        let pieces = CommandSeparator.pieces(in: lastCommand)
+        if pieces.count == 1, pieces[0] == lastCommand {
+            await session.send(fallback: lastCommand)
+            return
+        }
+        guard pieces.isEmpty == false else {
+            await session.send()
+            return
+        }
+        await postCommandPieces(pieces)
+    }
+
+    /// The field held only `;` and whitespace. Clear it and take the empty
+    /// `send()`, which posts nothing. The welcome menu leaves the field alone.
+    private func discardSeparatorOnlyLine() async {
+        guard session.atMenu == false else { return }
+        if session.command.isEmpty == false {
+            session.command = ""
+        }
         await session.send()
+    }
+
+    /// Each piece goes through `sendLine`, the post `send()` uses, awaited so
+    /// the server sees them in order. The field is cleared once when it still
+    /// holds the typed line. A placeholder repeat leaves the field blank, so
+    /// writing a piece would restart the keyboard.
+    private func postCommandPieces(_ pieces: [String]) async {
+        guard session.atMenu == false else { return }
+        if session.command.isEmpty == false {
+            session.command = ""
+        }
+        for piece in pieces {
+            guard session.atMenu == false else { return }
+            await session.sendLine(piece)
+        }
     }
 
     /// Posts `say` plus the field. Text that already starts with `say` is sent
@@ -3256,7 +3327,8 @@ struct TranscriptView: View {
     }
 
     /// Remembers a typed Send/Return line unless it is speech or a channel.
-    /// The Say button never calls this.
+    /// The whole typed line is stored once. A `;` inside it does not make a
+    /// separate entry for each piece. The Say button never calls this.
     private func rememberLastCommand(_ text: String) {
         guard CommunicationCommand.isOutgoing(text) == false else { return }
         lastCommand = text
