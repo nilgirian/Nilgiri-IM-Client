@@ -2592,6 +2592,9 @@ private struct CommandLineField: UIViewRepresentable {
     var placeholder: String
     /// Matrix Mode. The field's ink follows it without rewriting the command.
     var matrix: Bool
+    /// A sheet or cover is over the play screen. The field resigns and does not
+    /// take first responder back until this is false.
+    var suspendKeep: Bool
     var onSubmit: () -> Void
 
     func makeUIView(context: Context) -> UITextField {
@@ -2668,11 +2671,16 @@ private struct CommandLineField: UIViewRepresentable {
         }
         coordinator.isFocused = $isFocused
         coordinator.textChanged = { text = $0 }
+        coordinator.suspendKeep = suspendKeep
         if let command = field as? CommandTextField {
             // Live hide switch, not `dismissOnSubmit`: that flag can be a
             // frame behind the drawer. A swipe clears `wantsFocus` first.
+            // The closure reads `suspendKeep` when resign is asked for, so a
+            // cover can hand first responder to the sheet on that same turn.
             command.shouldRemainFirstResponder = { [weak coordinator] in
-                guard let coordinator, coordinator.wantsFocus else { return false }
+                guard let coordinator, coordinator.suspendKeep == false, coordinator.wantsFocus else {
+                    return false
+                }
                 return TranscriptTextView.logTapShouldKeepCommandField()
             }
         }
@@ -2683,7 +2691,17 @@ private struct CommandLineField: UIViewRepresentable {
             field.text = text
             coordinator.applyingText = false
         }
-        if coordinator.wantsFocus != isFocused {
+        // The cover is up. Drop the keep before the focus binding catches up,
+        // or the branch below sees a resigned field and becomes again. That
+        // second become is what leaves the sheet's keyboard unattached.
+        if suspendKeep {
+            if coordinator.wantsFocus {
+                coordinator.wantsFocus = false
+            }
+            if field.isFirstResponder {
+                coordinator.scheduleResign(field)
+            }
+        } else if coordinator.wantsFocus != isFocused {
             coordinator.wantsFocus = isFocused
             if isFocused {
                 coordinator.scheduleBecome(field)
@@ -2723,6 +2741,9 @@ private struct CommandLineField: UIViewRepresentable {
         var dismissOnSubmit = false
         var matrix: Bool?
         var wantsFocus = false
+        /// Picker sheet or login cover. Resign is allowed, and a queued become
+        /// must not run.
+        var suspendKeep = false
         var applyingText = false
         var becoming = false
 
@@ -2805,7 +2826,10 @@ private struct CommandLineField: UIViewRepresentable {
         /// field first responder, so the keyboard never starts to hide. A
         /// long-press selection still resigns. A swipe-down clears
         /// `wantsFocus` before it resigns. Hide-on fails the keep check.
+        /// A cover always ends editing, or the sheet's Name and Password
+        /// never become first responder.
         func textFieldShouldEndEditing(_: UITextField) -> Bool {
+            if suspendKeep { return true }
             if wantsFocus, TranscriptTextView.logTapShouldKeepCommandField() {
                 return false
             }
@@ -2813,6 +2837,11 @@ private struct CommandLineField: UIViewRepresentable {
         }
 
         func textFieldDidBeginEditing(_ textField: UITextField) {
+            if suspendKeep {
+                wantsFocus = false
+                scheduleResign(textField)
+                return
+            }
             wantsFocus = true
             if isFocused.wrappedValue == false {
                 isFocused.wrappedValue = true
@@ -2845,7 +2874,7 @@ private struct CommandLineField: UIViewRepresentable {
                     self.becoming = false
                     return
                 }
-                guard self.wantsFocus else {
+                guard self.wantsFocus, self.suspendKeep == false else {
                     self.becoming = false
                     return
                 }
@@ -2963,6 +2992,10 @@ struct TranscriptView: View {
     /// The command field should be first responder. Set when this orientation
     /// keeps the keyboard, cleared when the player swipes it away or a switch hides it.
     @State private var keyboardHeld = false
+    /// `keyboardHeld` at the moment a picker or login cover opened. Nil while
+    /// no cover is up. Closing the cover puts this back, so a swipe-away stays
+    /// dismissed and a held keyboard comes back.
+    @State private var coverWasHoldingKeyboard: Bool?
     @State private var keyboardOrientationToken = 0
     /// One restore is in flight. Stops a focus drop from scheduling another.
     @State private var restoringKeyboard = false
@@ -3232,6 +3265,13 @@ struct TranscriptView: View {
                     actionPanelShown = false
                 } else {
                     showCommandKeyboardIfPreferred()
+                }
+            }
+            .onChange(of: playScreenCoverPresented) { _, presented in
+                if presented {
+                    yieldCommandKeyboardForCover()
+                } else {
+                    restoreCommandKeyboardAfterCover()
                 }
             }
             .onChange(of: session.deathBannerID) { _, id in
@@ -3537,10 +3577,39 @@ struct TranscriptView: View {
         }
     }
 
-    /// Launch cover is up, or a side card is open. The command
+    /// Launch cover, a side card, or a sheet over the play screen. The command
     /// field must not take first responder until those are clear.
     private var commandKeyboardPaused: Bool {
-        launchSplashUp || keyboardSettingsOpen || actionSlotsOpen
+        launchSplashUp || keyboardSettingsOpen || actionSlotsOpen || playScreenCoverPresented
+    }
+
+    /// Character picker, or the login and create cover. Both sit on top of the
+    /// command field. While either is up the field has to yield the keyboard.
+    private var playScreenCoverPresented: Bool {
+        session.characterPickerPresented || session.addingCharacter
+    }
+
+    /// The picker or the login cover opened. Resign, and cancel a keep that
+    /// was about to call `becomeFirstResponder` again. The held flag is
+    /// remembered, not cleared, so closing the cover can put it back.
+    private func yieldCommandKeyboardForCover() {
+        if coverWasHoldingKeyboard == nil {
+            coverWasHoldingKeyboard = keyboardHeld
+        }
+        keyboardOrientationToken += 1
+        restoringKeyboard = false
+        commandFocused = false
+    }
+
+    /// The cover closed. A keyboard that was being held comes back when this
+    /// orientation leaves it up. A swipe-away stays dismissed. A cover that
+    /// was already up when the play screen appeared follows the hide switch,
+    /// because the field never got its own chance to become first responder.
+    private func restoreCommandKeyboardAfterCover() {
+        let held = coverWasHoldingKeyboard
+        coverWasHoldingKeyboard = nil
+        if let held, held == false { return }
+        showCommandKeyboardIfPreferred()
     }
 
     /// Left-menu switches, Matrix Mode, and the action lists follow the on-screen character.
@@ -3587,7 +3656,8 @@ struct TranscriptView: View {
     /// The switch for whichever orientation is on screen: portrait or landscape.
     /// Off makes the command field first responder and keeps it there.
     /// A swipe-away clears `keyboardHeld`, and that sticks until the next show.
-    /// The launch splash and an open side card are not a show.
+    /// The launch splash, an open side card, and a cover over the play screen
+    /// are not a show.
     private func showCommandKeyboardIfPreferred() {
         guard commandKeyboardPaused == false else { return }
         guard session.atMenu == false else { return }
@@ -3754,6 +3824,7 @@ struct TranscriptView: View {
                     ),
                     placeholder: commandPlaceholder,
                     matrix: matrixMode.enabled,
+                    suspendKeep: playScreenCoverPresented,
                     onSubmit: { Task { await sendCommand() } }
                 )
                     .onAppear {
