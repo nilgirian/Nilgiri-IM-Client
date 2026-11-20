@@ -1,6 +1,102 @@
 import SwiftUI
 import UIKit
 
+/// Which character the on-screen settings belong to. Keys are the existing
+/// names plus `.<lowercased character>`. An empty scope does not read the
+/// old client-wide keys, so a character this install has never seen cannot
+/// pick up someone else's values.
+enum CharacterPreferenceScope {
+    private static let migratedFlag = "im.perCharacterSettingsMigrated"
+
+    /// Lowercased character name currently being read and written. Empty until
+    /// a character is on screen or restored.
+    private(set) static var key: String = ""
+
+    static func storageKey(_ base: String) -> String {
+        let slug = key
+        if slug.isEmpty { return base + ".unset" }
+        return base + "." + slug
+    }
+
+    /// Points later reads and writes at `name`. An empty name leaves the
+    /// previous character in place so a picker with nobody selected does not
+    /// wipe their settings with the fresh defaults.
+    static func adopt(_ name: String?) {
+        let next = name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        guard next.isEmpty == false else { return }
+        key = next
+    }
+
+    /// One-time copy for the character who was logged in when this build first
+    /// launched. Passing nil marks the copy done and copies nothing, so the
+    /// next character starts from the fresh-install defaults.
+    static func migrateLoggedInCharacter(_ name: String?) {
+        let defaults = UserDefaults.standard
+        guard defaults.bool(forKey: migratedFlag) == false else { return }
+        defer { defaults.set(true, forKey: migratedFlag) }
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard trimmed.isEmpty == false else { return }
+        let slug = trimmed.lowercased()
+        for base in userDefaultsBases {
+            copyDefault(base, slug: slug, defaults: defaults)
+        }
+        copyCloud(slug: slug)
+    }
+
+    private static let userDefaultsBases = [
+        "im.hideKeyboardPortrait",
+        "im.hideKeyboardLandscape",
+        "im.hideHotButtonLabels",
+        "im.keepLastCommand",
+        "im.showActionHelp",
+        "im.matrixMode",
+        "im.actionShortcuts",
+        "im.hotButtons",
+        "im.sync.updatedAt",
+        "im.sync.seeded",
+        "im.sync.merged",
+        "im.lastSeq",
+        "im.disconnectAt",
+        "im.disconnectSeq",
+        "im.disconnectName",
+        "im.disconnectServerMs",
+        "im.shownDisconnectMs",
+        "im.hmv",
+        "im.hmvName",
+    ]
+
+    private static let cloudBases = [
+        "im.sync.actionShortcuts",
+        "im.sync.hotButtons",
+        "im.sync.updatedAt",
+        "im.sync.seeded",
+    ]
+
+    private static func copyDefault(_ base: String, slug: String, defaults: UserDefaults) {
+        guard defaults.object(forKey: base) != nil else { return }
+        let dest = base + "." + slug
+        guard defaults.object(forKey: dest) == nil else { return }
+        defaults.set(defaults.object(forKey: base), forKey: dest)
+    }
+
+    /// The pre-multi iCloud blob is this character's synced lists. Copy it
+    /// once under their name. Later characters read only their own keys.
+    private static func copyCloud(slug: String) {
+        let store = NSUbiquitousKeyValueStore.default
+        _ = store.synchronize()
+        var wrote = false
+        for base in cloudBases {
+            let dest = base + "." + slug
+            guard store.object(forKey: dest) == nil, let value = store.object(forKey: base) else { continue }
+            store.set(value, forKey: dest)
+            wrote = true
+        }
+        if wrote {
+            _ = store.synchronize()
+        }
+    }
+}
+
 /// Whether sending a command, or turning the window, dismisses the keyboard.
 /// Also whether the input line keeps the last command as grey placeholder text.
 /// Missing keys keep the device default. iPhone hides in landscape only.
@@ -10,28 +106,28 @@ import UIKit
 /// stays visible until the switch is turned off. Moving a switch writes the key.
 final class KeyboardHidePreferences: ObservableObject {
     @Published var hideInPortrait: Bool {
-        didSet { UserDefaults.standard.set(hideInPortrait, forKey: Key.portrait) }
+        didSet { UserDefaults.standard.set(hideInPortrait, forKey: scoped(Key.portrait)) }
     }
 
     @Published var hideInLandscape: Bool {
-        didSet { UserDefaults.standard.set(hideInLandscape, forKey: Key.landscape) }
+        didSet { UserDefaults.standard.set(hideInLandscape, forKey: scoped(Key.landscape)) }
     }
 
     /// Hide the letter on each on-screen hot button. The plate stays, and it still lights.
     @Published var hideHotButtonLabels: Bool {
-        didSet { UserDefaults.standard.set(hideHotButtonLabels, forKey: Key.hotButtonLabels) }
+        didSet { UserDefaults.standard.set(hideHotButtonLabels, forKey: scoped(Key.hotButtonLabels)) }
     }
 
     /// Grey placeholder of the last command sent from the input line.
     /// Return on an empty field sends that text. Off leaves the placeholder blank.
     @Published var keepLastCommand: Bool {
-        didSet { UserDefaults.standard.set(keepLastCommand, forKey: Key.keepLastCommand) }
+        didSet { UserDefaults.standard.set(keepLastCommand, forKey: scoped(Key.keepLastCommand)) }
     }
 
     /// The line under Actions: double tap to edit.
     /// Missing key leaves it showing.
     @Published var showActionHelp: Bool {
-        didSet { UserDefaults.standard.set(showActionHelp, forKey: Key.showActionHelp) }
+        didSet { UserDefaults.standard.set(showActionHelp, forKey: scoped(Key.showActionHelp)) }
     }
 
     private enum Key {
@@ -42,14 +138,35 @@ final class KeyboardHidePreferences: ObservableObject {
         static let showActionHelp = "im.showActionHelp"
     }
 
+    /// Character whose keys are loaded. A switch to someone else reads again.
+    private var loadedFor = ""
+
     init() {
+        load()
+        loadedFor = CharacterPreferenceScope.key
+    }
+
+    /// Loads the character `CharacterPreferenceScope` currently names.
+    /// A missing key uses the fresh-install default, not another character's value.
+    func reload() {
+        let key = CharacterPreferenceScope.key
+        guard key != loadedFor else { return }
+        load()
+        loadedFor = key
+    }
+
+    private func load() {
         let defaults = UserDefaults.standard
         let phone = UIDevice.current.userInterfaceIdiom == .phone
-        hideInPortrait = Self.stored(defaults, Key.portrait, fallback: false)
-        hideInLandscape = Self.stored(defaults, Key.landscape, fallback: phone)
-        hideHotButtonLabels = Self.stored(defaults, Key.hotButtonLabels, fallback: false)
-        keepLastCommand = Self.stored(defaults, Key.keepLastCommand, fallback: false)
-        showActionHelp = Self.stored(defaults, Key.showActionHelp, fallback: true)
+        hideInPortrait = Self.stored(defaults, scoped(Key.portrait), fallback: false)
+        hideInLandscape = Self.stored(defaults, scoped(Key.landscape), fallback: phone)
+        hideHotButtonLabels = Self.stored(defaults, scoped(Key.hotButtonLabels), fallback: false)
+        keepLastCommand = Self.stored(defaults, scoped(Key.keepLastCommand), fallback: false)
+        showActionHelp = Self.stored(defaults, scoped(Key.showActionHelp), fallback: true)
+    }
+
+    private func scoped(_ base: String) -> String {
+        CharacterPreferenceScope.storageKey(base)
     }
 
     func hidesKeyboard(isPortrait: Bool) -> Bool {
@@ -61,9 +178,9 @@ final class KeyboardHidePreferences: ObservableObject {
         let defaults = UserDefaults.standard
         let phone = UIDevice.current.userInterfaceIdiom == .phone
         if interfaceIsPortrait() {
-            return stored(defaults, Key.portrait, fallback: false)
+            return stored(defaults, CharacterPreferenceScope.storageKey(Key.portrait), fallback: false)
         }
-        return stored(defaults, Key.landscape, fallback: phone)
+        return stored(defaults, CharacterPreferenceScope.storageKey(Key.landscape), fallback: phone)
     }
 
     /// The window, not the log. The keyboard shortens the log without a rotation.

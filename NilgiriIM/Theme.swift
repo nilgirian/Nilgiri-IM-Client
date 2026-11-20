@@ -28,15 +28,41 @@ final class MatrixMode: ObservableObject {
     static let shared = MatrixMode()
 
     @Published var enabled: Bool {
-        didSet { UserDefaults.standard.set(enabled, forKey: Key.enabled) }
+        didSet { UserDefaults.standard.set(enabled, forKey: Self.scopedKey) }
     }
 
     private enum Key {
         static let enabled = "im.matrixMode"
     }
 
+    /// Character whose key is loaded. A switch reads that character's value.
+    private var loadedFor = ""
+
     private init() {
-        enabled = UserDefaults.standard.bool(forKey: Key.enabled)
+        enabled = Self.read()
+        loadedFor = CharacterPreferenceScope.key
+    }
+
+    /// Loads Matrix Mode for the character currently in scope.
+    /// A missing key stays off, which is the fresh-install default.
+    func reload() {
+        let key = CharacterPreferenceScope.key
+        guard key != loadedFor else { return }
+        loadedFor = key
+        let next = Self.read()
+        if enabled != next {
+            enabled = next
+        }
+    }
+
+    private static var scopedKey: String {
+        CharacterPreferenceScope.storageKey(Key.enabled)
+    }
+
+    private static func read() -> Bool {
+        let key = scopedKey
+        guard UserDefaults.standard.object(forKey: key) != nil else { return false }
+        return UserDefaults.standard.bool(forKey: key)
     }
 }
 

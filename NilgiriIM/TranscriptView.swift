@@ -2902,8 +2902,14 @@ struct TranscriptView: View {
                 applyKeyboardPreference()
             }
             .onAppear {
+                reloadCharacterPreferences()
                 adoptLaunchSplash(launchSplashVisible)
             }
+            .onChange(of: session.character) { _, _ in
+                reloadCharacterPreferences()
+                lastCommand = ""
+            }
+            .modifier(CharacterSwitchModifier(session: session))
             .onChange(of: launchSplashVisible) { _, visible in
                 adoptLaunchSplash(visible)
             }
@@ -2957,12 +2963,10 @@ struct TranscriptView: View {
 
     /// Character name with the latest prompt beside it: "Sin  30h 100m 97v".
     /// A downed condition is bold red: "STUNNED", "DEAD", "INCAPACITATED".
+    /// The name opens the character list. The counts are not part of that button.
     private var sessionHeader: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(session.character ?? "IM")
-                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                .foregroundStyle(Color.primary.matrix)
-                .lineLimit(1)
+            characterNameButton
             if let label = session.vitals?.label {
                 Text(label)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
@@ -2980,7 +2984,20 @@ struct TranscriptView: View {
                     .layoutPriority(2)
             }
         }
-        .accessibilityElement(children: .combine)
+    }
+
+    /// Tap target for the switcher. With nobody selected after Unlink, it reads "Choose".
+    private var characterNameButton: some View {
+        Button {
+            session.openCharacterPicker()
+        } label: {
+            Text(session.character ?? (session.choosingCharacter ? "Choose" : "IM"))
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundStyle(Color.primary.matrix)
+                .lineLimit(1)
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint("Shows logged-in characters")
     }
 
     /// Holds `YOU ARE DEAD!` for two seconds, then fades it out.
@@ -3177,6 +3194,13 @@ struct TranscriptView: View {
     /// field must not take first responder until those are clear.
     private var commandKeyboardPaused: Bool {
         launchSplashUp || keyboardSettingsOpen || actionSlotsOpen
+    }
+
+    /// Left-menu switches, Matrix Mode, and the action lists follow the on-screen character.
+    private func reloadCharacterPreferences() {
+        keyboardPrefs.reload()
+        matrixMode.reload()
+        menu.reload()
     }
 
     /// Copies the launch cover into `launchSplashUp`. While it is up the
@@ -3913,5 +3937,116 @@ private struct HotButtonStack: View {
                 return
             }
         }
+    }
+}
+
+/// Name-bar picker and the "log in another character" cover.
+/// Kept off `TranscriptView.body` so that view stays able to type-check.
+private struct CharacterSwitchModifier: ViewModifier {
+    @ObservedObject var session: IMSession
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(isPresented: $session.characterPickerPresented) {
+                CharacterPickerSheet()
+                    .environmentObject(session)
+                    .interactiveDismissDisabled(session.characterPickerLocked)
+            }
+            .fullScreenCover(isPresented: $session.addingCharacter) {
+                AdditionalCharacterCover()
+                    .environmentObject(session)
+            }
+    }
+}
+
+/// Login, or character creation, while other characters stay logged in.
+private struct AdditionalCharacterCover: View {
+    @EnvironmentObject private var session: IMSession
+
+    var body: some View {
+        Group {
+            if session.creating {
+                CharacterCreateView()
+            } else {
+                LoginView()
+            }
+        }
+    }
+}
+
+/// Logged-in characters on this device, plus a login row only while fewer than six are in.
+private struct CharacterPickerSheet: View {
+    @EnvironmentObject private var session: IMSession
+    @ObservedObject private var matrixMode = MatrixMode.shared
+
+    var body: some View {
+        NavigationStack {
+            List {
+                characterRows
+                if session.canAddCharacter {
+                    loginRow
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(Color.black)
+            .navigationTitle("Characters")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                if session.characterPickerLocked == false {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") {
+                            session.characterPickerPresented = false
+                        }
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+        .presentationDetents([.medium, .large])
+    }
+
+    private var characterRows: some View {
+        ForEach(session.rosterNames, id: \.self) { name in
+            CharacterPickerRow(
+                name: name,
+                current: session.isCurrentCharacter(name),
+                matrix: matrixMode.enabled
+            ) {
+                Task { await session.switchToCharacter(name) }
+            }
+        }
+    }
+
+    private var loginRow: some View {
+        Button {
+            session.beginAddingCharacter()
+        } label: {
+            Text("Log in another character")
+                .foregroundStyle(Color(white: 0.92).matrix)
+        }
+    }
+}
+
+/// One row in the character list. Split out so the sheet body stays small.
+private struct CharacterPickerRow: View {
+    let name: String
+    let current: Bool
+    let matrix: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack {
+                Text(name)
+                    .foregroundStyle(MatrixShade.display(Color(white: 0.92), enabled: matrix))
+                Spacer()
+                if current {
+                    Image(systemName: "checkmark")
+                        .foregroundStyle(MatrixShade.display(Color(white: 0.78), enabled: matrix))
+                        .accessibilityHidden(true)
+                }
+            }
+        }
+        .accessibilityAddTraits(current ? AccessibilityTraits.isSelected : AccessibilityTraits())
     }
 }

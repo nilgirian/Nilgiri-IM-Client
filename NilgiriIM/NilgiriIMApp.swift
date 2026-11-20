@@ -142,7 +142,7 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if session.token != nil {
+            if session.token != nil || session.choosingCharacter {
                 TranscriptView()
             } else if session.creating {
                 CharacterCreateView()
@@ -162,6 +162,9 @@ struct RootView: View {
             syncOrientationLock()
         }
         .onChange(of: session.creating) { _, _ in
+            syncOrientationLock()
+        }
+        .onChange(of: session.choosingCharacter) { _, _ in
             syncOrientationLock()
         }
         .onChange(of: session.createGreeting == nil) { _, _ in
@@ -191,7 +194,8 @@ struct RootView: View {
     /// rotate once the greeting is showing. The transcript and iPad stay free.
     private func syncOrientationLock() {
         let phone = UIDevice.current.userInterfaceIdiom == .phone
-        let portraitOnly = phone && session.token == nil
+        let inPlay = session.token != nil || session.choosingCharacter
+        let portraitOnly = phone && inPlay == false
             && (session.creating == false || session.createGreeting == nil)
         AppDelegate.orientationLock = portraitOnly ? .portrait : .all
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
