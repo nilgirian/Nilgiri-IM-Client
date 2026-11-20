@@ -2,16 +2,98 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+/// Colour of one shortcut. White is the ink and the plate the menus used
+/// before a row could choose. The other five are bright enough to read on
+/// the black log and the dark card, not dark shades of those hues.
+/// Saved and synced as the raw value (`white`, `red`, …). A missing or
+/// unknown id is white.
+enum ShortcutColor: String, CaseIterable, Equatable {
+    case white
+    case red
+    case yellow
+    case green
+    case cyan
+    case magenta
+
+    static func decode(_ stored: String?) -> ShortcutColor {
+        guard let stored, let color = ShortcutColor(rawValue: stored) else { return .white }
+        return color
+    }
+
+    var spokenName: String {
+        switch self {
+        case .white: return "White"
+        case .red: return "Red"
+        case .yellow: return "Yellow"
+        case .green: return "Green"
+        case .cyan: return "Cyan"
+        case .magenta: return "Magenta"
+        }
+    }
+
+    /// Action label. White is the menu's existing 0.92 text.
+    var label: Color {
+        if self == .white { return Color(white: 0.92) }
+        let (red, green, blue) = components
+        return Color(red: red, green: green, blue: blue)
+    }
+
+    /// Same ink for the editor field and the drag preview.
+    var uiColor: UIColor {
+        if self == .white { return UIColor(white: 0.92, alpha: 1) }
+        let (red, green, blue) = components
+        return UIColor(red: CGFloat(red), green: CGFloat(green), blue: CGFloat(blue), alpha: 1)
+    }
+
+    /// Hot-button plate in the menu. White is the existing 12% wash.
+    var menuPlate: Color {
+        if self == .white { return Color.white.opacity(0.12) }
+        return label.opacity(0.55)
+    }
+
+    var menuPlateUIColor: UIColor {
+        if self == .white { return UIColor(white: 1, alpha: 0.12) }
+        return uiColor.withAlphaComponent(0.55)
+    }
+
+    /// Play-screen plate. White is the shared compass wash.
+    var playPlate: Color {
+        if self == .white { return Chrome.hotButtonPlate }
+        return label.opacity(0.55)
+    }
+
+    /// Press flash. White is the shared flash, so a white button still
+    /// lights the way a compass letter does.
+    var playFlash: Color {
+        if self == .white { return Chrome.hotButtonFlash }
+        return label.opacity(0.85)
+    }
+
+    /// Bright, slightly softened. Not a dark shade: these sit on black.
+    private var components: (Double, Double, Double) {
+        switch self {
+        case .white: return (0.92, 0.92, 0.92)
+        case .red: return (1.0, 0.45, 0.42)
+        case .yellow: return (1.0, 0.86, 0.40)
+        case .green: return (0.42, 0.90, 0.50)
+        case .cyan: return (0.38, 0.90, 0.95)
+        case .magenta: return (0.98, 0.52, 0.84)
+        }
+    }
+}
+
 /// One right-edge shortcut. The text is sent as the player left it.
-/// A new id is minted when the row is created; reloading mints new ids and
-/// the saved order is the string array.
+/// A new id is minted when the row is created; reloading mints new ids.
+/// The saved order is the payload array. `color` is the label ink.
 struct ActionShortcut: Identifiable, Equatable {
     let id: UUID
     var text: String
+    var color: ShortcutColor
 
-    init(text: String) {
+    init(text: String, color: ShortcutColor = .white) {
         self.id = UUID()
         self.text = text
+        self.color = color
     }
 
     /// Tap command. A hilited word is appended, separated by one space.
@@ -30,15 +112,18 @@ struct ActionShortcut: Identifiable, Equatable {
 
 /// One play-screen hot button. `text` is the action as the player left it.
 /// `icon` is 0, 1, or 2 characters. Empty means the plate is drawn with no glyph.
+/// `color` tints the plate. The glyph stays the white it already was.
 struct HotButton: Identifiable, Equatable {
     let id: UUID
     var text: String
     var icon: String
+    var color: ShortcutColor
 
-    init(id: UUID = UUID(), text: String, icon: String) {
+    init(id: UUID = UUID(), text: String, icon: String, color: ShortcutColor = .white) {
         self.id = id
         self.text = text
         self.icon = Self.clampedIcon(icon)
+        self.color = color
     }
 
     /// Newlines are not an icon. Anything past two characters is dropped.
@@ -122,6 +207,8 @@ final class ActionMenuStore: ObservableObject {
     private struct Record: Codable {
         var text: String
         var icon: String
+        /// Absent on a blob written before plates could be tinted.
+        var color: String?
     }
 
     /// Used only when `im.actionShortcuts` has never been saved. Order is the
@@ -151,7 +238,7 @@ final class ActionMenuStore: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
-        let storedShortcuts = defaults.stringArray(forKey: Key.shortcuts)
+        let storedShortcuts = defaults.object(forKey: Key.shortcuts)
         let buttonsMissing = defaults.object(forKey: Key.buttons) == nil
         let loadedButtons: [HotButton]
         let loadedShortcuts: [ActionShortcut]
@@ -162,15 +249,10 @@ final class ActionMenuStore: ObservableObject {
             loadedShortcuts = Self.actionSeed.map { ActionShortcut(text: $0) }
         } else {
             loadedButtons = buttonsMissing ? [] : Self.migrateLegacyLoot(Self.readButtons(defaults))
-            if let storedShortcuts {
-                // Count cap plus the legacy loot rewrite. Other saved strings
-                // and their order are kept, and a list at or under the limit is whole.
-                loadedShortcuts = storedShortcuts.prefix(Self.shortcutLimit).map {
-                    ActionShortcut(text: Self.migratedActionText($0))
-                }
-            } else {
-                loadedShortcuts = []
-            }
+            // Count cap plus the legacy loot rewrite. A string array is the
+            // older payload. A dictionary array carries text and a color id.
+            // Other saved rows and their order are kept.
+            loadedShortcuts = Self.shortcuts(from: storedShortcuts)
         }
         apply(buttons: loadedButtons, shortcuts: loadedShortcuts)
         saveShortcuts()
@@ -255,6 +337,24 @@ final class ActionMenuStore: ObservableObject {
         apply(buttons: next, shortcuts: shortcuts)
     }
 
+    /// Label ink of one action. The words stay. White is the stored default.
+    func updateShortcutColor(id: UUID, color: ShortcutColor) {
+        guard let index = shortcuts.firstIndex(where: { $0.id == id }) else { return }
+        guard shortcuts[index].color != color else { return }
+        var next = shortcuts
+        next[index].color = color
+        apply(buttons: buttons, shortcuts: next)
+    }
+
+    /// Plate tint of one hot button. The glyph and the words stay.
+    func updateButtonColor(id: UUID, color: ShortcutColor) {
+        guard let index = buttons.firstIndex(where: { $0.id == id }) else { return }
+        guard buttons[index].color != color else { return }
+        var next = buttons
+        next[index].color = color
+        apply(buttons: next, shortcuts: shortcuts)
+    }
+
     /// Rewrite one hot button's words in place. The icon and the slot stay.
     /// A key already used by another row is refused, so the command stays in
     /// this list only. Clearing onto the empty key that already exists
@@ -303,11 +403,13 @@ final class ActionMenuStore: ObservableObject {
             return true
         }
         guard buttons.count < Self.hotLimit else { return false }
-        let stored = shortcuts.first(where: { Self.matchKey($0.text) == key })?.text ?? text
+        let source = shortcuts.first(where: { Self.matchKey($0.text) == key })
+        let stored = source?.text ?? text
+        let color = source?.color ?? .white
         let icon = rememberedIcons[key] ?? HotButton.defaultIcon(for: stored)
         var next = buttons
         let dest = min(max(0, index), next.count)
-        next.insert(HotButton(text: stored, icon: icon), at: dest)
+        next.insert(HotButton(text: stored, icon: icon, color: color), at: dest)
         apply(buttons: next, shortcuts: shortcuts)
         return true
     }
@@ -323,9 +425,11 @@ final class ActionMenuStore: ObservableObject {
         guard alreadyInActions || shortcuts.count < Self.shortcutLimit else { return false }
         var nextButtons = buttons
         var carried: String?
+        var carriedColor = ShortcutColor.white
         if let existing = nextButtons.firstIndex(where: { Self.matchKey($0.text) == key }) {
             let button = nextButtons.remove(at: existing)
             carried = button.text
+            carriedColor = button.color
             rememberedIcons[key] = button.icon
         }
         var nextShortcuts = shortcuts
@@ -342,7 +446,7 @@ final class ActionMenuStore: ObservableObject {
         }
         let stored = carried ?? shortcuts.first(where: { Self.matchKey($0.text) == key })?.text ?? text
         let dest = min(max(0, index), nextShortcuts.count)
-        nextShortcuts.insert(ActionShortcut(text: stored), at: dest)
+        nextShortcuts.insert(ActionShortcut(text: stored, color: carriedColor), at: dest)
         apply(buttons: nextButtons, shortcuts: nextShortcuts)
         return true
     }
@@ -430,8 +534,7 @@ final class ActionMenuStore: ObservableObject {
     }
 
     private func saveShortcuts() {
-        let capped = shortcuts.prefix(Self.shortcutLimit).map(\.text)
-        UserDefaults.standard.set(capped, forKey: Key.shortcuts)
+        UserDefaults.standard.set(Self.shortcutPayload(shortcuts), forKey: Key.shortcuts)
     }
 
     private func saveButtons() {
@@ -439,9 +542,70 @@ final class ActionMenuStore: ObservableObject {
         UserDefaults.standard.set(data, forKey: Key.buttons)
     }
 
-    /// Same JSON `im.hotButtons` already stores: an array of `{text, icon}`.
+    /// `im.actionShortcuts` and `im.sync.actionShortcuts`. Each entry is
+    /// `{text, color}`. `color` is the stable id. The cap is the same one
+    /// `apply` already enforces.
+    private static func shortcutPayload(_ shortcuts: [ActionShortcut]) -> [[String: String]] {
+        shortcuts.prefix(shortcutLimit).map { shortcut in
+            ["text": shortcut.text, "color": shortcut.color.rawValue]
+        }
+    }
+
+    /// A string array is the payload from before colors. A dictionary array
+    /// is the current one. An empty array is an empty list, not a seed.
+    /// Anything that is not one of those shapes is empty: the key was
+    /// present, so the caller does not write the factory list over it.
+    /// A missing color, or one this build does not know, is white.
+    private static func shortcuts(from stored: Any?) -> [ActionShortcut] {
+        let rows = shortcutRows(from: stored)
+        return rows.prefix(shortcutLimit).map { row in
+            ActionShortcut(text: migratedActionText(row.text), color: ShortcutColor.decode(row.color))
+        }
+    }
+
+    private static func shortcutRows(from stored: Any?) -> [(text: String, color: String?)] {
+        guard let stored else { return [] }
+        if let rows = stored as? [[String: String]] {
+            return rows.compactMap(shortcutRow(from:))
+        }
+        if let rows = stored as? [[String: Any]] {
+            return rows.compactMap(shortcutRow(from:))
+        }
+        if let texts = stored as? [String] {
+            return texts.map { (text: $0, color: nil) }
+        }
+        if let rows = stored as? [Any] {
+            return rows.compactMap(shortcutRow(from:))
+        }
+        return []
+    }
+
+    private static func shortcutRow(from row: [String: String]) -> (text: String, color: String?)? {
+        guard let text = row["text"] else { return nil }
+        return (text: text, color: row["color"])
+    }
+
+    private static func shortcutRow(from row: [String: Any]) -> (text: String, color: String?)? {
+        guard let text = row["text"] as? String else { return nil }
+        return (text: text, color: row["color"] as? String)
+    }
+
+    private static func shortcutRow(from element: Any) -> (text: String, color: String?)? {
+        if let text = element as? String {
+            return (text: text, color: nil)
+        }
+        if let row = element as? [String: Any] {
+            return shortcutRow(from: row)
+        }
+        return nil
+    }
+
+    /// Same JSON `im.hotButtons` already stores, plus `color` when set.
+    /// An older object without `color` still decodes.
     private static func buttonData(_ buttons: [HotButton]) -> Data? {
-        let records = buttons.map { Record(text: $0.text, icon: HotButton.clampedIcon($0.icon)) }
+        let records = buttons.map { button in
+            Record(text: button.text, icon: HotButton.clampedIcon(button.icon), color: button.color.rawValue)
+        }
         return try? JSONEncoder().encode(records)
     }
 
@@ -456,7 +620,9 @@ final class ActionMenuStore: ObservableObject {
               let records = try? JSONDecoder().decode([Record].self, from: data) else {
             return []
         }
-        return records.map { HotButton(text: $0.text, icon: $0.icon) }
+        return records.map { record in
+            HotButton(text: record.text, icon: record.icon, color: ShortcutColor.decode(record.color))
+        }
     }
 
     /// One cloud snapshot. `exists` is false when none of the payload keys
@@ -496,7 +662,8 @@ final class ActionMenuStore: ObservableObject {
     }
 
     /// The current factory lists, or the previous ones (loot plus hit / look /
-    /// flee). Text and icon, not row id. Either pair stays `seeded`, so it is
+    /// flee). Text and icon, not row id, and every colour still white. A tint
+    /// is a player edit. Either pair stays `seeded`, so it is
     /// not uploaded and a cloud player list replaces it. A player who edited
     /// and then landed back on these rows is not a seed: the stored flag says so.
     private static func isFactorySeed(buttons: [HotButton], shortcuts: [ActionShortcut]) -> Bool {
@@ -510,10 +677,15 @@ final class ActionMenuStore: ObservableObject {
         hot: [HotButton],
         actions: [String]
     ) -> Bool {
-        guard shortcuts.map(\.text) == actions else { return false }
+        guard shortcuts.count == actions.count else { return false }
+        for (shortcut, text) in zip(shortcuts, actions) {
+            if shortcut.text != text || shortcut.color != .white { return false }
+        }
         guard buttons.count == hot.count else { return false }
         for (button, seed) in zip(buttons, hot) {
-            if button.text != seed.text || button.icon != seed.icon { return false }
+            if button.text != seed.text || button.icon != seed.icon || button.color != .white {
+                return false
+            }
         }
         return true
     }
@@ -679,9 +851,18 @@ final class ActionMenuStore: ObservableObject {
     /// already on screen does not mint new row ids on every download.
     private func sameLists(buttons proposedButtons: [HotButton], shortcuts proposedShortcuts: [ActionShortcut]) -> Bool {
         let next = Self.cappedLists(buttons: proposedButtons, shortcuts: proposedShortcuts)
-        let sameButtons = buttons.map(\.text) == next.buttons.map(\.text)
-            && buttons.map(\.icon) == next.buttons.map(\.icon)
-        return sameButtons && shortcuts.map(\.text) == next.shortcuts.map(\.text)
+        guard buttons.count == next.buttons.count, shortcuts.count == next.shortcuts.count else {
+            return false
+        }
+        for (button, other) in zip(buttons, next.buttons) {
+            if button.text != other.text || button.icon != other.icon || button.color != other.color {
+                return false
+            }
+        }
+        for (shortcut, other) in zip(shortcuts, next.shortcuts) {
+            if shortcut.text != other.text || shortcut.color != other.color { return false }
+        }
+        return true
     }
 
     /// Same dedupe as `apply`, then `shortcutLimit`. Hot-button keys leave
@@ -716,7 +897,7 @@ final class ActionMenuStore: ObservableObject {
     ) -> (buttons: [HotButton], shortcuts: [ActionShortcut]) {
         var seen = Set<String>()
         var mergedButtons: [HotButton] = []
-        var overflow: [String] = []
+        var overflow: [ActionShortcut] = []
         func considerHot(_ button: HotButton) {
             let key = matchKey(button.text)
             if seen.contains(key) { return }
@@ -724,7 +905,7 @@ final class ActionMenuStore: ObservableObject {
                 seen.insert(key)
                 mergedButtons.append(button)
             } else {
-                overflow.append(button.text)
+                overflow.append(ActionShortcut(text: button.text, color: button.color))
             }
         }
         for button in localButtons { considerHot(button) }
@@ -740,7 +921,7 @@ final class ActionMenuStore: ObservableObject {
         }
         for shortcut in localShortcuts { considerAction(shortcut) }
         for shortcut in cloudShortcuts { considerAction(shortcut) }
-        for text in overflow { considerAction(ActionShortcut(text: text)) }
+        for shortcut in overflow { considerAction(shortcut) }
         return (mergedButtons, mergedShortcuts)
     }
 
@@ -776,8 +957,7 @@ final class ActionMenuStore: ObservableObject {
         guard iCloudAvailable, seeded == false else { return }
         guard let data = Self.buttonData(buttons) else { return }
         let store = NSUbiquitousKeyValueStore.default
-        let texts = Array(shortcuts.prefix(Self.shortcutLimit).map(\.text))
-        store.set(texts, forKey: SyncKey.shortcuts)
+        store.set(Self.shortcutPayload(shortcuts), forKey: SyncKey.shortcuts)
         store.set(data, forKey: SyncKey.buttons)
         store.set(false, forKey: SyncKey.seeded)
         store.set(stamp, forKey: SyncKey.updatedAt)
@@ -795,8 +975,7 @@ final class ActionMenuStore: ObservableObject {
         let buttonsValue = store.object(forKey: SyncKey.buttons)
         let updatedValue = store.object(forKey: SyncKey.updatedAt)
         let exists = shortcutsValue != nil || buttonsValue != nil || updatedValue != nil
-        let texts = (store.array(forKey: SyncKey.shortcuts) ?? []).compactMap { $0 as? String }
-        let cloudShortcuts = texts.map { ActionShortcut(text: Self.migratedActionText($0)) }
+        let cloudShortcuts = Self.shortcuts(from: shortcutsValue)
         let cloudButtons = Self.migrateLegacyLoot(Self.buttons(from: store.data(forKey: SyncKey.buttons)))
         return CloudLists(
             buttons: cloudButtons,
@@ -837,6 +1016,8 @@ struct ActionSlotsDrawer: View {
 
     private enum Metrics {
         static let rowStride: CGFloat = 48
+        /// Text field plus the colour row. Matches `ShortcutEditorMetrics`.
+        static let editorStride: CGFloat = ShortcutEditorMetrics.height
         static let deleteDistance: CGFloat = 64
     }
 
@@ -1143,21 +1324,11 @@ struct ActionSlotsDrawer: View {
             }
             Group {
                 if editingID == shortcut.id {
-                    ShortcutEditor(
-                        text: shortcut.text,
-                        onText: { menu.updateShortcut(id: shortcut.id, text: $0) },
-                        onCommit: {
-                            if editingID == shortcut.id {
-                                editingID = nil
-                            }
-                        },
-                        onDelete: { deleteShortcut(shortcut.id) }
-                    )
-                    .accessibilityLabel("Shortcut text")
+                    shortcutEditor(shortcut)
                 } else {
                     Text(verbatim: trimmed.isEmpty ? "shortcut" : shortcut.text)
                         .font(.system(size: 17, design: .monospaced))
-                        .foregroundStyle(Color(white: 0.92).opacity(trimmed.isEmpty ? 0.35 : 1))
+                        .foregroundStyle(shortcut.color.label.opacity(trimmed.isEmpty ? 0.35 : 1))
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
@@ -1168,6 +1339,7 @@ struct ActionSlotsDrawer: View {
                                 dragText: shortcut.text,
                                 dragLabel: trimmed.isEmpty ? "shortcut" : shortcut.text,
                                 dragLabelDimmed: trimmed.isEmpty,
+                                dragLabelColor: shortcut.color.uiColor,
                                 onTap: { _ in
                                     activate(text: shortcut.text, width: width) {
                                         editShortcut(shortcut.id)
@@ -1220,9 +1392,28 @@ struct ActionSlotsDrawer: View {
             .opacity(actionRowOpacity(index: index))
         }
         .frame(maxWidth: .infinity)
-        .frame(height: Metrics.rowStride)
+        .frame(height: editingID == shortcut.id ? Metrics.editorStride : Metrics.rowStride)
         .zIndex(dragging ? 1 : 0)
         .id(shortcut.id)
+    }
+
+    /// Double-tap field plus the six colour swatches. Split out of the row
+    /// so the label branch stays the one that type-checks on its own.
+    private func shortcutEditor(_ shortcut: ActionShortcut) -> some View {
+        ShortcutEditor(
+            text: shortcut.text,
+            ink: shortcut.color.uiColor,
+            selectedColor: shortcut.color,
+            onText: { menu.updateShortcut(id: shortcut.id, text: $0) },
+            onColor: { menu.updateShortcutColor(id: shortcut.id, color: $0) },
+            onCommit: {
+                if editingID == shortcut.id {
+                    editingID = nil
+                }
+            },
+            onDelete: { deleteShortcut(shortcut.id) }
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
 
     private var shortcutHint: String {
@@ -1273,12 +1464,14 @@ struct ActionSlotsDrawer: View {
         let offset: CGSize = hotRowOffset(index: index)
         let dragging: Bool = held?.list == .hotButtons && held?.id == button.id
         let trimmed: String = button.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        return HStack(spacing: 10) {
+        let editing = editingButtonID == button.id
+        return HStack(alignment: editing ? .top : .center, spacing: 10) {
             hotButtonIcon(button)
+                .padding(.top, editing ? 8 : 0)
             hotButtonTitle(button, trimmed: trimmed)
         }
         .frame(maxWidth: .infinity)
-        .frame(height: Metrics.rowStride)
+        .frame(height: editing ? Metrics.editorStride : Metrics.rowStride)
         .overlay {
             hotButtonGestures(button: button, width: width, trimmed: trimmed)
         }
@@ -1326,16 +1519,16 @@ struct ActionSlotsDrawer: View {
                 }
             )
             .frame(width: 40, height: 32)
-            .background(iconPlateFill)
+            .background(iconPlateFill(button.color))
         } else if editingButtonID == button.id {
-            iconPlate(button.icon)
+            iconPlate(button.icon, color: button.color)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     editingButtonID = nil
                     editingIconID = button.id
                 }
         } else {
-            iconPlate(button.icon)
+            iconPlate(button.icon, color: button.color)
         }
     }
 
@@ -1348,7 +1541,9 @@ struct ActionSlotsDrawer: View {
                 text: button.text,
                 placeholder: "action",
                 fieldLabel: "Hot button text",
+                selectedColor: button.color,
                 onText: { menu.updateButtonText(id: button.id, text: $0) },
+                onColor: { menu.updateButtonColor(id: button.id, color: $0) },
                 onCommit: {
                     if editingButtonID == button.id {
                         editingButtonID = nil
@@ -1377,6 +1572,7 @@ struct ActionSlotsDrawer: View {
                 dragLabel: trimmed.isEmpty ? "action" : button.text,
                 dragLabelDimmed: trimmed.isEmpty,
                 dragBadge: button.icon,
+                dragBadgePlate: button.color.menuPlateUIColor,
                 previewMatrix: matrixMode.enabled,
                 onTap: { _ in
                     activate(text: button.text, width: width) {
@@ -1397,19 +1593,21 @@ struct ActionSlotsDrawer: View {
         }
     }
 
-    private func iconPlate(_ icon: String) -> some View {
+    private func iconPlate(_ icon: String, color: ShortcutColor) -> some View {
         Text(verbatim: icon)
             .font(.system(size: 17, weight: .bold, design: .monospaced))
             .foregroundStyle(MatrixShade.display(Color(white: 0.92), enabled: matrixMode.enabled))
             .lineLimit(1)
             .minimumScaleFactor(0.5)
             .frame(width: 40, height: 32)
-            .background(iconPlateFill)
+            .background(iconPlateFill(color))
     }
 
-    private var iconPlateFill: some View {
+    /// Glyph stays the white it already was. The fill is the chosen tint.
+    /// White is the 12% wash this plate used before tints existed.
+    private func iconPlateFill(_ color: ShortcutColor) -> some View {
         RoundedRectangle(cornerRadius: 8, style: .continuous)
-            .fill(Color.white.opacity(0.12))
+            .fill(color.menuPlate)
     }
 
     /// Opens from the right edge, or follows a finger that is already dragging the card.
@@ -1951,20 +2149,153 @@ struct ActionSlotsDrawer: View {
     }
 }
 
+/// Field plus the colour row. The drawer uses `height` as the editing row.
+private enum ShortcutEditorMetrics {
+    static let fieldHeight: CGFloat = 48
+    static let colorRowHeight: CGFloat = 40
+    static var height: CGFloat { fieldHeight + colorRowHeight }
+}
+
+/// One swatch. The ring sits outside the fill so white still shows a mark
+/// against the dark card.
+private final class ShortcutSwatch: UIControl {
+    let color: ShortcutColor
+    var marked = false {
+        didSet {
+            guard marked != oldValue else { return }
+            accessibilityTraits = marked ? [.button, .selected] : [.button]
+            setNeedsDisplay()
+        }
+    }
+
+    init(color: ShortcutColor) {
+        self.color = color
+        super.init(frame: .zero)
+        isAccessibilityElement = true
+        accessibilityLabel = color.spokenName
+        accessibilityTraits = [.button]
+        backgroundColor = .clear
+        isOpaque = false
+        contentMode = .redraw
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func draw(_ rect: CGRect) {
+        let diameter: CGFloat = 22
+        let circle = CGRect(
+            x: (bounds.width - diameter) / 2,
+            y: (bounds.height - diameter) / 2,
+            width: diameter,
+            height: diameter
+        )
+        color.uiColor.setFill()
+        UIBezierPath(ovalIn: circle).fill()
+        guard marked else { return }
+        let ring = circle.insetBy(dx: -4, dy: -4)
+        let path = UIBezierPath(ovalIn: ring)
+        path.lineWidth = 2
+        UIColor.white.setStroke()
+        path.stroke()
+    }
+}
+
+/// Text field on top, six swatches under it. The swatches are not inside
+/// the field: a tap there would resign it before the colour landed. Hit
+/// testing marks that tap so `textFieldShouldEndEditing` keeps the keyboard.
+private final class ShortcutEditorView: UIView {
+    let field = UITextField()
+    var allowEnd = false
+    var keepingEdit = false
+    var onColor: (ShortcutColor) -> Void = { _ in }
+    private var swatches: [ShortcutSwatch] = []
+
+    var swatchIsTracking: Bool {
+        swatches.contains { $0.isTracking || $0.isHighlighted }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isOpaque = false
+        isAccessibilityElement = false
+        addSubview(field)
+        for color in ShortcutColor.allCases {
+            let swatch = ShortcutSwatch(color: color)
+            swatch.addTarget(self, action: #selector(swatchDown(_:)), for: .touchDown)
+            let ended: UIControl.Event = [.touchUpInside, .touchUpOutside, .touchCancel]
+            swatch.addTarget(self, action: #selector(swatchEnded), for: ended)
+            addSubview(swatch)
+            swatches.append(swatch)
+        }
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func applySelection(_ color: ShortcutColor) {
+        for swatch in swatches {
+            swatch.marked = swatch.color == color
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let textHeight = min(ShortcutEditorMetrics.fieldHeight, bounds.height)
+        field.frame = CGRect(x: 0, y: 0, width: bounds.width, height: textHeight)
+        let count = CGFloat(swatches.count)
+        guard count > 0 else { return }
+        let rowHeight = max(0, bounds.height - textHeight)
+        let width = bounds.width / count
+        for (index, swatch) in swatches.enumerated() {
+            swatch.frame = CGRect(
+                x: CGFloat(index) * width,
+                y: textHeight,
+                width: width,
+                height: rowHeight
+            )
+        }
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hit = super.hitTest(point, with: event)
+        keepingEdit = hit is ShortcutSwatch
+        return hit
+    }
+
+    @objc private func swatchDown(_ sender: ShortcutSwatch) {
+        keepingEdit = true
+        onColor(sender.color)
+    }
+
+    @objc private func swatchEnded() {
+        DispatchQueue.main.async { [weak self] in
+            self?.keepingEdit = false
+        }
+    }
+}
+
 /// Inline shortcut field. A plain field, not the command field: that one
 /// refuses to resign while this orientation keeps the keyboard, and the
 /// editor would never receive keys. Return ends the edit. The card is open,
-/// so the command field stays resigned until the card closes.
+/// so the command field stays resigned until the card closes. The colour
+/// row is part of this editor: actions recolour the label, hot buttons
+/// recolour the plate.
 private struct ShortcutEditor: UIViewRepresentable {
     var text: String
     var placeholder: String = "shortcut"
     var fieldLabel: String = "Shortcut text"
+    /// Action rows pass the chosen ink. Hot buttons leave this white: the
+    /// colour there is the plate, and the words stay as they were.
+    var ink: UIColor = UIColor(white: 0.92, alpha: 1)
+    var selectedColor: ShortcutColor = .white
     var onText: (String) -> Void
+    var onColor: (ShortcutColor) -> Void = { _ in }
     var onCommit: () -> Void
     var onDelete: () -> Void
 
-    func makeUIView(context: Context) -> UITextField {
-        let field = UITextField()
+    func makeUIView(context: Context) -> ShortcutEditorView {
+        let view = ShortcutEditorView()
+        let field = view.field
         field.delegate = context.coordinator
         field.font = UIFont.monospacedSystemFont(ofSize: 17, weight: .regular)
         field.textColor = UIColor(white: 0.92, alpha: 1)
@@ -2008,12 +2339,12 @@ private struct ShortcutEditor: UIViewRepresentable {
         slot.addSubview(trash)
         field.rightView = slot
         field.rightViewMode = .always
-        return field
+        return view
     }
 
     func sizeThatFits(
         _ proposal: ProposedViewSize,
-        uiView: UITextField,
+        uiView: ShortcutEditorView,
         context _: Context
     ) -> CGSize? {
         let width: CGFloat
@@ -2022,23 +2353,28 @@ private struct ShortcutEditor: UIViewRepresentable {
         } else {
             width = uiView.bounds.width
         }
-        return CGSize(width: width, height: 48)
+        return CGSize(width: width, height: ShortcutEditorMetrics.height)
     }
 
     private func applyChrome(_ field: UITextField) {
         field.accessibilityLabel = fieldLabel
+        field.textColor = ink
+        field.tintColor = ink
         field.attributedPlaceholder = NSAttributedString(
             string: placeholder,
-            attributes: [.foregroundColor: UIColor(white: 0.92, alpha: 0.35)]
+            attributes: [.foregroundColor: ink.withAlphaComponent(0.35)]
         )
     }
 
-    func updateUIView(_ field: UITextField, context: Context) {
+    func updateUIView(_ view: ShortcutEditorView, context: Context) {
+        let field = view.field
         let coordinator = context.coordinator
         coordinator.onText = onText
         coordinator.onCommit = onCommit
         coordinator.onDelete = onDelete
+        view.onColor = onColor
         applyChrome(field)
+        view.applySelection(selectedColor)
         if field.markedTextRange == nil, field.text != text {
             coordinator.applying = true
             field.text = text
@@ -2052,10 +2388,11 @@ private struct ShortcutEditor: UIViewRepresentable {
         }
     }
 
-    static func dismantleUIView(_ uiView: UITextField, coordinator: Coordinator) {
+    static func dismantleUIView(_ uiView: ShortcutEditorView, coordinator: Coordinator) {
         coordinator.didFocus = false
-        if uiView.isFirstResponder {
-            uiView.resignFirstResponder()
+        uiView.allowEnd = true
+        if uiView.field.isFirstResponder {
+            uiView.field.resignFirstResponder()
         }
     }
 
@@ -2091,11 +2428,23 @@ private struct ShortcutEditor: UIViewRepresentable {
             textField.selectedTextRange = textField.textRange(from: end, to: end)
         }
 
+        func textFieldShouldEndEditing(_ textField: UITextField) -> Bool {
+            guard let editor = textField.superview as? ShortcutEditorView else { return true }
+            if editor.allowEnd { return true }
+            // A swatch tap is outside the field. Keeping the session lets the
+            // colour land and leaves the row open for another swatch.
+            if editor.keepingEdit || editor.swatchIsTracking { return false }
+            return true
+        }
+
         func textFieldDidEndEditing(_ textField: UITextField) {
             onCommit()
         }
 
         func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            if let editor = textField.superview as? ShortcutEditorView {
+                editor.allowEnd = true
+            }
             textField.resignFirstResponder()
             return false
         }
@@ -2307,7 +2656,9 @@ private enum DragLiftPlate {
         dimmed: Bool,
         badge: String?,
         matrix: Bool,
-        width: CGFloat
+        width: CGFloat,
+        labelColor: UIColor = UIColor(white: 0.92, alpha: 1),
+        badgePlate: UIColor? = nil
     ) -> UIView {
         let font = UIFont.monospacedSystemFont(ofSize: 17, weight: .regular)
         let measured = ceil((label as NSString).size(withAttributes: [.font: font]).width)
@@ -2328,7 +2679,7 @@ private enum DragLiftPlate {
             glyph.font = UIFont.monospacedSystemFont(ofSize: 17, weight: .bold)
             glyph.textColor = MatrixShade.display(UIColor(white: 0.92, alpha: 1), enabled: matrix)
             glyph.textAlignment = .center
-            glyph.backgroundColor = UIColor(white: 1, alpha: 0.12)
+            glyph.backgroundColor = badgePlate ?? UIColor(white: 1, alpha: 0.12)
             glyph.isOpaque = false
             glyph.layer.cornerRadius = cornerRadius
             glyph.clipsToBounds = true
@@ -2341,7 +2692,7 @@ private enum DragLiftPlate {
         let title = UILabel(frame: CGRect(x: textX, y: 0, width: max(0, barWidth - textX - inset), height: rowHeight))
         title.text = label
         title.font = font
-        title.textColor = UIColor(white: 0.92, alpha: dimmed ? 0.35 : 1)
+        title.textColor = labelColor.withAlphaComponent(dimmed ? 0.35 : 1)
         title.lineBreakMode = .byTruncatingTail
         title.backgroundColor = .clear
         title.isOpaque = false
@@ -2365,8 +2716,12 @@ private struct ShortcutRowGestures: UIViewRepresentable {
     /// Words on the lift preview. The overlay itself has no label.
     var dragLabel: String = ""
     var dragLabelDimmed: Bool = false
+    /// Action label ink. White is the 0.92 the preview used before colours.
+    var dragLabelColor: UIColor = UIColor(white: 0.92, alpha: 1)
     /// Nil on an action. A hot button passes its icon, which may be empty.
     var dragBadge: String? = nil
+    /// Hot-button plate. Nil keeps the 12% white wash.
+    var dragBadgePlate: UIColor? = nil
     var previewMatrix: Bool = false
     var onTap: (CGPoint) -> Void
     var onDoubleTap: (() -> Void)?
@@ -2399,7 +2754,9 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         context.coordinator.dragText = dragText
         context.coordinator.dragLabel = dragLabel
         context.coordinator.dragLabelDimmed = dragLabelDimmed
+        context.coordinator.dragLabelColor = dragLabelColor
         context.coordinator.dragBadge = dragBadge
+        context.coordinator.dragBadgePlate = dragBadgePlate
         context.coordinator.previewMatrix = previewMatrix
         context.coordinator.onDragEnded = onDragEnded
         if yieldsToSystemDrag {
@@ -2444,7 +2801,9 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         coordinator.dragText = dragText
         coordinator.dragLabel = dragLabel
         coordinator.dragLabelDimmed = dragLabelDimmed
+        coordinator.dragLabelColor = dragLabelColor
         coordinator.dragBadge = dragBadge
+        coordinator.dragBadgePlate = dragBadgePlate
         coordinator.previewMatrix = previewMatrix
         coordinator.onTap = onTap
         coordinator.onDoubleTap = onDoubleTap
@@ -2465,7 +2824,9 @@ private struct ShortcutRowGestures: UIViewRepresentable {
         var dragText = ""
         var dragLabel = ""
         var dragLabelDimmed = false
+        var dragLabelColor = UIColor(white: 0.92, alpha: 1)
         var dragBadge: String?
+        var dragBadgePlate: UIColor?
         var previewMatrix = false
         var onTap: (CGPoint) -> Void = { _ in }
         var onDoubleTap: (() -> Void)?
@@ -2509,7 +2870,9 @@ private struct ShortcutRowGestures: UIViewRepresentable {
             item.localObject = text
             let label = dragLabel.isEmpty ? text : dragLabel
             let dimmed = dragLabelDimmed
+            let labelColor = dragLabelColor
             let badge = dragBadge
+            let badgePlate = dragBadgePlate
             let matrix = previewMatrix
             let rowWidth = interaction.view?.bounds.width ?? 0
             item.previewProvider = {
@@ -2518,7 +2881,9 @@ private struct ShortcutRowGestures: UIViewRepresentable {
                     dimmed: dimmed,
                     badge: badge,
                     matrix: matrix,
-                    width: rowWidth
+                    width: rowWidth,
+                    labelColor: labelColor,
+                    badgePlate: badgePlate
                 )
                 let parameters = UIDragPreviewParameters()
                 parameters.backgroundColor = DragLiftPlate.plateColor
