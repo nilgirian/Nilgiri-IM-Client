@@ -3801,13 +3801,14 @@ private struct ActionPanel: View {
 
 /// Hot buttons, stacked above the command bar in list order. Every entry is
 /// drawn, including one whose icon is empty. The glyph is a bold monospaced
-/// face, at most two characters. The plate is the bar frost plus
-/// `Chrome.hotButtonPlate`, and a tap lights it the same way a compass letter
-/// does: the shared flash, white for a quarter second. A hidden label, or an
-/// empty icon, leaves that plate and the light in place. Spacing shrinks
-/// before the plate does, so six fit in the log in either orientation. The
-/// log ends where the input bar begins, so the plates stay above the
-/// direction buttons.
+/// face, at most two characters, and it stays the white (or Matrix ink) it
+/// already was. A white plate is the bar frost plus `Chrome.hotButtonPlate`,
+/// and a tap lights it the same way a compass letter does: the shared flash,
+/// white for a quarter second. Any other colour tints that plate and that
+/// flash. A hidden label, or an empty icon, leaves the plate and the light
+/// in place. Spacing shrinks before the plate does, so six fit in the log
+/// in either orientation. The log ends where the input bar begins, so the
+/// plates stay above the direction buttons.
 private struct HotButtonStack: View {
     @ObservedObject private var matrixMode = MatrixMode.shared
     var buttons: [HotButton]
@@ -3865,36 +3866,53 @@ private struct HotButtonStack: View {
     private func column(_ metrics: Metrics) -> some View {
         VStack(spacing: metrics.spacing) {
             ForEach(buttons) { button in
-                let lit = litButtons.contains(button.id)
-                let showsGlyph = hideLabels == false && button.icon.isEmpty == false
-                let spoken = ActionShortcut.command(text: button.text, target: target)
-                    ?? button.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                Button {
-                    guard ActionShortcut.command(text: button.text, target: target) != nil else { return }
-                    light(button.id)
-                    send(button)
-                } label: {
-                    Text(verbatim: button.icon)
-                        .font(.system(size: metrics.font, weight: .bold, design: .monospaced))
-                        .foregroundStyle(MatrixShade.display(lit ? Color.white : ink, enabled: matrixMode.enabled))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.5)
-                        // Opacity stops at the glyph. The frost and the press light sit outside it.
-                        .opacity(showsGlyph ? 1 : 0)
-                        .frame(width: metrics.side, height: metrics.side)
-                        .background {
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .fill(lit ? Chrome.hotButtonFlash : Color.clear)
-                                .padding(3)
-                        }
-                        .background(Chrome.hotButtonPlate, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .background(Chrome.barBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(spoken.isEmpty ? "Hot button" : spoken)
+                stackedButton(button, metrics: metrics)
             }
         }
+    }
+
+    private func stackedButton(_ button: HotButton, metrics: Metrics) -> some View {
+        let lit = litButtons.contains(button.id)
+        let showsGlyph = hideLabels == false && button.icon.isEmpty == false
+        let spoken = ActionShortcut.command(text: button.text, target: target)
+            ?? button.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Button {
+            guard ActionShortcut.command(text: button.text, target: target) != nil else { return }
+            light(button.id)
+            send(button)
+        } label: {
+            stackedFace(button, lit: lit, showsGlyph: showsGlyph, metrics: metrics)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(spoken.isEmpty ? "Hot button" : spoken)
+    }
+
+    /// Glyph stays white. A white plate is the shared chrome; any other
+    /// colour tints the resting plate and the press flash.
+    private func stackedFace(
+        _ button: HotButton,
+        lit: Bool,
+        showsGlyph: Bool,
+        metrics: Metrics
+    ) -> some View {
+        let flash = lit ? button.color.playFlash : Color.clear
+        let plate = button.color.playPlate
+        return Text(verbatim: button.icon)
+            .font(.system(size: metrics.font, weight: .bold, design: .monospaced))
+            .foregroundStyle(MatrixShade.display(lit ? Color.white : ink, enabled: matrixMode.enabled))
+            .lineLimit(1)
+            .minimumScaleFactor(0.5)
+            // Opacity stops at the glyph. The frost and the press light sit outside it.
+            .opacity(showsGlyph ? 1 : 0)
+            .frame(width: metrics.side, height: metrics.side)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(flash)
+                    .padding(3)
+            }
+            .background(plate, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background(Chrome.barBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(Rectangle())
     }
 
     /// Brighten this plate for a quarter second. The button still sends the action.
