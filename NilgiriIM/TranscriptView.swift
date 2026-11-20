@@ -178,6 +178,14 @@ private final class ColourCarryCache {
         held = lines
     }
 
+    /// The cache is keyed by server seq. Another character's lines reuse those
+    /// seqs, so a switch must not keep the previous colour run.
+    func discard() {
+        entries = []
+        startByID = [:]
+        held = []
+    }
+
     func startState(for id: String) -> Ansi.State {
         startByID[id] ?? .initial
     }
@@ -392,6 +400,26 @@ private final class TranscriptDocumentStore {
             text = working.attributedSubstring(from: NSRange(location: cut, length: working.length - cut))
         }
         return TranscriptEdit(replaceFrom: max(0, cut), text: text)
+    }
+
+    /// The next update writes the whole document. Line ids are server seqs,
+    /// so two characters share them. A prefix match would keep the previous
+    /// character's glyphs and the scroll offset that went with them.
+    func discardForSessionSwitch() {
+        attributed = NSAttributedString()
+        markers = []
+        fontSize = -1
+        matrix = false
+        enlargeCommunication = false
+        communicationColumns = terminalColumns
+        slotWidth = 0
+        ids = []
+        sigs = []
+        working = NSMutableAttributedString()
+        held = []
+        needsJoiner = false
+        lastWasSeparator = false
+        lastMudFontSize = 0
     }
 
     private func signature(_ line: LineDTO) -> Int {
@@ -1149,6 +1177,8 @@ private final class TranscriptHost: UIView {
 
 private struct TranscriptLog: UIViewRepresentable {
     var lines: [LineDTO]
+    /// On-screen character. The text view is reused across switches.
+    var sessionKey: String
     var scrollToken: Int
     /// Name bar height. Fallback top inset until the bar's frame is known.
     var topBarHeight: CGFloat
@@ -1244,6 +1274,7 @@ private struct TranscriptLog: UIViewRepresentable {
         coordinator.revealPending = revealPending
         coordinator.resumeSeparatorID = resumeSeparatorID
         coordinator.lines = lines
+        coordinator.noteSession(sessionKey)
         let splashEnded = coordinator.launchSplashVisible && launchSplashVisible == false
         coordinator.launchSplashVisible = launchSplashVisible
         coordinator.matrix = matrix
@@ -1278,7 +1309,12 @@ private struct TranscriptLog: UIViewRepresentable {
             coordinator.pinAfterLaunchSplash()
         }
         coordinator.syncReveal()
-        if requestedScroll == false, coordinator.stickToBottom == false, coordinator.revealing == false {
+        // A switch has already replaced the storage. Putting the previous
+        // character's offset back would open this transcript mid-log.
+        if requestedScroll == false,
+           coordinator.stickToBottom == false,
+           coordinator.revealing == false,
+           coordinator.followNewSession == false {
             let deltaY = abs(textView.contentOffset.y - offset.y)
             let deltaX = abs(textView.contentOffset.x - offset.x)
             if deltaY > 1 || deltaX > 1 {
@@ -1317,6 +1353,16 @@ private struct TranscriptLog: UIViewRepresentable {
         var holdUntil = Date.distantPast
         var scrollToken = 0
         var programmatic = 0
+        /// Character whose text is in the storage. Nil until the first update,
+        /// so the launch paint is not treated as a switch.
+        private var appliedSessionKey: String?
+        /// True after a character switch until that transcript and its
+        /// catch-up batch have been pinned, or the reader drags.
+        var followNewSession = false
+        private var followToken = 0
+        /// Line ids painted for the new character. The next different
+        /// document is the catch-up batch.
+        private var followAnchor: [String]?
         var applying = false
         var inLayout = false
         var revealing = false
@@ -1700,7 +1746,9 @@ private struct TranscriptLog: UIViewRepresentable {
                 carry: carry
             ) else { return }
             apply(edit, to: textView)
-            if revealing && launchSplashVisible == false {
+            if followNewSession {
+                pinNewSession()
+            } else if revealing && launchSplashVisible == false {
                 deferredBottom = true
             } else if nearBottom, revealBlocksBottomPin == false {
                 stickToBottom = true
@@ -1793,15 +1841,135 @@ private struct TranscriptLog: UIViewRepresentable {
             }
         }
 
+        /// Records the on-screen character. The first value is launch.
+        /// A later change is a different transcript in the same text view.
+        func noteSession(_ key: String) {
+            guard appliedSessionKey != key else { return }
+            let hadSession = appliedSessionKey != nil
+            appliedSessionKey = key
+            guard hadSession else { return }
+            beginSessionSwitch()
+        }
+
+        /// The reused text view still has the previous character's follow
+        /// flag, and a full replace drops the offset to the top. Arm a
+        /// follow that lasts through the catch-up batch. A finger drag ends it.
+        private func beginSessionSwitch() {
+            followToken += 1
+            let token = followToken
+            followNewSession = true
+            followAnchor = nil
+            bottomPinHeld = true
+            if nearBottom == false {
+                emitNear(true)
+            } else {
+                stickToBottom = true
+            }
+            // Layout after the replace reports a scroll. Hold the tail across
+            // that, and across a catch-up insert that arrives a moment later.
+            extendBottomHold(by: 2)
+            store.discardForSessionSwitch()
+            carry.discard()
+            clearHilite()
+            revealToken += 1
+            if revealing, let textView {
+                textView.layer.removeAllAnimations()
+            }
+            revealing = false
+            deferredBottom = false
+            revealPending = false
+            startedRevealID = nil
+            finishedRevealID = nil
+            // No catch-up batch (the since body added nothing) must not leave
+            // the resume ease suppressed for the rest of the session.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                guard let self, self.followToken == token else { return }
+                self.followNewSession = false
+                self.followAnchor = nil
+            }
+        }
+
+        /// Layout, then the bottom, then again next turn. The first content
+        /// height is often the empty estimate, which is the top of the log.
+        /// The catch-up batch is a later apply and pins once more.
+        private func pinNewSession() {
+            guard followNewSession, let textView else { return }
+            guard textView.isTracking == false,
+                  textView.isDragging == false,
+                  textView.isDecelerating == false else { return }
+            let ids = lines.map(\.id)
+            let caughtUp = followAnchor != nil && followAnchor != ids
+            if followAnchor == nil {
+                followAnchor = ids
+            }
+            let token = followToken
+            textView.layoutIfNeeded()
+            scrollToBottom(animated: false)
+            if nearBottom == false {
+                emitNear(true)
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, token == self.followToken, self.followNewSession else { return }
+                guard let textView = self.textView,
+                      textView.isTracking == false,
+                      textView.isDragging == false,
+                      textView.isDecelerating == false else { return }
+                textView.layoutIfNeeded()
+                self.scrollToBottom(animated: false)
+                if self.nearBottom == false {
+                    self.emitNear(true)
+                }
+                if caughtUp {
+                    self.followNewSession = false
+                    self.followAnchor = nil
+                }
+            }
+        }
+
         func syncReveal() {
             // The ease would run under the cover and then refuse later pins.
             // It starts once the cover is gone, unless that gap was already skipped.
             guard launchSplashVisible == false else { return }
+            // Catch-up marks a separator for the resume ease. That ease jumps
+            // to the separator — the top of a log that was just swapped in —
+            // and aims at a height TextKit has not measured yet. The separator
+            // stays. The new character opens at the bottom.
+            if followNewSession {
+                absorbNewSessionReveal()
+                return
+            }
             guard revealPending, let id = resumeSeparatorID, id.isEmpty == false else { return }
             guard startedRevealID != id else { return }
             guard textView?.bounds.width ?? 0 > 1 else { return }
             startedRevealID = id
             beginReveal(id)
+        }
+
+        /// Drops a resume ease that the catch-up since armed. The separator
+        /// line stays in the log. The callback clears the pending flag so a
+        /// later resume of this same character can ease again.
+        private func absorbNewSessionReveal() {
+            guard revealPending || revealing else { return }
+            revealToken += 1
+            let wasRevealing = revealing
+            revealing = false
+            deferredBottom = false
+            if wasRevealing, let textView {
+                textView.layer.removeAllAnimations()
+                programmatic += 1
+                textView.setContentOffset(textView.contentOffset, animated: false)
+                programmatic = max(0, programmatic - 1)
+            }
+            let id = resumeSeparatorID ?? startedRevealID
+            revealPending = false
+            guard let id, id.isEmpty == false else { return }
+            startedRevealID = id
+            guard finishedRevealID != id else { return }
+            finishedRevealID = id
+            let callback = onRevealFinished
+            DispatchQueue.main.async {
+                callback(id)
+            }
         }
 
         private func apply(_ edit: TranscriptEdit, to textView: TranscriptTextView) {
@@ -1813,6 +1981,17 @@ private struct TranscriptLog: UIViewRepresentable {
             // pointing at different glyphs. An append keeps the prefix.
             if let range = textView.rules?.hiliteRange, cut <= range.location {
                 textView.rules?.setHilite(nil)
+            }
+            // Replacing the storage drops the offset to the top and reports a
+            // scroll. A character switch is not the reader leaving the tail.
+            let switching = followNewSession
+            if switching {
+                programmatic += 1
+            }
+            defer {
+                if switching {
+                    programmatic = max(0, programmatic - 1)
+                }
             }
             storage.beginEditing()
             if cut <= 0 {
@@ -1830,7 +2009,11 @@ private struct TranscriptLog: UIViewRepresentable {
             } else {
                 keep = previous.commonPrefix(with: storage.string).utf16.count
             }
-            if selected.length > 0,
+            if switching {
+                // A selection from the previous character would scroll itself
+                // back into view, which is the top of this transcript.
+                textView.selectedRange = NSRange(location: storage.length, length: 0)
+            } else if selected.length > 0,
                selected.location + selected.length <= keep,
                selected.location + selected.length <= storage.length {
                 textView.selectedRange = selected
@@ -2220,6 +2403,11 @@ private struct TranscriptLog: UIViewRepresentable {
         }
 
         func scrollViewWillBeginDragging(_: UIScrollView) {
+            if followNewSession {
+                followNewSession = false
+                followToken += 1
+                followAnchor = nil
+            }
             launchPinToken += 1
             bottomPinHeld = false
             holdUntil = .distantPast
@@ -2246,6 +2434,13 @@ private struct TranscriptLog: UIViewRepresentable {
             // call this, and they were clearing the pin before the new lines
             // had a chance to follow the bottom.
             if launchSplashVisible {
+                extendBottomHold(by: 0.25)
+                emitNear(true)
+                return
+            }
+            // A character switch replaces the storage and the offset jumps to
+            // the top. That is not the reader. A drag clears this flag first.
+            if followNewSession {
                 extendBottomHold(by: 0.25)
                 emitNear(true)
                 return
@@ -2828,6 +3023,7 @@ struct TranscriptView: View {
             ZStack {
                 TranscriptLog(
                     lines: session.lines,
+                    sessionKey: session.character ?? "",
                     scrollToken: scrollToken,
                     topBarHeight: topBarHeight,
                     bottomBarHeight: bottomBarHeight,
@@ -3004,6 +3200,8 @@ struct TranscriptView: View {
             .onChange(of: session.character) { _, _ in
                 reloadCharacterPreferences()
                 lastCommand = ""
+                nearBottom = true
+                showNewLines = false
             }
             .modifier(CharacterSwitchModifier(session: session))
             .onChange(of: launchSplashVisible) { _, visible in
