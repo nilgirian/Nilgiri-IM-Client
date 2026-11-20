@@ -2377,10 +2377,18 @@ private final class CommandTextField: UITextField {
 /// Return still calls `onSubmit`; the caller sends the hint when the field
 /// is empty.
 ///
+/// The line holds at most `maxCommandLength` UTF-16 code units. Command and
+/// say share this field. A keystroke past the cap is refused. A paste that
+/// would pass it keeps the leading characters that still fit, at the caret.
+///
 /// Traits are set once. `textInputMode` is not overridden, and
 /// `becomeFirstResponder` is not called from `updateUIView`: doing either
 /// restarts the input session, the caret blinks, and the keyboard never attaches.
 private struct CommandLineField: UIViewRepresentable {
+    /// Typed and pasted text, in UTF-16 code units. `shouldChangeCharactersIn`
+    /// reports its range in those units.
+    static let maxCommandLength = 512
+
     @Binding var text: String
     @Binding var isFocused: Bool
     /// Hide switch for the orientation on screen. Return dismisses only then.
@@ -2526,6 +2534,76 @@ private struct CommandLineField: UIViewRepresentable {
         @objc func editingChanged(_ field: UITextField) {
             guard applyingText == false else { return }
             textChanged(field.text ?? "")
+        }
+
+        /// Cap the line at `maxCommandLength` UTF-16 units. A change that
+        /// fits is left to the field. A keystroke that does not fit is
+        /// refused. A longer paste keeps the leading characters that fit
+        /// in the room left by the replaced range, inserted there.
+        func textField(
+            _ textField: UITextField,
+            shouldChangeCharactersIn range: NSRange,
+            replacementString string: String
+        ) -> Bool {
+            if applyingText { return false }
+            let current = textField.text ?? ""
+            let nsCurrent = current as NSString
+            guard range.location != NSNotFound, NSMaxRange(range) <= nsCurrent.length else {
+                return false
+            }
+            let currentLength = nsCurrent.length
+            let replacementLength = (string as NSString).length
+            let resulting = currentLength - range.length + replacementLength
+            if resulting <= CommandLineField.maxCommandLength {
+                return true
+            }
+            // Still over the cap. A delete, or a replacement that does not
+            // grow the line, stays so an over-long value can be edited down.
+            if resulting <= currentLength {
+                return true
+            }
+            let room = CommandLineField.maxCommandLength - (currentLength - range.length)
+            let clipped = Self.prefixFitting(string, maxUnits: room)
+            guard clipped.isEmpty == false else { return false }
+            if (clipped as NSString).length >= replacementLength {
+                return true
+            }
+            let next = nsCurrent.replacingCharacters(in: range, with: clipped)
+            let caret = range.location + (clipped as NSString).length
+            applyingText = true
+            textField.text = next
+            applyingText = false
+            textChanged(next)
+            // UIKit restores the pre-change selection after this method
+            // returns false. Place the caret after the kept paste once that
+            // settles, without resigning the field.
+            DispatchQueue.main.async { [weak textField] in
+                guard let textField, textField.text == next else { return }
+                guard let position = textField.position(
+                    from: textField.beginningOfDocument,
+                    offset: caret
+                ), let selection = textField.textRange(from: position, to: position) else {
+                    return
+                }
+                textField.selectedTextRange = selection
+            }
+            return false
+        }
+
+        /// Leading Swift characters of `string` whose UTF-16 length is at
+        /// most `maxUnits`. A character that would pass the budget is left
+        /// out whole, so a surrogate pair is never split.
+        private static func prefixFitting(_ string: String, maxUnits: Int) -> String {
+            guard maxUnits > 0, string.isEmpty == false else { return "" }
+            var fitted = ""
+            var used = 0
+            for character in string {
+                let units = character.utf16.count
+                if used + units > maxUnits { break }
+                fitted.append(character)
+                used += units
+            }
+            return fitted
         }
 
         /// Hide-off: any log tap must not resign. Returning false leaves this
