@@ -105,6 +105,10 @@ final class IMSession: ObservableObject {
     @Published private(set) var savedTokenAvailable = false
     /// Characters this device still has a bearer for. The on-screen name is first.
     @Published private(set) var rosterNames: [String] = []
+    /// Canonical spelling learned from `You login|reconnect <Name> into the game.`
+    /// Keyed by the lowercased character name. Login's `character` is not stored
+    /// here, so an echo that differs only by case does not replace a learned name.
+    @Published private(set) var displayNames: [String: String] = [:]
     /// Name-bar list. Locked after Unlink when more than one character remains.
     @Published var characterPickerPresented = false
     @Published var characterPickerLocked = false
@@ -168,6 +172,11 @@ final class IMSession: ObservableObject {
     private let defaults = UserDefaults.standard
     /// In-memory transcript and secrets for characters that are not on screen.
     private var held: [String: HeldCharacter] = [:]
+    /// Unfinished `You login|reconnect ...` text from a partial server line.
+    /// Recognition only. The transcript lines are not joined or rewritten.
+    private var canonicalCarry = ""
+    /// Lowercased character the carry belongs to. A different character drops it.
+    private var canonicalCarryOwner = ""
     /// A character this phone just created, whose `/device` has not succeeded.
     /// A device-limit 409 menu-parks only that session.
     private var createdUnbound = false
@@ -194,6 +203,8 @@ final class IMSession: ObservableObject {
     private enum RosterKey {
         static let names = "im.roster"
         static let active = "im.activeCharacter"
+        /// Canonical spellings, keyed by lowercased character name. Display only.
+        static let displayNames = "im.displayNames"
     }
 
     /// One logged-in character. The live `IMSession` fields mirror whoever is on screen.
@@ -341,6 +352,25 @@ final class IMSession: ObservableObject {
     func isCurrentCharacter(_ name: String) -> Bool {
         guard let character else { return false }
         return namesEqual(character, name)
+    }
+
+    /// Name bar and picker spelling. A canonical name learned from the game
+    /// wins. Otherwise the saved name is shown as it was stored.
+    /// Keys stay on the lowercased name either way.
+    func displayedName(for name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty == false else { return name }
+        let key = characterKey(trimmed)
+        if let known = displayNames[key], namesEqual(known, trimmed) {
+            return known
+        }
+        return trimmed
+    }
+
+    /// Name bar text for the character on screen.
+    var displayedCharacter: String? {
+        guard let character, character.isEmpty == false else { return nil }
+        return displayedName(for: character)
     }
 
     /// True when Enter should try the saved bearer token before posting a login.
@@ -1317,9 +1347,12 @@ final class IMSession: ObservableObject {
         // Another character's saved cursor is not a gap in this transcript.
         let seenSeq = trustCursor ? lastSeq : 0
         exitScan.reset()
+        // A replaced buffer is not the tail of a live partial line.
+        canonicalCarry = ""
         var shown: [LineDTO] = []
         var maxSeq: Int64 = 0
         for line in incoming {
+            noteCanonicalName(line.text)
             if line.seq > maxSeq {
                 maxSeq = line.seq
             }
@@ -1358,6 +1391,8 @@ final class IMSession: ObservableObject {
             // run; the scroll does not gain a second copy.
             let fresh = line.seq > lastSeq
             if fresh {
+                // A repeated seq is not the next chunk of a split line.
+                noteCanonicalName(line.text)
                 lastSeq = line.seq
             }
             guard let shownLine = presentable(
@@ -1575,6 +1610,239 @@ final class IMSession: ObservableObject {
 
     private func shouldShow(_ line: LineDTO) -> Bool {
         line.text.contains("Do you want text color") == false
+    }
+
+    /// `You login <Name> into the game.` and `You reconnect <Name> into the game.`
+    /// The game sends `<Name>` as the stored spelling. A leading color or reset
+    /// can sit on that line because the previous text was colored. The line is
+    /// shown unchanged. Only the name bar and the picker use the captured spelling.
+    ///
+    /// The IM server publishes a quiet partial as its own line, then the rest.
+    /// A chunk that is still a prefix of the sentence is held, and the next
+    /// chunk of the same character can finish it. Held text is never written
+    /// back into the transcript. A newline, a blank line, or another character
+    /// ends the hold.
+    private func noteCanonicalName(_ raw: String) {
+        let owner = character.map { characterKey($0) } ?? ""
+        if owner != canonicalCarryOwner {
+            canonicalCarry = ""
+            canonicalCarryOwner = owner
+        }
+        guard owner.isEmpty == false else { return }
+        let normalized = raw.replacingOccurrences(of: "\r", with: "")
+        var parts = normalized.split(
+            omittingEmptySubsequences: false,
+            whereSeparator: \.isNewline
+        ).map(String.init)
+        let ended = normalized.hasSuffix("\n")
+        if ended, parts.last?.isEmpty == true {
+            parts.removeLast()
+        }
+        if parts.isEmpty {
+            canonicalCarry = ""
+            return
+        }
+        for index in parts.indices {
+            let open = ended == false && index == parts.count - 1
+            acceptCanonicalPiece(parts[index], open: open, canContinue: index == 0)
+        }
+    }
+
+    private func acceptCanonicalPiece(_ piece: String, open: Bool, canContinue: Bool) {
+        let visiblePiece = Self.plainForCanonicalMatch(piece)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if visiblePiece.isEmpty {
+            canonicalCarry = ""
+            return
+        }
+        if canContinue, canonicalCarry.isEmpty == false {
+            let combinedRaw = canonicalCarry + piece
+            let combined = Self.plainForCanonicalMatch(combinedRaw)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let name = Self.canonicalName(in: combined) {
+                learnDisplayName(name)
+                canonicalCarry = ""
+                return
+            }
+            if open, Self.isIncompleteCanonical(Self.plainForCanonicalMatch(combinedRaw)) {
+                canonicalCarry = combinedRaw
+                return
+            }
+            canonicalCarry = ""
+        }
+        if let name = Self.canonicalName(in: visiblePiece) {
+            learnDisplayName(name)
+            canonicalCarry = ""
+            return
+        }
+        if open, Self.isIncompleteCanonical(Self.plainForCanonicalMatch(piece)) {
+            canonicalCarry = piece
+            return
+        }
+        canonicalCarry = ""
+    }
+
+    /// Takes `captured` when it is this session's character, ignoring case.
+    /// A login `character` never calls this, so it cannot replace a spelling
+    /// the game already sent unless that login name differs by more than case
+    /// (it is then a different character, with its own entry).
+    private func learnDisplayName(_ captured: String) {
+        guard let owner = character, owner.isEmpty == false, namesEqual(owner, captured) else { return }
+        let key = characterKey(owner)
+        guard displayNames[key] != captured else { return }
+        var next = displayNames
+        next[key] = captured
+        displayNames = next
+        persistDisplayNames()
+    }
+
+    private func loadDisplayNames() {
+        guard let stored = defaults.dictionary(forKey: RosterKey.displayNames) else {
+            displayNames = [:]
+            return
+        }
+        var names: [String: String] = [:]
+        for (key, value) in stored {
+            guard let spelling = value as? String else { continue }
+            let slug = characterKey(key)
+            let trimmed = spelling.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard slug.isEmpty == false, trimmed.isEmpty == false, namesEqual(slug, trimmed) else { continue }
+            names[slug] = trimmed
+        }
+        displayNames = names
+    }
+
+    private func persistDisplayNames() {
+        if displayNames.isEmpty {
+            defaults.removeObject(forKey: RosterKey.displayNames)
+        } else {
+            defaults.set(displayNames, forKey: RosterKey.displayNames)
+        }
+    }
+
+    /// Whole line, after ANSI/CSI and carriage returns are gone and the
+    /// ends are trimmed. `login` and `reconnect` are matched in that case.
+    private static func canonicalName(in line: String) -> String? {
+        let range = NSRange(line.startIndex..., in: line)
+        guard let match = canonicalNameExpression.firstMatch(in: line, options: [], range: range),
+              match.numberOfRanges >= 3,
+              let nameRange = Range(match.range(at: 2), in: line) else { return nil }
+        let name = String(line[nameRange])
+        return name.isEmpty ? nil : name
+    }
+
+    /// `text` still has its trailing spaces. A shorter prefix is held only
+    /// once it can no longer be some other `You ...` line (`You l` / `You r`).
+    private static func isIncompleteCanonical(_ plain: String) -> Bool {
+        let text = String(plain.drop(while: { $0 == " " || $0 == "\t" }))
+        if text.isEmpty || text.contains(where: \.isNewline) { return false }
+        let suffix = " into the game."
+        for head in ["You login ", "You reconnect "] {
+            if head.hasPrefix(text) {
+                return text.hasPrefix(String(head.prefix(5)))
+            }
+            guard text.hasPrefix(head) else { continue }
+            let rest = text.dropFirst(head.count)
+            if rest.isEmpty { return true }
+            if let space = rest.firstIndex(where: { $0 == " " || $0 == "\t" }) {
+                if rest[..<space].isEmpty { return false }
+                let tail = rest[space...]
+                return suffix.hasPrefix(String(tail)) && tail.count < suffix.count
+            }
+            return rest.contains(where: \.isWhitespace) == false
+        }
+        return false
+    }
+
+    private static let canonicalNameExpression: NSRegularExpression = {
+        let pattern = #"^You (login|reconnect) (\S+) into the game\.$"#
+        return try! NSRegularExpression(pattern: pattern)
+    }()
+
+    /// ANSI/CSI sequences and carriage returns removed. Other characters,
+    /// including newlines, stay in order. An unfinished sequence at the end
+    /// is dropped so a split color code does not hide the words in front of it.
+    private static func plainForCanonicalMatch(_ raw: String) -> String {
+        var out = ""
+        var index = raw.startIndex
+        while index < raw.endIndex {
+            let character = raw[index]
+            if character == "\r" {
+                index = raw.index(after: index)
+                continue
+            }
+            if character == "\u{001B}" || character == "\u{009B}" {
+                if let end = endOfAnsi(raw, from: index) {
+                    index = end
+                    continue
+                }
+            }
+            out.append(character)
+            index = raw.index(after: index)
+        }
+        return out
+    }
+
+    /// Index just after an ANSI/CSI sequence, or the end when the sequence
+    /// runs off the string. Nil when `start` is not one.
+    private static func endOfAnsi(_ raw: String, from start: String.Index) -> String.Index? {
+        let introducer = raw[start]
+        var index = raw.index(after: start)
+        if introducer == "\u{009B}" {
+            return endOfCSI(raw, from: index)
+        }
+        guard introducer == "\u{001B}" else { return nil }
+        guard index < raw.endIndex else { return raw.endIndex }
+        let kind = raw[index]
+        index = raw.index(after: index)
+        if kind == "[" {
+            return endOfCSI(raw, from: index)
+        }
+        if kind == "]" || kind == "P" || kind == "^" || kind == "_" || kind == "X" {
+            return endOfTerminatedString(raw, from: index)
+        }
+        if kind >= " " && kind <= "/" {
+            while index < raw.endIndex {
+                let byte = raw[index]
+                let next = raw.index(after: index)
+                index = next
+                if byte >= "0" && byte <= "~" { return index }
+                if byte < " " || byte > "/" { return nil }
+            }
+            return raw.endIndex
+        }
+        return index
+    }
+
+    private static func endOfCSI(_ raw: String, from start: String.Index) -> String.Index? {
+        var index = start
+        while index < raw.endIndex {
+            let byte = raw[index]
+            let next = raw.index(after: index)
+            if byte >= "@" && byte <= "~" { return next }
+            if byte >= " " && byte <= "?" {
+                index = next
+                continue
+            }
+            return nil
+        }
+        return raw.endIndex
+    }
+
+    private static func endOfTerminatedString(_ raw: String, from start: String.Index) -> String.Index? {
+        var index = start
+        while index < raw.endIndex {
+            let byte = raw[index]
+            let next = raw.index(after: index)
+            if byte == "\u{0007}" || byte == "\u{009C}" { return next }
+            if byte == "\u{001B}" {
+                guard next < raw.endIndex else { return raw.endIndex }
+                if raw[next] == "\\" { return raw.index(after: next) }
+                return nil
+            }
+            index = next
+        }
+        return raw.endIndex
     }
 
     /// Drops the color question and a line that is only an HMV prompt.
@@ -1819,7 +2087,12 @@ final class IMSession: ObservableObject {
     }
 
     /// Another character's saved prompt is not this header.
+    /// `next` is the login echo. It is not copied onto a canonical spelling.
+    /// A learned name stays when this echo differs only by case. A different
+    /// name is another character and is shown from its own spelling.
     private func adoptCharacter(_ next: String?) {
+        canonicalCarry = ""
+        canonicalCarryOwner = next.map { characterKey($0) } ?? ""
         CharacterPreferenceScope.adopt(next)
         character = next
         guard let next, next.isEmpty == false else { return }
@@ -2559,6 +2832,7 @@ final class IMSession: ObservableObject {
             )
         }
         rosterNames = names
+        loadDisplayNames()
     }
 
     private func resolvedActiveName(fallback: String) -> String {
@@ -2590,6 +2864,7 @@ final class IMSession: ObservableObject {
         if let character, character.isEmpty == false {
             defaults.set(character, forKey: RosterKey.active)
         }
+        persistDisplayNames()
     }
 
     /// Copies the on-screen character into the roster without closing their MUD session.
@@ -2641,6 +2916,8 @@ final class IMSession: ObservableObject {
     }
 
     private func install(_ slot: HeldCharacter) {
+        canonicalCarry = ""
+        canonicalCarryOwner = characterKey(slot.name)
         CharacterPreferenceScope.adopt(slot.name)
         assignNameFromApp(slot.name)
         savedName = slot.name
