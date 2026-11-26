@@ -100,7 +100,7 @@ private struct LaunchSplash: View {
                         VStack(spacing: 6) {
                             Text(appName)
                                 .font(.title2.weight(.semibold))
-                            Text("by Frederick Nacino")
+                            Text("by Frederick Manligas Nacino")
                                 .font(.subheadline)
                         }
                         VStack(spacing: 4) {
@@ -108,7 +108,7 @@ private struct LaunchSplash: View {
                                 .font(.title3.bold())
                             Text("by")
                                 .font(.subheadline)
-                            Text("Frederick Nacino and Robert Jeremy Bogue")
+                            Text("Robert Jeremy Bogue and Frederick Nacino")
                                 .font(.subheadline)
                         }
                         Text(versionLine)
