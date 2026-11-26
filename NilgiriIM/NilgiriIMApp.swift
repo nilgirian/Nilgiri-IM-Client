@@ -84,7 +84,9 @@ private func clearDeliveredNotificationsAndBadge(_ session: IMSession) {
 
 /// White cover over the root for about three seconds, then a short fade.
 /// Display name, version, and build are read from the generated Info.plist.
-/// The app credit and the world credit sit between those two lines.
+/// The app credit and the world credit sit between those two lines, across
+/// the top of the cover. The knight and dice sit on the bottom, scaled to
+/// fit, on the same white as the cover.
 /// Black on white stays the same in light and dark mode.
 private struct LaunchSplash: View {
     @StateObject private var matrixMode = MatrixMode.shared
@@ -92,27 +94,42 @@ private struct LaunchSplash: View {
     var body: some View {
         ZStack {
             Color.white.ignoresSafeArea()
-            VStack(spacing: 22) {
-                VStack(spacing: 6) {
-                    Text(appName)
-                        .font(.title2.weight(.semibold))
-                    Text("by Frederick Nacino")
+            VStack(spacing: 12) {
+                VStack(spacing: 22) {
+                    VStack(spacing: 6) {
+                        Text(appName)
+                            .font(.title2.weight(.semibold))
+                        Text("by Frederick Nacino")
+                            .font(.subheadline)
+                    }
+                    VStack(spacing: 4) {
+                        Text("Nilgiri the Forgotten World")
+                            .font(.title3.bold())
+                        Text("by")
+                            .font(.subheadline)
+                        Text("Frederick Nacino and Robert Jeremy Bogue")
+                            .font(.subheadline)
+                    }
+                    Text(versionLine)
                         .font(.subheadline)
                 }
-                VStack(spacing: 4) {
-                    Text("Nilgiri the Forgotten World")
-                        .font(.title3.bold())
-                    Text("by")
-                        .font(.subheadline)
-                    Text("Frederick Nacino and Robert Jeremy Bogue")
-                        .font(.subheadline)
-                }
-                Text(versionLine)
-                    .font(.subheadline)
+                .foregroundStyle(MatrixShade.display(Color.black, enabled: matrixMode.enabled))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+                .padding(.top, 16)
+
+                // Fills whatever is left under the credits. The photo is
+                // fitted inside that space and kept on the bottom edge.
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .overlay(alignment: .bottom) {
+                        Image("NilgiriDice")
+                            .resizable()
+                            .scaledToFit()
+                            .accessibilityHidden(true)
+                    }
             }
-            .foregroundStyle(MatrixShade.display(Color.black, enabled: matrixMode.enabled))
-            .multilineTextAlignment(.center)
-            .padding(.horizontal, 32)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .combine)
