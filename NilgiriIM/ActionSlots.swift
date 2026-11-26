@@ -1176,6 +1176,8 @@ struct ActionSlotsDrawer: View {
         /// Text field plus the colour row. Matches `ShortcutEditorMetrics`.
         static let editorStride: CGFloat = ShortcutEditorMetrics.height
         static let deleteDistance: CGFloat = 64
+        /// Air between the colour row and the top of the keyboard.
+        static let keyboardGap: CGFloat = 12
     }
 
     private enum DragList { case actions, hotButtons }
@@ -1206,6 +1208,13 @@ struct ActionSlotsDrawer: View {
     @State private var editingIconID: UUID?
     /// Hot-button words in inline edit. Same field as an action, including Delete.
     @State private var editingButtonID: UUID?
+    /// Extra room under the column while a docked keyboard covers this card.
+    /// The scroll view ignores the safe area, so the keyboard never insets it.
+    /// Zero when the card is shut or the keyboard is down.
+    @State private var keyboardClearance: CGFloat = 0
+    /// A hide can be followed by a frame change that still carries the docked
+    /// rect. That change must not put the clearance back.
+    @State private var keyboardDismissed = true
     /// A system drop already placed this drag. The finger-up path must not
     /// place it a second time.
     @State private var dropClaimed = false
@@ -1280,6 +1289,18 @@ struct ActionSlotsDrawer: View {
             .onChange(of: openRequest) { _, _ in
                 settleCard(open: true, width: width)
             }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
+                noteKeyboard(note)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+                noteKeyboard(note)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { note in
+                noteKeyboard(note)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidHideNotification)) { note in
+                noteKeyboard(note)
+            }
         }
         .ignoresSafeArea()
     }
@@ -1325,8 +1346,11 @@ struct ActionSlotsDrawer: View {
             // command field is already resigned for the open card.
             .scrollDismissesKeyboard(.never)
             // The drawer already pads for the notch. A scroll view would add
-            // that inset again and leave a gap above Actions.
+            // that inset again and leave a gap above Actions. The keyboard is
+            // the same ignored region, so the list itself is shortened by the
+            // overlap. The bottom of that shorter list is the top of the keys.
             .ignoresSafeArea()
+            .padding(.bottom, keyboardLift)
             .onChange(of: editingID) { _, id in
                 guard let id else { return }
                 scrollEditingRow(id, proxy: proxy)
@@ -1337,6 +1361,10 @@ struct ActionSlotsDrawer: View {
             }
             .onChange(of: editingButtonID) { _, id in
                 guard let id else { return }
+                scrollEditingRow(id, proxy: proxy)
+            }
+            .onChange(of: keyboardClearance) { _, _ in
+                guard let id = editingID ?? editingButtonID ?? editingIconID else { return }
                 scrollEditingRow(id, proxy: proxy)
             }
         }
@@ -1816,6 +1844,8 @@ struct ActionSlotsDrawer: View {
             editingID = nil
             editingIconID = nil
             editingButtonID = nil
+            keyboardClearance = 0
+            keyboardDismissed = true
             heldActive = false
             held = nil
             hotDropTargeted = false
@@ -2293,16 +2323,82 @@ struct ActionSlotsDrawer: View {
         hotDropTargeted = targeted
     }
 
-    /// Puts the editing row near the top of the card, above the keyboard.
-    /// The scroll view ignores the safe area, so a center anchor can sit
-    /// under the keys on a short landscape window.
+    /// Rests the bottom of the editing row on the keyboard. The row is the
+    /// whole editor: field, delete button, and the colour swatches. The list
+    /// is already shortened by `keyboardLift`, so `.bottom` is the top of the
+    /// keys. A top anchor is what sent the row to the top of the card.
     private func scrollEditingRow(_ id: UUID, proxy: ScrollViewProxy) {
+        guard keyboardClearance > 0.5 else { return }
         func align() {
+            guard keyboardClearance > 0.5 else { return }
             guard editingID == id || editingIconID == id || editingButtonID == id else { return }
-            proxy.scrollTo(id, anchor: UnitPoint(x: 0, y: 0.12))
+            proxy.scrollTo(id, anchor: .bottom)
         }
         DispatchQueue.main.async(execute: align)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: align)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: align)
+    }
+
+    /// How far the list lifts while a docked keyboard covers the card.
+    /// Zero when the keyboard is down, and the column is full height again.
+    private var keyboardLift: CGFloat {
+        guard keyboardClearance > 0.5 else { return 0 }
+        return keyboardClearance + Metrics.keyboardGap
+    }
+
+    /// Docked keyboard over this open card. The command field's keyboard is
+    /// ignored while the card is shut, so a hide-off play screen is left alone.
+    /// A frame change after a hide can still carry the docked rect; that one
+    /// is dropped unless an editor in this card is actually open.
+    private func noteKeyboard(_ note: Notification) {
+        let hiding = note.name == UIResponder.keyboardWillHideNotification
+            || note.name == UIResponder.keyboardDidHideNotification
+        if hiding {
+            keyboardDismissed = true
+            if cardOpen || keyboardClearance > 0 {
+                setKeyboardClearance(0)
+            }
+            return
+        }
+        guard cardOpen else { return }
+        if note.name == UIResponder.keyboardWillShowNotification {
+            keyboardDismissed = false
+        }
+        let editorUp = editingID != nil || editingIconID != nil || editingButtonID != nil
+        if keyboardDismissed, editorUp == false,
+           note.name != UIResponder.keyboardWillShowNotification {
+            return
+        }
+        let covering = keyboardCoveringBottom(note)
+        if covering > 0 {
+            keyboardDismissed = false
+        }
+        setKeyboardClearance(covering)
+    }
+
+    private func setKeyboardClearance(_ covering: CGFloat) {
+        guard abs(covering - keyboardClearance) > 0.5 else { return }
+        keyboardClearance = covering
+    }
+
+    /// Height of a docked keyboard covering the bottom of the window. Zero
+    /// when the keyboard is hidden or floating clear of that edge. The card
+    /// fills the window, safe area included, so the window overlap is the
+    /// list's overlap.
+    private func keyboardCoveringBottom(_ note: Notification) -> CGFloat {
+        guard let end = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else {
+            return 0
+        }
+        guard end.isNull == false, end.height > 1 else { return 0 }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        guard let window = scene?.keyWindow ?? scene?.windows.first else { return 0 }
+        let screen = window.windowScene?.screen
+        let inWindow = screen.map { window.convert(end, from: $0.coordinateSpace) } ?? end
+        guard inWindow.maxY >= window.bounds.maxY - 1 else { return 0 }
+        let overlap = window.bounds.intersection(inWindow)
+        guard overlap.isNull == false, overlap.height > 0.5 else { return 0 }
+        guard overlap.maxY >= window.bounds.maxY - 1 else { return 0 }
+        return overlap.height
     }
 }
 
