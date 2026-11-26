@@ -1176,6 +1176,8 @@ struct ActionSlotsDrawer: View {
         /// Text field plus the colour row. Matches `ShortcutEditorMetrics`.
         static let editorStride: CGFloat = ShortcutEditorMetrics.height
         static let deleteDistance: CGFloat = 64
+        /// Air between the colour row and the top of the keyboard.
+        static let keyboardGap: CGFloat = 12
     }
 
     private enum DragList { case actions, hotButtons }
@@ -1337,10 +1339,6 @@ struct ActionSlotsDrawer: View {
                 .padding(.top, insets.top + 24)
                 .padding(.bottom, insets.bottom + 20)
                 .frame(maxWidth: .infinity, minHeight: height, alignment: .topLeading)
-                // Outside the minimum height. A short column is exactly one
-                // screen, so padding inside that frame never becomes scroll
-                // room and the last colour row stays under the keys.
-                .padding(.bottom, keyboardClearance)
             }
             .scrollBounceBehavior(.basedOnSize)
             .scrollDisabled(heldActive)
@@ -1349,8 +1347,10 @@ struct ActionSlotsDrawer: View {
             .scrollDismissesKeyboard(.never)
             // The drawer already pads for the notch. A scroll view would add
             // that inset again and leave a gap above Actions. The keyboard is
-            // the same ignored region: clearance above is what lifts the list.
+            // the same ignored region, so the list itself is shortened by the
+            // overlap. The bottom of that shorter list is the top of the keys.
             .ignoresSafeArea()
+            .padding(.bottom, keyboardLift)
             .onChange(of: editingID) { _, id in
                 guard let id else { return }
                 scrollEditingRow(id, proxy: proxy)
@@ -2323,18 +2323,26 @@ struct ActionSlotsDrawer: View {
         hotDropTargeted = targeted
     }
 
-    /// Puts the editing row near the top of the card, above the keyboard.
-    /// The row's height is the whole editor: field, delete button, and the
-    /// colour swatches. The scroll view ignores the safe area, so a center
-    /// anchor can sit under the keys on a short landscape window. The extra
-    /// bottom padding is what lets a last row actually reach this anchor.
+    /// Rests the bottom of the editing row on the keyboard. The row is the
+    /// whole editor: field, delete button, and the colour swatches. The list
+    /// is already shortened by `keyboardLift`, so `.bottom` is the top of the
+    /// keys. A top anchor is what sent the row to the top of the card.
     private func scrollEditingRow(_ id: UUID, proxy: ScrollViewProxy) {
+        guard keyboardClearance > 0.5 else { return }
         func align() {
+            guard keyboardClearance > 0.5 else { return }
             guard editingID == id || editingIconID == id || editingButtonID == id else { return }
-            proxy.scrollTo(id, anchor: UnitPoint(x: 0, y: 0.12))
+            proxy.scrollTo(id, anchor: .bottom)
         }
         DispatchQueue.main.async(execute: align)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: align)
+    }
+
+    /// How far the list lifts while a docked keyboard covers the card.
+    /// Zero when the keyboard is down, and the column is full height again.
+    private var keyboardLift: CGFloat {
+        guard keyboardClearance > 0.5 else { return 0 }
+        return keyboardClearance + Metrics.keyboardGap
     }
 
     /// Docked keyboard over this open card. The command field's keyboard is
