@@ -2982,13 +2982,15 @@ struct TranscriptView: View {
     @State private var commandFocused = false
     @StateObject private var keyboardPrefs = KeyboardHidePreferences()
     @StateObject private var matrixMode = MatrixMode.shared
-    /// Last non-communication line posted from the input bar (Return or Send).
-    /// A line split on `;` is stored whole, once, not as each piece. Speech,
-    /// channels, and the Say button leave this unchanged. Compass directions
-    /// and hot buttons do not replace it. Shown greyed out, and repeated from
-    /// an empty field, only while Keep last command is on. A repeat splits on
-    /// `;` again. Kept for this play screen, not on disk.
-    @State private var lastCommand = ""
+    /// Last non-communication line posted from the input bar (Return or Send),
+    /// one entry per character. A line split on `;` is stored whole, once, not
+    /// as each piece. Speech, channels, and the Say button leave that
+    /// character's line unchanged. Compass directions and hot buttons do not
+    /// replace it. Shown greyed out, and repeated from an empty field, only
+    /// while that character's Keep last command switch is on. A repeat splits
+    /// on `;` again. Kept for this play screen, not on disk. The key is the
+    /// lowercased name, so a switch restores the line that character sent.
+    @State private var lastCommandByCharacter: [String: String] = [:]
     /// The command field should be first responder. Set when this orientation
     /// keeps the keyboard, cleared when the player swipes it away or a switch hides it.
     @State private var keyboardHeld = false
@@ -3232,7 +3234,6 @@ struct TranscriptView: View {
             }
             .onChange(of: session.character) { _, _ in
                 reloadCharacterPreferences()
-                lastCommand = ""
                 nearBottom = true
                 showNewLines = false
             }
@@ -3697,21 +3698,37 @@ struct TranscriptView: View {
     }
 
     /// Remembers a typed Send/Return line unless it is speech or a channel.
-    /// The whole typed line is stored once. A `;` inside it does not make a
-    /// separate entry for each piece. The Say button never calls this.
+    /// The whole typed line is stored once, under the character on screen.
+    /// A `;` inside it does not make a separate entry for each piece. The Say
+    /// button never calls this. Another character's line is left as it was.
     private func rememberLastCommand(_ text: String) {
         guard CommunicationCommand.isOutgoing(text) == false else { return }
-        lastCommand = text
+        let key = lastCommandKey(session.character)
+        guard key.isEmpty == false else { return }
+        lastCommandByCharacter[key] = text
     }
 
+    /// The on-screen character's remembered line. Empty when nobody is
+    /// selected, or when that character has not sent one from this screen yet.
+    private var lastCommand: String {
+        let key = lastCommandKey(session.character)
+        guard key.isEmpty == false else { return "" }
+        return lastCommandByCharacter[key] ?? ""
+    }
+
+    /// Lowercased name. A login echo that differs only by case stays on
+    /// this character's line.
+    private func lastCommandKey(_ name: String?) -> String {
+        name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    }
 
     /// Blank after the same trim `send()` uses. Whitespace is not a command.
     private var typedCommandIsBlank: Bool {
         session.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// Grey text in the command field. Empty when the switch is off, or when
-    /// this screen has not sent from the input line yet.
+    /// Grey text in the command field. Empty when this character's switch is
+    /// off, or when this character has not sent from the input line yet.
     private var commandPlaceholder: String {
         guard keyboardPrefs.keepLastCommand, lastCommand.isEmpty == false else { return "" }
         return lastCommand
