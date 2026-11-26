@@ -2818,6 +2818,10 @@ final class IMSession: ObservableObject {
             cancelReentry()
         }
         switch outcome {
+        case .superseded:
+            // The first switch already returned. A late body must not retire
+            // whoever is on screen or write their status.
+            return
         case .closed:
             await retireActiveCharacter(statusMessage: "MUD session closed (idle, unlink, or logout).")
             return
