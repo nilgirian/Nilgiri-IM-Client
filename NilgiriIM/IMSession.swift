@@ -162,7 +162,13 @@ final class IMSession: ObservableObject {
     /// Seq of the line that last changed the header. Catch-up can hand the
     /// death lines over again after `<2h 100m 94v>` has already arrived.
     /// An older seq must not put those counts, or DEAD, back.
+    /// Seqs belong to one session. Another character's seq must not stay here.
     private var headerSeq: Int64 = 0
+    /// Bumped in `stopLive`. A since or stream that started earlier belongs to
+    /// the character who was on screen then. Applying it after a switch writes
+    /// that character's prompt onto the new one, and their higher seq blocks
+    /// every later prompt.
+    private var liveEpoch = 0
     /// `+87 XP!` / `LEVEL!` collected from this live batch. Cleared on commit.
     private var liveProgress: [String] = []
     private var progressSerial = 0
@@ -253,6 +259,9 @@ final class IMSession: ObservableObject {
         /// Since applied a restored session that is not attached yet (`closed` and `resumed`).
         /// Login follows. The transcript and the divider stay.
         case detached
+        /// The on-screen session changed while this request was in flight.
+        /// Nothing was applied. The caller must not log the new character out.
+        case superseded
     }
 
     private struct HTTPFailure: Error {
@@ -408,6 +417,8 @@ final class IMSession: ObservableObject {
             await autoPasswordLogin()
         case .rejected:
             _ = await handleRejectedSession(thenLogin: true)
+        case .superseded:
+            break
         }
     }
 
@@ -438,6 +449,8 @@ final class IMSession: ObservableObject {
                 break
             case .rejected:
                 if await handleRejectedSession(thenLogin: false) { return }
+            case .superseded:
+                return
             }
         }
         await passwordLogin()
@@ -856,6 +869,8 @@ final class IMSession: ObservableObject {
 
     func catchUp() async {
         guard token != nil, sessionId != nil else { return }
+        let epoch = liveEpoch
+        let owner = sessionId
         // Launch resume can fail before any line is applied. The next poll
         // is still that backlog: a death in it must not stick on the bar.
         let staleBacklog = didApplyEntryBacklog == false
@@ -863,6 +878,12 @@ final class IMSession: ObservableObject {
             beginReentry()
         }
         let outcome = await fetchSince(adoptDeath: staleBacklog == false)
+        guard epoch == liveEpoch, sessionId == owner else {
+            if staleBacklog {
+                cancelReentry()
+            }
+            return
+        }
         if staleBacklog {
             switch outcome {
             case .ready, .detached, .closed:
@@ -900,6 +921,8 @@ final class IMSession: ObservableObject {
         case .rejected:
             stopLive()
             _ = await handleRejectedSession(thenLogin: true)
+        case .superseded:
+            return
         }
     }
 
@@ -1068,6 +1091,9 @@ final class IMSession: ObservableObject {
         case .ready, .detached, .closed:
             // The since body is history. DEAD in it is not a new death.
             endReentry()
+        case .superseded:
+            cancelReentry()
+            return .superseded
         default:
             cancelReentry()
         }
@@ -1088,13 +1114,16 @@ final class IMSession: ObservableObject {
     /// poll keeps the default, so a death that arrives while playing still
     /// updates the header when the stream is down.
     private func fetchSince(adoptDeath: Bool = true) async -> ResumeOutcome {
-        guard let token else { return .rejected }
+        guard let token, let owner = sessionId, owner.isEmpty == false else { return .rejected }
+        let epoch = liveEpoch
         let seq = lines.isEmpty ? Int64(0) : lastSeq
-        guard let requestURL = sessionURL("/since/\(seq)") else { return .rejected }
+        guard let requestURL = sessionURL("/since/\(seq)", sessionId: owner) else { return .rejected }
         var req = URLRequest(url: requestURL)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
+            // A switch stops the old poll. Its body is the previous character's.
+            guard liveEpoch == epoch, self.sessionId == owner else { return .superseded }
             // Menu unlink clears the token. A late since must not log in again.
             guard self.token != nil else { return .offline }
             guard let http = resp as? HTTPURLResponse else { return .offline }
@@ -1137,6 +1166,9 @@ final class IMSession: ObservableObject {
                 return .offline
             }
         } catch {
+            if liveEpoch != epoch || self.sessionId != owner {
+                return .superseded
+            }
             if let kind = OutageKind.transport(error) {
                 return .outage(kind)
             }
@@ -1298,6 +1330,8 @@ final class IMSession: ObservableObject {
     }
 
     private func stopLive() {
+        // Bump before cancel so a response that already arrived still sees it.
+        liveEpoch += 1
         streamTask?.cancel()
         pollTask?.cancel()
         streamTask = nil
@@ -1305,13 +1339,18 @@ final class IMSession: ObservableObject {
     }
 
     private func stream() async {
-        guard let token, let requestURL = sessionURL("/stream") else { return }
+        if Task.isCancelled { return }
+        guard let token, let owner = sessionId, owner.isEmpty == false,
+              let requestURL = sessionURL("/stream", sessionId: owner) else { return }
+        let epoch = liveEpoch
         var req = URLRequest(url: requestURL)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         do {
             let (bytes, _) = try await URLSession.shared.bytes(for: req)
             for try await line in bytes.lines {
-                if Task.isCancelled || self.token == nil { return }
+                if Task.isCancelled || liveEpoch != epoch || self.sessionId != owner || self.token == nil {
+                    return
+                }
                 if line.hasPrefix("data: ") {
                     let payload = String(line.dropFirst(6))
                     if let data = payload.data(using: .utf8),
@@ -1326,12 +1365,12 @@ final class IMSession: ObservableObject {
                     applyMenuComment(line)
                 }
             }
-            if Task.isCancelled == false {
+            if Task.isCancelled == false, liveEpoch == epoch, self.sessionId == owner {
                 noteDisconnect()
                 status = "Live stream dropped; polling catch-up."
             }
         } catch {
-            if Task.isCancelled { return }
+            if Task.isCancelled || liveEpoch != epoch || self.sessionId != owner { return }
             if let urlError = error as? URLError, urlError.code == .cancelled { return }
             noteDisconnect()
             status = "Live stream dropped; polling catch-up."
@@ -2012,12 +2051,21 @@ final class IMSession: ObservableObject {
             pendingVitals = nil
             // `found` is already the whole prompt. A living one does not
             // inherit a previous DEAD condition or the old negative count.
+            let owner = character ?? name
             if vitals != found {
                 vitals = found
-                defaults.set(found.stored, forKey: scopedKey(StoreKey.hmv))
-                let owner = character ?? name
                 if owner.isEmpty == false {
+                    defaults.set(found.stored, forKey: scopedKey(StoreKey.hmv))
                     defaults.set(owner, forKey: scopedKey(StoreKey.hmvName))
+                }
+            }
+            // The bar is shared. The roster keeps this character's own copy.
+            if owner.isEmpty == false {
+                let key = characterKey(owner)
+                if var slot = held[key] {
+                    slot.vitals = found
+                    slot.headerSeq = headerSeq
+                    held[key] = slot
                 }
             }
         }
@@ -2031,20 +2079,33 @@ final class IMSession: ObservableObject {
     }
 
     private func restoreVitals() {
-        guard let raw = defaults.string(forKey: scopedKey(StoreKey.hmv)),
-              let held = defaults.string(forKey: scopedKey(StoreKey.hmvName)),
-              let found = HMVPrompt.Vitals.parse(raw) else { return }
         let owner = character ?? name
-        guard owner.isEmpty == false, namesEqual(held, owner) else { return }
+        guard owner.isEmpty == false else { return }
+        if let found = savedVitals(for: owner) {
+            vitals = found
+            return
+        }
         // Relaunch is not a live death. Drop the saved DEAD counts so the
         // bar does not keep `-9h DEAD` while wear commands have no prompt yet.
         // Stun and incapacitated still restore; those alarms are separate.
-        guard found.isDead == false else {
-            defaults.removeObject(forKey: scopedKey(StoreKey.hmv))
-            defaults.removeObject(forKey: scopedKey(StoreKey.hmvName))
-            return
-        }
-        vitals = found
+        guard let raw = defaults.string(forKey: scopedKey(StoreKey.hmv)),
+              let heldName = defaults.string(forKey: scopedKey(StoreKey.hmvName)),
+              namesEqual(heldName, owner),
+              let found = HMVPrompt.Vitals.parse(raw),
+              found.isDead else { return }
+        defaults.removeObject(forKey: scopedKey(StoreKey.hmv))
+        defaults.removeObject(forKey: scopedKey(StoreKey.hmvName))
+    }
+
+    /// Living prompt saved for `owner`. A stored DEAD is not current.
+    private func savedVitals(for owner: String) -> HMVPrompt.Vitals? {
+        guard owner.isEmpty == false,
+              let raw = defaults.string(forKey: scopedKey(StoreKey.hmv, character: owner)),
+              let heldName = defaults.string(forKey: scopedKey(StoreKey.hmvName, character: owner)),
+              namesEqual(heldName, owner),
+              let found = HMVPrompt.Vitals.parse(raw),
+              found.isDead == false else { return nil }
+        return found
     }
 
     /// Login, resume, or creation is about to apply its backlog.
@@ -2090,18 +2151,39 @@ final class IMSession: ObservableObject {
     /// `next` is the login echo. It is not copied onto a canonical spelling.
     /// A learned name stays when this echo differs only by case. A different
     /// name is another character and is shown from its own spelling.
+    /// The on-screen counts follow that character. The previous character's
+    /// seq gate is dropped so this session's prompts are not ignored.
     private func adoptCharacter(_ next: String?) {
+        let previous = character
         canonicalCarry = ""
         canonicalCarryOwner = next.map { characterKey($0) } ?? ""
         CharacterPreferenceScope.adopt(next)
         character = next
         guard let next, next.isEmpty == false else { return }
+        if let previous, namesEqual(previous, next) == false {
+            restoreHeader(for: next)
+            return
+        }
         guard let heldName = defaults.string(forKey: scopedKey(StoreKey.hmvName)),
               namesEqual(heldName, next) == false else { return }
         vitals = nil
         headerSeq = 0
         defaults.removeObject(forKey: scopedKey(StoreKey.hmv))
         defaults.removeObject(forKey: scopedKey(StoreKey.hmvName))
+    }
+
+    /// Shows `owner`'s own prompt, or clears the bar. `headerSeq` goes back to
+    /// zero so a line number from the character who just left cannot reject
+    /// this character's `<30h 100m 97v>`.
+    private func restoreHeader(for owner: String) {
+        pendingVitals = nil
+        liveDeathInBatch = false
+        headerSeq = 0
+        if let stored = held[characterKey(owner)]?.vitals, stored.isDead == false {
+            vitals = stored
+            return
+        }
+        vitals = savedVitals(for: owner)
     }
 
     @discardableResult
@@ -2726,6 +2808,10 @@ final class IMSession: ObservableObject {
         beginReentry()
         let outcome = await fetchSince(adoptDeath: false)
         switch outcome {
+        case .superseded:
+            // Another switch or a background stop owns the screen now.
+            cancelReentry()
+            return
         case .ready, .detached, .closed:
             endReentry()
         default:
@@ -2818,7 +2904,7 @@ final class IMSession: ObservableObject {
                 sessionId: savedSession,
                 lines: [],
                 lastSeq: seq,
-                vitals: nil,
+                vitals: savedVitals(for: trimmed),
                 headerSeq: 0,
                 atMenu: false,
                 parked: true,
@@ -2927,8 +3013,15 @@ final class IMSession: ObservableObject {
         character = slot.name
         lines = slot.lines
         lastSeq = slot.lastSeq
-        vitals = slot.vitals
-        headerSeq = slot.headerSeq
+        // Nil vitals means this character has no prompt yet. Do not keep the
+        // seq gate from a previous visit, or their next prompt is ignored.
+        if let stored = slot.vitals {
+            vitals = stored
+            headerSeq = slot.headerSeq
+        } else {
+            vitals = savedVitals(for: slot.name)
+            headerSeq = 0
+        }
         atMenu = slot.atMenu
         parked = slot.parked
         roomExits = slot.roomExits
