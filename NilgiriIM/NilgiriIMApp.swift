@@ -84,35 +84,55 @@ private func clearDeliveredNotificationsAndBadge(_ session: IMSession) {
 
 /// White cover over the root for about three seconds, then a short fade.
 /// Display name, version, and build are read from the generated Info.plist.
-/// The app credit and the world credit sit between those two lines.
+/// The app credit and the world credit sit between those two lines, lowered
+/// by about an eighth of the screen. The knight and dice sit on the bottom,
+/// scaled to fit in the space under the credits, on the same white.
 /// Black on white stays the same in light and dark mode.
 private struct LaunchSplash: View {
     @StateObject private var matrixMode = MatrixMode.shared
 
     var body: some View {
-        ZStack {
-            Color.white.ignoresSafeArea()
-            VStack(spacing: 22) {
-                VStack(spacing: 6) {
-                    Text(appName)
-                        .font(.title2.weight(.semibold))
-                    Text("by Frederick Nacino")
-                        .font(.subheadline)
+        GeometryReader { geo in
+            ZStack {
+                Color.white.ignoresSafeArea()
+                VStack(spacing: 12) {
+                    VStack(spacing: 22) {
+                        VStack(spacing: 6) {
+                            Text(appName)
+                                .font(.title2.weight(.semibold))
+                            Text("by Frederick Manligas Nacino")
+                                .font(.subheadline)
+                        }
+                        VStack(spacing: 4) {
+                            Text("Nilgiri the Forgotten World")
+                                .font(.title3.bold())
+                            Text("by")
+                                .font(.subheadline)
+                            Text("Robert Jeremy Bogue and Frederick Nacino")
+                                .font(.subheadline)
+                        }
+                        Text(versionLine)
+                            .font(.subheadline)
+                    }
+                    .foregroundStyle(MatrixShade.display(Color.black, enabled: matrixMode.enabled))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+                    .padding(.top, geo.size.height / 8)
+                    .layoutPriority(1)
+
+                    // Whatever is left under the credits. The photo is fitted
+                    // inside that space, so it stays below the text.
+                    Color.clear
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .overlay(alignment: .bottom) {
+                            Image("NilgiriDice")
+                                .resizable()
+                                .scaledToFit()
+                                .accessibilityHidden(true)
+                        }
                 }
-                VStack(spacing: 4) {
-                    Text("Nilgiri the Forgotten World")
-                        .font(.title3.bold())
-                    Text("by")
-                        .font(.subheadline)
-                    Text("Frederick Nacino and Robert Jeremy Bogue")
-                        .font(.subheadline)
-                }
-                Text(versionLine)
-                    .font(.subheadline)
+                .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
             }
-            .foregroundStyle(MatrixShade.display(Color.black, enabled: matrixMode.enabled))
-            .multilineTextAlignment(.center)
-            .padding(.horizontal, 32)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .combine)
