@@ -60,12 +60,23 @@ final class IMSession: ObservableObject {
     /// True while the welcome menu is up. Login, creation, since, and the
     /// stream's `: {"menu":true|false}` comments all write this. The panel
     /// sends 0 or 1; the server answers PRESS RETURN itself.
+    /// Delete character sends 3 from its own dialog, then the two passwords.
     @Published private(set) var atMenu = false
     /// A menu choice is in flight. The panel ignores a second tap.
     @Published private(set) var menuBusy = false
     /// Quit, or parking on the menu, is leaving for good.
     /// A close that arrives after the menu flag drops must not log in again.
     private var menuExit = false
+    /// Delete-character dialog is up, or choice 3 is in flight.
+    /// The panel stays so the command line does not replace it when the
+    /// server drops the menu flag for the password prompts.
+    @Published private(set) var characterDeleteActive = false
+    /// Choice `3` was sent. Cancel can answer a leftover password prompt.
+    private var characterDeleteSent = false
+    /// The success sentence has been seen. A later close unlinks this character.
+    private var characterDeleted = false
+    /// Unlink for a successful delete has started.
+    private var characterDeleteSettled = false
     /// Set when login failed because this name is not a character yet.
     @Published var characterMissing = false
     /// Name/email form, then the creation wizard. The account is not written
@@ -607,7 +618,7 @@ final class IMSession: ObservableObject {
     /// saved actions send their text whole. Command mode splits before it
     /// calls `sendLine`.
     func send(fallback: String? = nil) async {
-        guard atMenu == false else { return }
+        guard atMenu == false, characterDeleteActive == false else { return }
         menuExit = false
         let typed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = typed.isEmpty
@@ -629,7 +640,7 @@ final class IMSession: ObservableObject {
     func sendLine(_ text: String) async {
         let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard line.isEmpty == false else { return }
-        guard atMenu == false else { return }
+        guard atMenu == false, characterDeleteActive == false else { return }
         menuExit = false
         do {
             let data = try await post("/input", ["text": line])
@@ -641,9 +652,10 @@ final class IMSession: ObservableObject {
 
     /// Welcome-menu choice. `1` enters the game. `0` quits and unlinks.
     /// Change-password is the dialog, not choice `2`.
+    /// Delete character is its own dialog, not this method.
     /// The server answers PRESS RETURN itself; this does not send a blank line.
     func chooseMenu(_ choice: String) async {
-        guard atMenu, menuBusy == false else { return }
+        guard atMenu, menuBusy == false, characterDeleteActive == false else { return }
         guard choice == "0" || choice == "1" else { return }
         menuBusy = true
         if choice == "0" {
@@ -710,9 +722,144 @@ final class IMSession: ObservableObject {
         }
     }
 
+    /// The welcome menu text includes `3) Delete this character.`
+    /// ANSI is ignored. The button stays hidden until that line is present,
+    /// so it does not appear before the game offers the choice.
+    var menuOffersCharacterDelete: Bool {
+        guard atMenu else { return false }
+        return lines.contains { line in
+            line.isServerLine && Ansi.plain(line.text).contains(Self.deleteMenuItem)
+        }
+    }
+
+    /// Opens the delete dialog. Backgrounding must not send menu choice 0
+    /// while this is up.
+    func beginCharacterDelete() {
+        guard atMenu, menuBusy == false else { return }
+        characterDeleteSettled = false
+        characterDeleted = false
+        characterDeleteSent = false
+        characterDeleteActive = true
+    }
+
+    /// Leaves the dialog. A password prompt that is still waiting gets a blank
+    /// line, which the game treats as a cancelled delete and returns to the menu.
+    func cancelCharacterDelete() async {
+        guard menuBusy == false else { return }
+        let abortPrompt = characterDeleteSent && atMenu == false && token != nil && sessionId != nil
+        characterDeleteActive = false
+        characterDeleteSent = false
+        guard abortPrompt else { return }
+        _ = try? await post("/input", ["text": ""])
+    }
+
+    /// Menu choice `3`, then the same current password for both server prompts.
+    /// Nil means the character was deleted and unlinked. Any other string is
+    /// the game's own sentence, or a short message when the game did not answer.
+    /// The password is never written to the status line, the transcript, or a log.
+    func deleteCharacter(password: String) async -> String? {
+        guard atMenu, characterDeleteActive, menuBusy == false else {
+            return "Not at the menu."
+        }
+        if password.isEmpty {
+            return "Enter your current password."
+        }
+        menuBusy = true
+        defer { menuBusy = false }
+        let startSeq = lastSeq
+        do {
+            _ = try await post("/input", ["text": "3"])
+            characterDeleteSent = true
+        } catch {
+            return failureMessage(error)
+        }
+        if characterDeleteSettled || characterDeleted { return nil }
+        guard token != nil, sessionId != nil else {
+            characterDeleteActive = false
+            characterDeleteSent = false
+            return "The game connection dropped."
+        }
+        switch await awaitCharacterDeleteSignal(after: startSeq, phase: .afterChoice) {
+        case .immortal(let sentence):
+            await awaitMenuAfterDelete()
+            return sentence
+        case .prompt1:
+            break
+        case .deleted:
+            characterDeleted = true
+            await finishDeletedCharacter()
+            return nil
+        case .cancelled(let sentence):
+            await awaitMenuAfterDelete()
+            return sentence
+        case .prompt2, .timeout:
+            return "The game did not answer."
+        case .closed:
+            return "The game connection dropped."
+        }
+        let afterFirst = lastSeq
+        do {
+            _ = try await post("/input", ["text": password])
+        } catch {
+            return failureMessage(error)
+        }
+        if characterDeleteSettled || characterDeleted { return nil }
+        guard token != nil, sessionId != nil else {
+            characterDeleteActive = false
+            characterDeleteSent = false
+            return "The game connection dropped."
+        }
+        switch await awaitCharacterDeleteSignal(after: afterFirst, phase: .afterFirstPassword) {
+        case .prompt2:
+            break
+        case .deleted:
+            characterDeleted = true
+            await finishDeletedCharacter()
+            return nil
+        case .cancelled(let sentence):
+            await awaitMenuAfterDelete()
+            return sentence
+        case .immortal(let sentence):
+            await awaitMenuAfterDelete()
+            return sentence
+        case .prompt1, .timeout:
+            return "The game did not answer."
+        case .closed:
+            return "The game connection dropped."
+        }
+        let afterSecond = lastSeq
+        do {
+            _ = try await post("/input", ["text": password])
+        } catch {
+            return failureMessage(error)
+        }
+        if characterDeleteSettled || characterDeleted { return nil }
+        guard token != nil, sessionId != nil else {
+            characterDeleteActive = false
+            characterDeleteSent = false
+            return "The game connection dropped."
+        }
+        switch await awaitCharacterDeleteSignal(after: afterSecond, phase: .afterSecondPassword) {
+        case .deleted:
+            characterDeleted = true
+            await finishDeletedCharacter()
+            return nil
+        case .cancelled(let sentence):
+            await awaitMenuAfterDelete()
+            return sentence
+        case .immortal(let sentence):
+            await awaitMenuAfterDelete()
+            return sentence
+        case .prompt1, .prompt2, .timeout:
+            return "The game did not answer."
+        case .closed:
+            return "The game connection dropped."
+        }
+    }
+
     @discardableResult
     func park(_ value: Bool) async -> Bool {
-        let closingMenu = value && atMenu
+        let closingMenu = value && atMenu && characterDeleteActive == false
         parked = value
         if value, closingMenu == false {
             noteDisconnect()
@@ -831,6 +978,10 @@ final class IMSession: ObservableObject {
     /// Backgrounding on the welcome menu unlinks: the server answers choice 0
     /// with {"closed":true}, and that drops the Keychain session.
     func sceneWentBackground() async {
+        // The delete dialog is still the menu. Parking from here would send 0.
+        if characterDeleteActive {
+            return
+        }
         let closingMenu = atMenu
         if closingMenu == false {
             noteDisconnect()
@@ -965,6 +1116,19 @@ final class IMSession: ObservableObject {
             guard let http = resp as? HTTPURLResponse else {
                 status = "Login failed."
                 cancelReentry()
+                return
+            }
+            if http.statusCode != 200, let sentence = deletedCharacterSentence(in: respData) {
+                status = sentence
+                characterMissing = false
+                cancelReentry()
+                if addingCharacter {
+                    return
+                }
+                atMenu = false
+                menuBusy = false
+                stopLive()
+                token = nil
                 return
             }
             if let kind = OutageKind.http(status: http.statusCode, data: respData) {
@@ -2346,6 +2510,151 @@ final class IMSession: ObservableObject {
         }
     }
 
+    private static let deleteMenuItem = "3) Delete this character."
+    private static let immortalSentence = "Immortals cannot self-delete."
+    private static let deletePrompt1 = "Enter your current password to confirm deletion:"
+    private static let deletePrompt2 = "Re-enter your current password to permanently delete this character:"
+    private static let badPasswordSentence = "That password is incorrect."
+    private static let deleteCancelledSentence = "Character deletion cancelled."
+    private static let deletedSentence = "Your character has been permanently deleted. Good-bye!"
+    private static let deletedCharacterSentence = "That character can no longer be used."
+
+    private enum CharacterDeletePhase {
+        case afterChoice
+        case afterFirstPassword
+        case afterSecondPassword
+    }
+
+    private enum CharacterDeleteSignal {
+        case prompt1
+        case prompt2
+        case immortal(String)
+        case cancelled(String)
+        case deleted
+        case closed
+        case timeout
+    }
+
+    /// New menu lines since `seq`, ANSI removed, joined for matching.
+    /// The transcript lines themselves are not edited.
+    private func characterDeletePlain(after seq: Int64) -> String {
+        lines.lazy
+            .filter { $0.isServerLine && $0.seq > seq }
+            .map { Ansi.plain($0.text) }
+            .joined(separator: "\n")
+    }
+
+    private func characterDeleteCancelledCopy(_ plain: String) -> String {
+        var parts: [String] = []
+        if plain.contains(Self.badPasswordSentence) {
+            parts.append(Self.badPasswordSentence)
+        }
+        if plain.contains(Self.deleteCancelledSentence) {
+            parts.append(Self.deleteCancelledSentence)
+        }
+        if parts.isEmpty {
+            return Self.deleteCancelledSentence
+        }
+        return parts.joined(separator: "\n")
+    }
+
+    private func characterDeleteSignal(
+        after seq: Int64,
+        phase: CharacterDeletePhase
+    ) -> CharacterDeleteSignal? {
+        let plain = characterDeletePlain(after: seq)
+        if plain.contains(Self.deletedSentence) {
+            return .deleted
+        }
+        if plain.contains(Self.immortalSentence) {
+            return .immortal(Self.immortalSentence)
+        }
+        let cancelled = plain.contains(Self.deleteCancelledSentence)
+            || (plain.contains(Self.badPasswordSentence) && plain.contains("Make your choice:"))
+        if cancelled {
+            return .cancelled(characterDeleteCancelledCopy(plain))
+        }
+        switch phase {
+        case .afterChoice:
+            if plain.contains(Self.deletePrompt1) {
+                return .prompt1
+            }
+        case .afterFirstPassword:
+            if plain.contains(Self.deletePrompt2) {
+                return .prompt2
+            }
+        case .afterSecondPassword:
+            break
+        }
+        return nil
+    }
+
+    private func awaitCharacterDeleteSignal(
+        after seq: Int64,
+        phase: CharacterDeletePhase
+    ) async -> CharacterDeleteSignal {
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline {
+            if token == nil || sessionId == nil {
+                return .closed
+            }
+            if let signal = characterDeleteSignal(after: seq, phase: phase) {
+                return signal
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        if token == nil || sessionId == nil {
+            return .closed
+        }
+        return .timeout
+    }
+
+    /// The game reprints the menu after an immortal refusal or a cancelled delete.
+    private func awaitMenuAfterDelete() async {
+        let deadline = Date().addingTimeInterval(8)
+        while Date() < deadline {
+            if atMenu || token == nil {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    /// Success sentence. Close the IM session, then drop this character the
+    /// way Unlink does. A second call, including one from a late close, does nothing.
+    private func finishDeletedCharacter() async {
+        guard characterDeleteSettled == false else { return }
+        characterDeleteSettled = true
+        characterDeleted = true
+        stopLive()
+        if token != nil, sessionId != nil {
+            _ = try? await post("/close", [:])
+        }
+        await retireActiveCharacter(statusMessage: Self.deletedSentence)
+        if characterPickerPresented {
+            status = Self.deletedSentence
+        }
+        characterDeleteSettled = false
+        characterDeleted = false
+    }
+
+    /// Login or creation copy for a tombstoned name. Nil when this body is not that refusal.
+    /// The creation `message` is kept as the server sent it. A longer login error
+    /// that only mentions the sentence is shown as the sentence.
+    private func deletedCharacterSentence(in data: Data) -> String? {
+        guard let object = jsonObject(data) else { return nil }
+        let message = (object["message"] as? String) ?? ""
+        let plainMessage = Ansi.plain(message).trimmingCharacters(in: .whitespacesAndNewlines)
+        if plainMessage.contains(Self.deletedCharacterSentence) {
+            return plainMessage
+        }
+        let error = (object["error"] as? String) ?? ""
+        if Ansi.plain(error).contains(Self.deletedCharacterSentence) {
+            return Self.deletedCharacterSentence
+        }
+        return nil
+    }
+
     /// Menu quit, or park while the menu is up (`{"closed":true}`).
     /// Only this character is logged out. Anyone else stays connected.
     private func finishMenuUnlink() async {
@@ -2355,7 +2664,15 @@ final class IMSession: ObservableObject {
 
     /// Playing sessions still reattach. A close while the menu is up, or a quit
     /// that already dropped the menu flag, stays on the login screen.
+    /// A delete in flight owns the close: success unlinks, anything else waits.
     private func handleClosedSession() async {
+        if characterDeleteSettled || characterDeleted {
+            await finishDeletedCharacter()
+            return
+        }
+        if characterDeleteActive {
+            return
+        }
         if atMenu || menuExit {
             await finishMenuUnlink()
             return
@@ -2365,6 +2682,13 @@ final class IMSession: ObservableObject {
 
     /// True when the caller must stop. Menu rejects do not log in again.
     private func handleRejectedSession(thenLogin: Bool) async -> Bool {
+        if characterDeleteSettled || characterDeleted {
+            await finishDeletedCharacter()
+            return true
+        }
+        if characterDeleteActive {
+            return true
+        }
         if atMenu || menuExit {
             await finishMenuUnlink()
             return true
@@ -2695,6 +3019,9 @@ final class IMSession: ObservableObject {
     }
 
     private func errorText(from data: Data, status: Int) -> String {
+        if let sentence = deletedCharacterSentence(in: data) {
+            return sentence
+        }
         if let object = jsonObject(data),
            let error = object["error"] as? String,
            error.isEmpty == false {
@@ -2780,6 +3107,7 @@ final class IMSession: ObservableObject {
 
     /// Opens the name-bar list and refreshes it from the server when a bearer is available.
     func openCharacterPicker() {
+        if characterDeleteActive && menuBusy { return }
         characterPickerLocked = choosingCharacter && token == nil
         characterPickerPresented = true
         Task { await refreshDeviceCharacters() }
@@ -2787,6 +3115,7 @@ final class IMSession: ObservableObject {
 
     /// Puts `name` on screen, catches its transcript up with `GET /since`, and claims pushes.
     func switchToCharacter(_ name: String) async {
+        if characterDeleteActive && menuBusy { return }
         let key = characterKey(name)
         if token != nil, let character, namesEqual(character, name) {
             characterPickerPresented = false
@@ -3027,6 +3356,10 @@ final class IMSession: ObservableObject {
             headerSeq = 0
         }
         atMenu = slot.atMenu
+        if characterDeleteSettled == false && characterDeleted == false {
+            characterDeleteActive = false
+            characterDeleteSent = false
+        }
         parked = slot.parked
         roomExits = slot.roomExits
         exitScan = slot.exitScan
@@ -3069,6 +3402,8 @@ final class IMSession: ObservableObject {
 
     /// The on-screen character's MUD session is already closed. Someone else may still be logged in.
     private func retireActiveCharacter(statusMessage: String) async {
+        characterDeleteActive = false
+        characterDeleteSent = false
         let retiring = character
         let retiringPassword = resolvedPassword(for: retiring ?? name)
         reportedDeviceCount = nil

@@ -14,6 +14,14 @@ struct LoginView: View {
     /// Password writes closer than this belong to the same turn as the name edit.
     private static let sameTurnSeconds: TimeInterval = 0.05
 
+    /// Missing-name, deleted-character, and permanent-delete copy is the alert color.
+    /// The extra create button stays only for a name that is not a character yet.
+    private var loginStatusIsAlert: Bool {
+        if session.characterMissing { return true }
+        return session.status == "Your character has been permanently deleted. Good-bye!"
+            || session.status.contains("That character can no longer be used.")
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -71,8 +79,8 @@ struct LoginView: View {
                     .listRowSeparator(.hidden)
                 } footer: {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(session.status)
-                            .foregroundStyle(session.characterMissing ? Color.red.matrix : Color(white: 0.78).matrix)
+                        Text(verbatim: session.status)
+                            .foregroundStyle(loginStatusIsAlert ? Color.red.matrix : Color(white: 0.78).matrix)
                         if session.characterMissing {
                             Button("Create new character") {
                                 session.openCharacterCreation()
