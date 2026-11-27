@@ -3111,7 +3111,9 @@ struct TranscriptView: View {
                     }
                     .clipped()
                     Group {
-                        if session.atMenu || session.characterDeleteActive {
+                        if session.isDetached {
+                            ReconnectBanner()
+                        } else if session.atMenu || session.characterDeleteActive {
                             GameMenuPanel()
                         } else {
                             inputBar
@@ -3261,10 +3263,18 @@ struct TranscriptView: View {
                 }
             }
             .onChange(of: session.atMenu) { _, atMenu in
-                if atMenu || session.characterDeleteActive {
+                if atMenu || session.characterDeleteActive || session.isDetached {
                     releaseCommandKeyboard()
                     actionPanelShown = false
                 } else {
+                    showCommandKeyboardIfPreferred()
+                }
+            }
+            .onChange(of: session.isDetached) { _, detached in
+                if detached {
+                    releaseCommandKeyboard()
+                    actionPanelShown = false
+                } else if session.atMenu == false {
                     showCommandKeyboardIfPreferred()
                 }
             }
@@ -3488,7 +3498,7 @@ struct TranscriptView: View {
     /// holds the typed line. A placeholder repeat leaves the field blank, so
     /// writing a piece would restart the keyboard.
     private func postCommandPieces(_ pieces: [String]) async {
-        guard session.atMenu == false else { return }
+        guard session.atMenu == false, session.isDetached == false else { return }
         if session.command.isEmpty == false {
             session.command = ""
         }
@@ -3541,7 +3551,7 @@ struct TranscriptView: View {
     /// write after a delay.
     private func keepCommandKeyboard() {
         guard commandKeyboardPaused == false else { return }
-        guard session.atMenu == false else { return }
+        guard session.atMenu == false, session.isDetached == false else { return }
         guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
         guard UIApplication.shared.applicationState == .active else { return }
         guard keyboardHeld else { return }
@@ -3667,7 +3677,7 @@ struct TranscriptView: View {
     /// are not a show.
     private func showCommandKeyboardIfPreferred() {
         guard commandKeyboardPaused == false else { return }
-        guard session.atMenu == false else { return }
+        guard session.atMenu == false, session.isDetached == false else { return }
         guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
         keyboardHeld = true
         // Already up. Requesting focus again restarts the keyboard. Rotation
@@ -3692,7 +3702,7 @@ struct TranscriptView: View {
     private func reassertCommandKeyboard(token: Int) {
         guard token == keyboardOrientationToken else { return }
         guard commandKeyboardPaused == false else { return }
-        guard keyboardHeld, session.atMenu == false else { return }
+        guard keyboardHeld, session.atMenu == false, session.isDetached == false else { return }
         guard keyboardPrefs.hidesKeyboard(isPortrait: KeyboardHidePreferences.interfaceIsPortrait()) == false else { return }
         guard commandFocused == false else { return }
         commandFocused = true
@@ -3755,7 +3765,7 @@ struct TranscriptView: View {
     /// Empty action text does not send. The welcome menu is not a target.
     /// The stored action is not edited.
     private func sendHotButton(_ button: HotButton) async {
-        guard session.atMenu == false else { return }
+        guard session.atMenu == false, session.isDetached == false else { return }
         guard let text = ActionShortcut.command(text: button.text, target: session.hilitedWord) else { return }
         await sendDirection(text)
     }
@@ -3763,7 +3773,7 @@ struct TranscriptView: View {
     /// A shortcut the drawer already joined with the hilite, when there was one.
     /// The welcome menu is not a target. The transcript text is not edited.
     private func sendShortcut(_ text: String) async {
-        guard session.atMenu == false else { return }
+        guard session.atMenu == false, session.isDetached == false else { return }
         let command = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard command.isEmpty == false else { return }
         await sendDirection(command)
@@ -3777,7 +3787,7 @@ struct TranscriptView: View {
     /// stay off the direction row.
     @ViewBuilder
     private var skillActionButtons: some View {
-        if session.atMenu == false {
+        if session.atMenu == false, session.isDetached == false {
             let room = logGlobalFrame.height > 1 ? max(0, logGlobalFrame.height - 8) : 0
             VStack(alignment: .trailing, spacing: 0) {
                 HStack(alignment: .bottom, spacing: 0) {
@@ -3929,6 +3939,50 @@ struct TranscriptView: View {
     }
 }
 
+
+/// Shown in place of the command bar while the MUD is not attached.
+/// The scrollback above it is the saved transcript, unchanged.
+/// Reconnect posts login again. With no saved password that returns to the
+/// login form without Unlink.
+private struct ReconnectBanner: View {
+    @EnvironmentObject private var session: IMSession
+    @ObservedObject private var matrixMode = MatrixMode.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(verbatim: session.reconnectBannerText)
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(MatrixShade.display(ink, enabled: matrixMode.enabled))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                Task { await session.reconnect() }
+            } label: {
+                HStack(spacing: 8) {
+                    Text("Reconnect")
+                    if session.reconnecting {
+                        ProgressView()
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(Color(white: 0.28))
+            .matrixProminentText()
+            .disabled(session.reconnecting || session.busy)
+            .accessibilityLabel("Reconnect")
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Chrome.barBackground, ignoresSafeAreaEdges: .bottom)
+        .anchorPreference(key: BottomBarBoundsKey.self, value: .bounds) { $0 }
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(key: BottomBarHeightKey.self, value: proxy.size.height)
+            }
+        }
+    }
+}
 
 /// Welcome menu, in the input bar's place. Enter sends `1`. Quit sends `0`
 /// and unlinks. Change password is a dialog, not menu choice `2`.

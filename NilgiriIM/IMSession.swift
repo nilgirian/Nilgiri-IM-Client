@@ -62,6 +62,34 @@ final class IMSession: ObservableObject {
     /// sends 0 or 1; the server answers PRESS RETURN itself.
     /// Delete character sends 3 from its own dialog, then the two passwords.
     @Published private(set) var atMenu = false
+    /// The scrollback is on screen and the MUD is not attached. Set when since
+    /// reports `connected: false` or a closed restored session (`closed` and
+    /// `resumed`), when the stream emits `disconnected`, or when input is
+    /// refused with `not_connected`. Cleared on a successful login or a live
+    /// since/stream. The transcript bytes are not touched.
+    @Published private(set) var isDetached = false
+    /// True while a re-login of a detached session is in flight.
+    @Published private(set) var reconnecting = false
+    /// Why the reconnect banner is up. A wizlock `message`, or a short local
+    /// sentence. Never copied into the transcript.
+    @Published private(set) var detachReason: String?
+    /// False while `isDetached` is set. Logged out is not this state.
+    var isConnected: Bool { isDetached == false }
+    /// Banner copy. The wizlock sentence stays as the server sent it (ANSI
+    /// stripped for the chrome only). "Reconnecting…" is added while a try runs.
+    var reconnectBannerText: String {
+        let reason = detachReason?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if reconnecting {
+            if reason.isEmpty || reason == "Disconnected from the game." {
+                return "Reconnecting…"
+            }
+            return reason + "\nReconnecting…"
+        }
+        if reason.isEmpty {
+            return "Disconnected from the game."
+        }
+        return reason
+    }
     /// A menu choice is in flight. The panel ignores a second tap.
     @Published private(set) var menuBusy = false
     /// Quit, or parking on the menu, is leaving for good.
@@ -142,6 +170,15 @@ final class IMSession: ObservableObject {
     private var streamTask: Task<Void, Never>?
     private var didRestore = false
     private var didAutoLogin = false
+    /// One re-login at a time. A poll tick during that attempt does not post another.
+    private var reconnectInFlight = false
+    /// After a failed re-login the poll waits until this instant. A tap, coming
+    /// back to the app, and switching character do not.
+    private var reconnectNotBefore = Date.distantPast
+    private var reconnectAttempt = 0
+    /// Bumped when the on-screen character changes so a login started for
+    /// someone else cannot paint over whoever is up now.
+    private var screenGeneration = 0
     private var desiredParked = false
     private var parkApplying = false
     private var lastParkOK = true
@@ -243,6 +280,9 @@ final class IMSession: ObservableObject {
         var menuExit: Bool
         var liveDeathEpoch: Int
         var menuDeathEpoch: Int
+        /// Scrollback kept, MUD not attached. The command bar stays down.
+        var detached: Bool = false
+        var detachReason: String? = nil
     }
 
     private static let maxCharacters = 6
@@ -267,8 +307,9 @@ final class IMSession: ObservableObject {
         case offline
         /// Proxy or MUD outage. The stored token and session id stay.
         case outage(OutageKind)
-        /// Since applied a restored session that is not attached yet (`closed` and `resumed`).
-        /// Login follows. The transcript and the divider stay.
+        /// Since applied a session that is not attached (`connected` false, or
+        /// `closed` with `resumed`). Login follows. The transcript and the
+        /// divider stay. The command bar does not.
         case detached
         /// The on-screen session changed while this request was in flight.
         /// Nothing was applied. The caller must not log the new character out.
@@ -278,7 +319,12 @@ final class IMSession: ObservableObject {
     private struct HTTPFailure: Error {
         let status: Int
         let message: String
+        /// `message` from the JSON body, when the server sent one beside `error`.
+        var serverMessage: String? = nil
     }
+
+    /// `/input` was refused because the MUD is not attached. The banner already says so.
+    private struct NotConnected: Error {}
 
     init() {
         defaults.removeObject(forKey: "im.serverURL")
@@ -457,7 +503,8 @@ final class IMSession: ObservableObject {
                 await handleClosedSession()
                 return
             case .detached:
-                break
+                await autoPasswordLogin(bypassBackoff: true)
+                return
             case .rejected:
                 if await handleRejectedSession(thenLogin: false) { return }
             case .superseded:
@@ -618,7 +665,7 @@ final class IMSession: ObservableObject {
     /// saved actions send their text whole. Command mode splits before it
     /// calls `sendLine`.
     func send(fallback: String? = nil) async {
-        guard atMenu == false, characterDeleteActive == false else { return }
+        guard atMenu == false, characterDeleteActive == false, isDetached == false else { return }
         menuExit = false
         let typed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         let text = typed.isEmpty
@@ -640,11 +687,13 @@ final class IMSession: ObservableObject {
     func sendLine(_ text: String) async {
         let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard line.isEmpty == false else { return }
-        guard atMenu == false, characterDeleteActive == false else { return }
+        guard atMenu == false, characterDeleteActive == false, isDetached == false else { return }
         menuExit = false
         do {
-            let data = try await post("/input", ["text": line])
+            let data = try await postInput(line)
             noteMenuFlag(data)
+        } catch is NotConnected {
+            return
         } catch {
             status = failureMessage(error)
         }
@@ -655,7 +704,7 @@ final class IMSession: ObservableObject {
     /// Delete character is its own dialog, not this method.
     /// The server answers PRESS RETURN itself; this does not send a blank line.
     func chooseMenu(_ choice: String) async {
-        guard atMenu, menuBusy == false, characterDeleteActive == false else { return }
+        guard atMenu, menuBusy == false, characterDeleteActive == false, isDetached == false else { return }
         guard choice == "0" || choice == "1" else { return }
         menuBusy = true
         if choice == "0" {
@@ -665,7 +714,7 @@ final class IMSession: ObservableObject {
         }
         defer { menuBusy = false }
         do {
-            let data = try await post("/input", ["text": choice])
+            let data = try await postInput(choice)
             // A since poll may have already dropped this menu session.
             guard token != nil else { return }
             if responseClosed(data) {
@@ -674,6 +723,10 @@ final class IMSession: ObservableObject {
             }
             noteMenuFlag(data)
             if choice == "0", atMenu {
+                menuExit = false
+            }
+        } catch is NotConnected {
+            if choice == "0", token != nil {
                 menuExit = false
             }
         } catch {
@@ -750,7 +803,7 @@ final class IMSession: ObservableObject {
         characterDeleteActive = false
         characterDeleteSent = false
         guard abortPrompt else { return }
-        _ = try? await post("/input", ["text": ""])
+        _ = try? await postInput("")
     }
 
     /// Menu choice `3`, then the same current password for both server prompts.
@@ -768,8 +821,10 @@ final class IMSession: ObservableObject {
         defer { menuBusy = false }
         let startSeq = lastSeq
         do {
-            _ = try await post("/input", ["text": "3"])
+            _ = try await postInput("3")
             characterDeleteSent = true
+        } catch is NotConnected {
+            return "Not connected to the game."
         } catch {
             return failureMessage(error)
         }
@@ -799,7 +854,9 @@ final class IMSession: ObservableObject {
         }
         let afterFirst = lastSeq
         do {
-            _ = try await post("/input", ["text": password])
+            _ = try await postInput(password)
+        } catch is NotConnected {
+            return "Not connected to the game."
         } catch {
             return failureMessage(error)
         }
@@ -829,7 +886,9 @@ final class IMSession: ObservableObject {
         }
         let afterSecond = lastSeq
         do {
-            _ = try await post("/input", ["text": password])
+            _ = try await postInput(password)
+        } catch is NotConnected {
+            return "Not connected to the game."
         } catch {
             return failureMessage(error)
         }
@@ -892,6 +951,12 @@ final class IMSession: ObservableObject {
             }
             if closingMenu {
                 menuExit = false
+            }
+            if noteNotConnected(error) {
+                Task { @MainActor in
+                    await reconnectDetached(bypassBackoff: false)
+                }
+                return false
             }
             status = failureMessage(error)
             return false
@@ -957,6 +1022,11 @@ final class IMSession: ObservableObject {
             do {
                 try await post("/close", [:])
             } catch {
+                // The MUD is already gone. Dropping the local bearer is the unlink.
+                if notConnectedFailure(error) != nil {
+                    await retireActiveCharacter(statusMessage: "Unlinked. The MUD session is closed.")
+                    return
+                }
                 status = failureMessage(error)
                 if token != nil {
                     startLive()
@@ -1000,6 +1070,12 @@ final class IMSession: ObservableObject {
         guard token != nil, sessionId != nil else { return }
         // Returning to the app is one reconnect attempt, not a poll tick.
         outageLatched = false
+        if isDetached {
+            // The saved session is still dead. Re-login before unparking it.
+            // Unpark on a closed MUD only fails and leaves the command bar up.
+            await autoPasswordLogin(bypassBackoff: true)
+            return
+        }
         await setParked(false)
         // A menu park may have closed the session while this was waiting.
         guard token != nil, sessionId != nil else { return }
@@ -1065,9 +1141,8 @@ final class IMSession: ObservableObject {
             stopLive()
             await handleClosedSession()
         case .detached:
-            // A login is already reattaching this restore. Don't drop the bearer.
-            guard didAutoLogin == false else { return }
-            stopLive()
+            // Keep polling. A failed re-login stays on the scrollback and waits
+            // out its backoff instead of dropping the bearer.
             await autoPasswordLogin()
         case .rejected:
             stopLive()
@@ -1084,7 +1159,12 @@ final class IMSession: ObservableObject {
             if addingCharacter == false {
                 token = nil
             }
-            status = "Enter the password to reattach the parked character."
+            status = isDetached
+                ? "Enter the password to reconnect."
+                : "Enter the password to reattach the parked character."
+            if isDetached {
+                clearDetached()
+            }
             return
         }
         // Block the catch-up poller from firing another login while this one is in flight.
@@ -1106,6 +1186,7 @@ final class IMSession: ObservableObject {
             body["since"] = NSNumber(value: lastSeq)
         }
         beginReentry()
+        let screen = screenGeneration
         do {
             let data = try JSONSerialization.data(withJSONObject: body)
             var req = URLRequest(url: url("/v1/login"))
@@ -1113,6 +1194,10 @@ final class IMSession: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = data
             let (respData, resp) = try await URLSession.shared.data(for: req)
+            guard screen == screenGeneration else {
+                cancelReentry()
+                return
+            }
             guard let http = resp as? HTTPURLResponse else {
                 status = "Login failed."
                 cancelReentry()
@@ -1129,12 +1214,32 @@ final class IMSession: ObservableObject {
                 menuBusy = false
                 stopLive()
                 token = nil
+                clearDetached()
+                return
+            }
+            // Wizlock is a closed gate, not the MUD-down alert. Keep the
+            // scrollback and the bearer so Reconnect can try again later.
+            if http.statusCode == 403, let wizlock = Self.wizlockMessage(in: respData) {
+                didAutoLogin = false
+                cancelReentry()
+                if addingCharacter {
+                    status = wizlock
+                    return
+                }
+                if token != nil {
+                    markDetached(reason: wizlock)
+                    return
+                }
+                status = wizlock
                 return
             }
             if let kind = OutageKind.http(status: http.statusCode, data: respData) {
                 // Leave the Keychain pair in place. Retry resumes it.
                 // This was not a rejected login, so the one automatic re-login stays armed.
                 didAutoLogin = false
+                if isDetached {
+                    markDetached(reason: kind.message)
+                }
                 reportOutage(kind)
                 cancelReentry()
                 return
@@ -1143,6 +1248,9 @@ final class IMSession: ObservableObject {
                 // No session was created. Do not /close, and do not drop whoever is on screen.
                 status = Self.deviceFullMessage
                 cancelReentry()
+                if isDetached, addingCharacter == false {
+                    markDetached(reason: Self.deviceFullMessage)
+                }
                 return
             }
             if http.statusCode == 401 {
@@ -1158,19 +1266,28 @@ final class IMSession: ObservableObject {
                 menuBusy = false
                 stopLive()
                 token = nil
+                clearDetached()
                 return
             }
             if http.statusCode != 200 {
-                status = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
+                let message = (try? JSONDecoder().decode(ErrorResponse.self, from: respData))?.error
                     ?? "Login failed (\(http.statusCode))"
+                status = message
                 characterMissing = Self.indicatesMissingCharacter(status) || http.statusCode == 404
                 cancelReentry()
                 if addingCharacter {
                     return
                 }
+                // A dead restore stays on its scrollback for anything except a
+                // missing session. Boot failures must not dump the reader to Unlink.
+                if isDetached, http.statusCode != 404 {
+                    markDetached(reason: loginFailureBanner(respData, fallback: message))
+                    return
+                }
                 atMenu = false
                 menuBusy = false
                 token = nil
+                clearDetached()
                 return
             }
             let login = try JSONDecoder().decode(LoginResponse.self, from: respData)
@@ -1191,13 +1308,6 @@ final class IMSession: ObservableObject {
             sessionId = login.sessionId
             parked = login.parked ?? false
             savedName = name
-            // A fresh login stops on the menu. A resumed reattach is linkdead:
-            // stay in the game unless the server still says menu.
-            applyArrivedMenu(
-                menu: login.menu,
-                state: login.state,
-                whenAbsent: login.resumed == true ? .playing : .menu
-            )
             // A brand-new session has nothing to split. Older servers omit both flags.
             // A live reattach is resumed with no disconnectedAt: the device-clock
             // marker is the fallback. A restored login repeats the since value;
@@ -1208,6 +1318,7 @@ final class IMSession: ObservableObject {
                 clearShownDisconnect()
                 cancelResumeReveal()
             }
+            let wasDetached = isDetached
             if switching == false && login.resumed == true && includeSince {
                 append(
                     login.lines ?? [],
@@ -1227,6 +1338,20 @@ final class IMSession: ObservableObject {
                     persistCursor()
                 }
             }
+            // `resumed` only means the saved buffer was reused. Explicit menu
+            // and state win. When both are absent, the lines that just arrived
+            // decide. A detached reconnect with nothing to read stays on the
+            // welcome menu, which is where a combined restart lands.
+            applyArrivedMenu(
+                menu: login.menu,
+                state: login.state,
+                whenAbsent: menuFallback(
+                    loginLines: login.lines,
+                    wasDetached: wasDetached,
+                    resumed: login.resumed
+                )
+            )
+            clearDetached()
             // Before the next await, so a replayed DEAD is gone before the bar paints.
             endReentry()
             persistAccount()
@@ -1235,10 +1360,21 @@ final class IMSession: ObservableObject {
             }
             await settleAfterResume(announcement: arrivalAnnouncement(login.character, resumed: login.resumed))
         } catch {
+            guard screen == screenGeneration else {
+                cancelReentry()
+                return
+            }
             cancelReentry()
             if let kind = OutageKind.transport(error) {
                 didAutoLogin = false
+                if isDetached {
+                    markDetached(reason: kind.message)
+                }
                 reportOutage(kind)
+                return
+            }
+            if isDetached, addingCharacter == false {
+                markDetached(reason: failureMessage(error))
                 return
             }
             status = failureMessage(error)
@@ -1314,14 +1450,27 @@ final class IMSession: ObservableObject {
                     )
                 }
                 applyArrivedMenu(menu: since.menu, state: since.state, whenAbsent: .keep)
+                let connected = connectedFlag(in: data)
+                // A restored session is closed and resumed, with the MUD gone.
+                // `connected: false` is the same once the server sends it,
+                // including when `resumed` is left out. The lines above stay.
+                if connected == false || (since.closed && since.resumed == true) {
+                    markDetached(reason: nil)
+                    return .detached
+                }
                 if since.closed {
-                    if since.resumed == true {
-                        return .detached
-                    }
+                    clearDetached()
                     return .closed
                 }
+                clearDetached()
                 return .ready
-            case 401, 403, 404:
+            case 403:
+                if let wizlock = Self.wizlockMessage(in: data) {
+                    markDetached(reason: wizlock)
+                    return .detached
+                }
+                return .rejected
+            case 401, 404:
                 return .rejected
             default:
                 if let kind = OutageKind.http(status: http.statusCode, data: data) {
@@ -1380,8 +1529,13 @@ final class IMSession: ObservableObject {
         await PushRegistration.flush(session: self)
     }
 
-    /// One automatic re-login per failed resume. A ready since arms it again.
-    private func autoPasswordLogin() async {
+    /// One automatic re-login per failed resume that is not a detached restore.
+    /// A detached session keeps its bearer and retries with backoff.
+    private func autoPasswordLogin(bypassBackoff: Bool = false) async {
+        if isDetached {
+            await reconnectDetached(bypassBackoff: bypassBackoff)
+            return
+        }
         guard didAutoLogin == false else {
             token = nil
             await showRemainingOrLogin(statusMessage: "Could not reattach the parked session.")
@@ -1391,6 +1545,142 @@ final class IMSession: ObservableObject {
         if token == nil, rosterNames.isEmpty == false {
             await showRemainingOrLogin(statusMessage: status)
         }
+    }
+
+    /// Reconnect button. One login, even while the poll is waiting out a backoff.
+    func reconnect() async {
+        await reconnectDetached(bypassBackoff: true)
+    }
+
+    /// Posts `/v1/login` for the on-screen detached session.
+    /// The poll honors `reconnectNotBefore`. A tap, `sceneBecameActive`, and a
+    /// character switch pass `bypassBackoff` so a wizlock lifting is not stuck
+    /// behind the timer. Overlapping calls share one in-flight login.
+    private func reconnectDetached(bypassBackoff: Bool) async {
+        guard isDetached else { return }
+        guard token != nil, sessionId != nil else { return }
+        if reconnectInFlight {
+            guard bypassBackoff else { return }
+            let generation = screenGeneration
+            while reconnectInFlight {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            guard generation == screenGeneration, isDetached, token != nil else { return }
+        }
+        if bypassBackoff == false, Date() < reconnectNotBefore { return }
+        if password.isEmpty {
+            let saved = resolvedPassword(for: character ?? name)
+            if saved.isEmpty == false {
+                password = saved
+            }
+        }
+        if password.isEmpty {
+            // No saved password. Leave the Keychain token so the next login can
+            // resume, and do not make them open Unlink to get the form.
+            stopLive()
+            token = nil
+            status = "Enter the password to reconnect."
+            return
+        }
+        let generation = screenGeneration
+        reconnectInFlight = true
+        reconnecting = true
+        status = reconnectBannerText
+        defer {
+            reconnectInFlight = false
+            reconnecting = false
+            if isDetached, generation == screenGeneration {
+                status = reconnectBannerText
+            }
+        }
+        await passwordLogin()
+        guard generation == screenGeneration else { return }
+        if isDetached {
+            reconnectAttempt += 1
+            let delay = min(30.0, pow(2.0, Double(min(reconnectAttempt, 5))))
+            reconnectNotBefore = Date().addingTimeInterval(delay)
+            if token != nil, pollTask == nil, inForeground, desiredParked == false {
+                startLive()
+            }
+        } else {
+            reconnectAttempt = 0
+            reconnectNotBefore = .distantPast
+        }
+    }
+
+    /// Scrollback stays. The command bar comes down. A nil reason keeps a
+    /// wizlock sentence that is already showing.
+    private func markDetached(reason: String?) {
+        if let text = bannerReason(reason) {
+            detachReason = text
+        } else if detachReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+            detachReason = "Disconnected from the game."
+        }
+        isDetached = true
+        if reconnecting == false {
+            status = detachReason ?? "Disconnected from the game."
+        }
+    }
+
+    /// The MUD is attached again. Backoff resets. The transcript is not rewritten.
+    private func clearDetached() {
+        reconnectAttempt = 0
+        reconnectNotBefore = .distantPast
+        guard isDetached || detachReason != nil else { return }
+        isDetached = false
+        detachReason = nil
+    }
+
+    /// ANSI comes off for the banner. The stored lines are not passed through here.
+    private func bannerReason(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let plain = Ansi.plain(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        return plain.isEmpty ? nil : plain
+    }
+
+    /// `403` `{"error":"wizlocked","message":...}`. Nil for every other body,
+    /// so this is never turned into the unavailable alert.
+    private static func wizlockMessage(in data: Data) -> String? {
+        guard data.isEmpty == false,
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        let error = (object["error"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard error.compare("wizlocked", options: .caseInsensitive) == .orderedSame else { return nil }
+        let message = (object["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if message.isEmpty { return "The game is wizlocked." }
+        let plain = Ansi.plain(message).trimmingCharacters(in: .whitespacesAndNewlines)
+        return plain.isEmpty ? "The game is wizlocked." : plain
+    }
+
+    /// Prefer the server's `message` on the banner. `fallback` is the `error` code.
+    private func loginFailureBanner(_ data: Data, fallback: String) -> String {
+        if let object = jsonObject(data), let message = bannerReason(object["message"] as? String) {
+            return message
+        }
+        let trimmed = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Could not reconnect." : trimmed
+    }
+
+    /// Disconnect `data` that arrived without a usable `event:` line.
+    /// A transcript line has `seq` and is not this.
+    private func disconnectPayload(_ payload: String) -> Bool {
+        guard let data = payload.data(using: .utf8), let object = jsonObject(data) else { return false }
+        guard boolValue(object, "connected") == false else { return false }
+        return object["seq"] == nil
+    }
+
+    /// `connected` on a since body. Nil when this server does not send it.
+    private func connectedFlag(in data: Data) -> Bool? {
+        guard let object = jsonObject(data) else { return nil }
+        return boolValue(object, "connected")
+    }
+
+    private func jsonEpochMillis(_ value: Any?) -> Int64? {
+        guard let value, (value is NSNull) == false else { return nil }
+        guard let number = value as? NSNumber else { return nil }
+        if CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+        let ms = number.doubleValue
+        guard ms.isFinite, ms > 0, ms < Double(Int64.max) else { return nil }
+        return Int64(ms.rounded())
     }
 
     /// Keeps the last park request aligned with the latest foreground or background.
@@ -1511,25 +1801,52 @@ final class IMSession: ObservableObject {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         do {
             let (bytes, _) = try await URLSession.shared.bytes(for: req)
+            var eventName = ""
+            var sawDisconnect = false
             for try await line in bytes.lines {
                 if Task.isCancelled || liveEpoch != epoch || self.sessionId != owner || self.token == nil {
                     return
                 }
-                if line.hasPrefix("data: ") {
-                    let payload = String(line.dropFirst(6))
-                    if let data = payload.data(using: .utf8),
-                       let dto = try? JSONDecoder().decode(LineDTO.self, from: data) {
-                        append([dto])
-                    }
+                if line.isEmpty {
+                    eventName = ""
                     continue
                 }
                 // Comment lines carry the menu flag only. Game text stays on data lines.
                 // The server answers PRESS RETURN; this client does not send it.
                 if line.hasPrefix(":") {
-                    applyMenuComment(line)
+                    if applyMenuComment(line), reconnectInFlight == false {
+                        clearDetached()
+                    }
+                    continue
+                }
+                if line.lowercased().hasPrefix("event:") {
+                    eventName = String(line.dropFirst(6))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .lowercased()
+                    continue
+                }
+                if line.hasPrefix("data:") {
+                    let payload = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+                    if eventName == "disconnected" || disconnectPayload(payload) {
+                        sawDisconnect = true
+                        noteStreamDisconnected(payload)
+                        eventName = ""
+                        continue
+                    }
+                    eventName = ""
+                    if let data = payload.data(using: .utf8),
+                       let dto = try? JSONDecoder().decode(LineDTO.self, from: data) {
+                        // A game line means this stream is attached. Don't clear a
+                        // banner out from under a re-login that is already posting.
+                        if reconnectInFlight == false {
+                            clearDetached()
+                        }
+                        append([dto])
+                    }
+                    continue
                 }
             }
-            if Task.isCancelled == false, liveEpoch == epoch, self.sessionId == owner {
+            if Task.isCancelled == false, liveEpoch == epoch, self.sessionId == owner, sawDisconnect == false {
                 noteDisconnect()
                 status = "Live stream dropped; polling catch-up."
             }
@@ -2378,11 +2695,76 @@ final class IMSession: ObservableObject {
             throw HTTPFailure(status: 0, message: "No response from the IM server.")
         }
         guard (200...299).contains(http.statusCode) else {
-            let message = (try? JSONDecoder().decode(ErrorResponse.self, from: data))?.error
-                ?? "Request failed (\(http.statusCode))"
-            throw HTTPFailure(status: http.statusCode, message: message)
+            let object = jsonObject(data)
+            let error = (object?["error"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let serverMessage = (object?["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = (error?.isEmpty == false ? error : nil) ?? "Request failed (\(http.statusCode))"
+            throw HTTPFailure(
+                status: http.statusCode,
+                message: message,
+                serverMessage: (serverMessage?.isEmpty == false) ? serverMessage : nil
+            )
         }
         return data
+    }
+
+    /// `/input`. A `409` `not_connected` or a legacy `500` `not connected` drops
+    /// the command bar, shows the reconnect banner, and starts one re-login.
+    private func postInput(_ text: String) async throws -> Data {
+        do {
+            return try await post("/input", ["text": text])
+        } catch {
+            guard noteNotConnected(error) else { throw error }
+            await reconnectDetached(bypassBackoff: false)
+            throw NotConnected()
+        }
+    }
+
+    /// `409` `not_connected`, or a legacy `500` whose error says `not connected`.
+    /// Nil for every other failure, including a device-limit 409.
+    private func notConnectedFailure(_ error: Error) -> HTTPFailure? {
+        guard let failure = error as? HTTPFailure else { return nil }
+        let code = failure.message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folded = code.lowercased()
+        let mentions = folded == "not_connected" || folded.contains("not connected")
+        // 409 is `not_connected`. Legacy servers use 500 and the words "not connected".
+        let modern = failure.status == 409 && mentions
+        let legacy = failure.status == 500 && mentions
+        guard modern || legacy else { return nil }
+        return failure
+    }
+
+    /// True when this refusal means the MUD socket is gone. The transcript is not changed.
+    private func noteNotConnected(_ error: Error) -> Bool {
+        guard let failure = notConnectedFailure(error) else { return false }
+        markDetached(reason: bannerReason(failure.serverMessage) ?? "Not connected to the game.")
+        return true
+    }
+
+    /// `event: disconnected` on the live stream. Inserts the gap row the since
+    /// path already uses, then re-login. Game lines are not rewritten.
+    private func noteStreamDisconnected(_ payload: String) {
+        var reason: String?
+        var disconnectedAt: Int64?
+        if let data = payload.data(using: .utf8), let object = jsonObject(data) {
+            reason = bannerReason(object["message"] as? String)
+            disconnectedAt = jsonEpochMillis(object["disconnectedAt"])
+        }
+        if disconnectedAt == nil {
+            noteDisconnect()
+        }
+        if lines.isEmpty == false {
+            let next = applyingDisconnectSeparator(
+                lines,
+                seenSeq: lastSeq,
+                serverDisconnectedAt: disconnectedAt
+            )
+            publishLines(next, animatedScroll: false)
+        }
+        markDetached(reason: reason)
+        Task { @MainActor in
+            await self.reconnectDetached(bypassBackoff: false)
+        }
     }
 
     /// Where a login or since body left the character when `menu` and `state` are absent.
@@ -2436,6 +2818,57 @@ final class IMSession: ObservableObject {
         }
     }
 
+    /// Where a login left the character when `menu` and `state` were not sent.
+    /// Only the lines this login returned are read. The pre-reboot scrollback
+    /// still has in-game prompts, and those must not count as "already playing".
+    /// Nothing here is written back into the transcript.
+    private func menuFallback(
+        loginLines: [LineDTO]?,
+        wasDetached: Bool,
+        resumed: Bool?
+    ) -> MenuWhenAbsent {
+        if let inferred = inferredMenu(from: loginLines ?? []) {
+            return inferred
+        }
+        // A detached reconnect with no flags is the combined restart: the
+        // welcome menu, not the in-game command bar.
+        if wasDetached {
+            return .menu
+        }
+        return resumed == true ? .playing : .menu
+    }
+
+    /// Last matching line in the tail wins. Nil when the tail does not say.
+    /// `Make your choice:` is the welcome menu. A prompt or the login echo
+    /// after that is in the game.
+    private func inferredMenu(from source: [LineDTO]) -> MenuWhenAbsent? {
+        let tail = source.compactMap { line -> String? in
+            let plain = Ansi.plain(line.text).trimmingCharacters(in: .whitespacesAndNewlines)
+            return plain.isEmpty ? nil : plain
+        }
+        guard tail.isEmpty == false else { return nil }
+        var decision: MenuWhenAbsent?
+        for line in tail {
+            if line.range(of: "make your choice", options: .caseInsensitive) != nil {
+                decision = .menu
+                continue
+            }
+            if line.range(of: "into the game.", options: .caseInsensitive) != nil {
+                decision = .playing
+                continue
+            }
+            let range = NSRange(line.startIndex..., in: line)
+            if Self.playingPromptExpression.firstMatch(in: line, options: [], range: range) != nil {
+                decision = .playing
+            }
+        }
+        return decision
+    }
+
+    private static let playingPromptExpression: NSRegularExpression = {
+        try! NSRegularExpression(pattern: #"<\s*-?\d+h\s+-?\d+m\s+-?\d+v"#)
+    }()
+
     /// Entering the menu remembers which live death had already happened.
     /// Leaving it drops a DEAD header from before the menu unless a live
     /// line has said dead again since the menu was shown.
@@ -2450,14 +2883,17 @@ final class IMSession: ObservableObject {
 
     /// SSE comment `: {"menu":true|false}`. Anything else is ignored.
     /// The comment is not game text and is never written into the transcript.
-    private func applyMenuComment(_ line: String) {
+    /// True when a menu flag was applied, which only happens on a live stream.
+    @discardableResult
+    private func applyMenuComment(_ line: String) -> Bool {
         let payload = line.dropFirst().drop(while: { $0 == " " || $0 == "\t" })
         guard let data = String(payload).data(using: .utf8),
-              let object = jsonObject(data) else { return }
+              let object = jsonObject(data) else { return false }
         let menu = boolValue(object, "menu")
         let state = object["state"] as? String
-        guard menu != nil || (state?.isEmpty == false) else { return }
+        guard menu != nil || (state?.isEmpty == false) else { return false }
         applyArrivedMenu(menu: menu, state: state, whenAbsent: .keep)
+        return true
     }
 
     private func noteMenuFlag(_ data: Data) {
@@ -2844,6 +3280,7 @@ final class IMSession: ObservableObject {
             password = keptPassword
         }
         didAutoLogin = true
+        clearDetached()
         createdUnbound = login.deviceBound != true
         noteDeviceCounts(bound: login.deviceBound, count: login.deviceCount, limit: login.deviceLimit)
         addingCharacter = false
@@ -3159,20 +3596,16 @@ final class IMSession: ObservableObject {
             await showRemainingOrLogin(statusMessage: "That character's session ended.")
             return
         case .detached:
-            await passwordLogin()
-            if token == nil {
-                forgetActiveToken()
-                await showRemainingOrLogin(statusMessage: "Could not reattach the parked session.")
-                return
-            }
-            if pollTask == nil {
-                startLive()
-            }
+            await autoPasswordLogin(bypassBackoff: true)
             return
         case .outage(let kind):
             reportOutage(kind)
         case .ready, .offline:
             break
+        }
+        if isDetached {
+            await autoPasswordLogin(bypassBackoff: true)
+            return
         }
         guard token != nil else { return }
         persistAccount()
@@ -3315,7 +3748,9 @@ final class IMSession: ObservableObject {
             didApplyEntryBacklog: didApplyEntryBacklog,
             menuExit: menuExit,
             liveDeathEpoch: liveDeathEpoch,
-            menuDeathEpoch: menuDeathEpoch
+            menuDeathEpoch: menuDeathEpoch,
+            detached: isDetached,
+            detachReason: detachReason
         )
         rememberCharacter(character)
     }
@@ -3335,6 +3770,7 @@ final class IMSession: ObservableObject {
     }
 
     private func install(_ slot: HeldCharacter) {
+        screenGeneration += 1
         canonicalCarry = ""
         canonicalCarryOwner = characterKey(slot.name)
         CharacterPreferenceScope.adopt(slot.name)
@@ -3356,6 +3792,11 @@ final class IMSession: ObservableObject {
             headerSeq = 0
         }
         atMenu = slot.atMenu
+        isDetached = slot.detached
+        detachReason = slot.detachReason
+        if isDetached, detachReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true {
+            detachReason = "Disconnected from the game."
+        }
         if characterDeleteSettled == false && characterDeleted == false {
             characterDeleteActive = false
             characterDeleteSent = false
@@ -3384,6 +3825,8 @@ final class IMSession: ObservableObject {
 
     /// Drops the on-screen bearer. The password stays so the name can be entered again.
     private func forgetActiveToken() {
+        screenGeneration += 1
+        clearDetached()
         let retiring = character
         stopLive()
         cancelResumeReveal()
@@ -3402,6 +3845,8 @@ final class IMSession: ObservableObject {
 
     /// The on-screen character's MUD session is already closed. Someone else may still be logged in.
     private func retireActiveCharacter(statusMessage: String) async {
+        screenGeneration += 1
+        clearDetached()
         characterDeleteActive = false
         characterDeleteSent = false
         let retiring = character
