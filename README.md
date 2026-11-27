@@ -4,6 +4,8 @@ An iPhone and iPad client for [Nilgiri the Forgotten World](https://nilgiri.net)
 
 NilgiriIM lets you play Nilgiri from your phone like a chat app. You can log in or create a character, play in a scrolling transcript with ANSI colors, and park your character when you leave the app. While it's parked, you get push notifications for tells, whispers, prayers, combat, death, and link loss.
 
+iOS TestFlight URL: https://testflight.apple.com/join/NvAbmJhJ
+
 ## How it works
 
 The app doesn't talk to the game over telnet directly. It connects over HTTPS to the Nilgiri IM server at `https://nilgiri.net/im`, which keeps your game session alive and sends Apple push notifications. The IM server is part of the game's server code, which is not public.
