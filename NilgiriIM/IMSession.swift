@@ -477,6 +477,7 @@ final class IMSession: ObservableObject {
         case .superseded:
             break
         }
+        notePrefsSession()
     }
 
     func login() async {
@@ -495,9 +496,11 @@ final class IMSession: ObservableObject {
                 pendingUnpark = true
                 status = "Could not reach the IM server. The parked session is still saved."
                 startLive()
+                notePrefsSession()
                 return
             case .outage(let kind):
                 holdSessionThroughOutage(kind)
+                notePrefsSession()
                 return
             case .closed:
                 await handleClosedSession()
@@ -1041,6 +1044,7 @@ final class IMSession: ObservableObject {
         // Leave the Keychain pair in place so the next enter can resume.
         cancelResumeReveal()
         token = nil
+        notePrefsSession()
         status = "Parked. Resume keeps this character where they are."
     }
 
@@ -1074,6 +1078,7 @@ final class IMSession: ObservableObject {
             // The saved session is still dead. Re-login before unparking it.
             // Unpark on a closed MUD only fails and leaves the command bar up.
             await autoPasswordLogin(bypassBackoff: true)
+            notePrefsSession()
             return
         }
         await setParked(false)
@@ -1085,6 +1090,7 @@ final class IMSession: ObservableObject {
             }
             startLive()
         }
+        notePrefsSession()
     }
 
     /// Fire-and-forget. Login, resume, and since also zero the counter.
@@ -1158,6 +1164,7 @@ final class IMSession: ObservableObject {
         guard password.isEmpty == false else {
             if addingCharacter == false {
                 token = nil
+                notePrefsSession()
             }
             status = isDetached
                 ? "Enter the password to reconnect."
@@ -1214,6 +1221,7 @@ final class IMSession: ObservableObject {
                 menuBusy = false
                 stopLive()
                 token = nil
+                notePrefsSession()
                 clearDetached()
                 return
             }
@@ -1266,6 +1274,7 @@ final class IMSession: ObservableObject {
                 menuBusy = false
                 stopLive()
                 token = nil
+                notePrefsSession()
                 clearDetached()
                 return
             }
@@ -1287,6 +1296,7 @@ final class IMSession: ObservableObject {
                 atMenu = false
                 menuBusy = false
                 token = nil
+                notePrefsSession()
                 clearDetached()
                 return
             }
@@ -1518,6 +1528,7 @@ final class IMSession: ObservableObject {
         let foreground = inForeground
         pendingUnpark = foreground == false
         await setParked(foreground ? false : true)
+        notePrefsSession()
         guard desiredParked == false else { return }
         if lastParkOK {
             status = announcement
@@ -1538,6 +1549,7 @@ final class IMSession: ObservableObject {
         }
         guard didAutoLogin == false else {
             token = nil
+            notePrefsSession()
             await showRemainingOrLogin(statusMessage: "Could not reattach the parked session.")
             return
         }
@@ -1579,6 +1591,7 @@ final class IMSession: ObservableObject {
             // resume, and do not make them open Unlink to get the form.
             stopLive()
             token = nil
+            notePrefsSession()
             status = "Enter the password to reconnect."
             return
         }
@@ -2653,6 +2666,23 @@ final class IMSession: ObservableObject {
         defaults.removeObject(forKey: scopedKey(StoreKey.hmvName))
     }
 
+    /// The on-screen character has a bearer, or no longer does. Action slots
+    /// pull `/prefs` from this and drop a response when the bearer is cleared.
+    private func notePrefsSession() {
+        guard let token, token.isEmpty == false,
+              let sessionId, sessionId.isEmpty == false,
+              let character, character.isEmpty == false else {
+            CharacterPrefsSession.clear()
+            return
+        }
+        CharacterPrefsSession.publish(
+            character: character,
+            sessionId: sessionId,
+            token: token,
+            baseURL: serverURL
+        )
+    }
+
     /// Shows `owner`'s own prompt, or clears the bar. `headerSeq` goes back to
     /// zero so a line number from the character who just left cannot reject
     /// this character's `<30h 100m 97v>`.
@@ -3559,6 +3589,7 @@ final class IMSession: ObservableObject {
             characterPickerLocked = false
             choosingCharacter = false
             await claimActive()
+            notePrefsSession()
             return
         }
         if token != nil {
@@ -3622,6 +3653,7 @@ final class IMSession: ObservableObject {
             status = "Playing as \(character)"
         }
         await PushRegistration.flush(session: self)
+        notePrefsSession()
     }
 
     /// Login cover. The character on screen stays connected, including their password.
@@ -3821,6 +3853,7 @@ final class IMSession: ObservableObject {
         defaults.set(slot.name, forKey: StoreKey.name)
         defaults.set(slot.name, forKey: RosterKey.active)
         rememberCharacter(slot.name)
+        notePrefsSession()
     }
 
     /// Drops the on-screen bearer. The password stays so the name can be entered again.
@@ -3841,6 +3874,7 @@ final class IMSession: ObservableObject {
         token = nil
         sessionId = nil
         savedTokenAvailable = false
+        notePrefsSession()
     }
 
     /// The on-screen character's MUD session is already closed. Someone else may still be logged in.
@@ -3886,6 +3920,7 @@ final class IMSession: ObservableObject {
         token = nil
         sessionId = nil
         savedTokenAvailable = remaining.isEmpty == false
+        notePrefsSession()
         if remaining.isEmpty {
             character = nil
             choosingCharacter = false
@@ -3918,6 +3953,7 @@ final class IMSession: ObservableObject {
             characterPickerLocked = false
             token = nil
             sessionId = nil
+            notePrefsSession()
             defaults.removeObject(forKey: StoreKey.character)
             defaults.removeObject(forKey: RosterKey.active)
             status = statusMessage
@@ -3931,6 +3967,7 @@ final class IMSession: ObservableObject {
         character = nil
         token = nil
         sessionId = nil
+        notePrefsSession()
         characterPickerLocked = true
         characterPickerPresented = true
         status = "Choose a character."

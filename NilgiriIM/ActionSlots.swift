@@ -193,6 +193,26 @@ final class ActionMenuStore: ObservableObject {
     private var settingsEditPending = false
     /// Character whose lists are loaded. Switching reloads that character's keys.
     private var loadedFor = ""
+    /// Nonzero while a server payload is being applied. That apply writes
+    /// iCloud and the local lists, and must not PUT the same bytes back.
+    /// A push requested while this is set is remembered and sent after.
+    private var suppressServerPush = 0
+    private var serverPushDeferred = false
+    /// Bumped for each pull and when the bearer goes away, so a late body
+    /// for the previous character is dropped.
+    private var pullGeneration = 0
+    /// The live imserver answered 404 or 405 for `/prefs`. Edits stay on
+    /// device and in iCloud until the next attach tries again.
+    private var prefsUnavailable = false
+    /// Last `updatedAt` known for each character, in epoch milliseconds.
+    /// A push is sent only when the local stamp is newer than this.
+    private var serverUpdatedAt: [String: Int64] = [:]
+    private var pendingPush: PendingServerPush?
+    private var pushWait: Task<Void, Never>?
+    private var pullWait: Task<Void, Never>?
+    private var serverSendInFlight = false
+    private var serverAttachObserver: NSObjectProtocol?
+    private var serverEndedObserver: NSObjectProtocol?
 
     private enum Key {
         static let shortcuts = "im.actionShortcuts"
@@ -249,6 +269,7 @@ final class ActionMenuStore: ObservableObject {
         startCloudSync()
         loadedFor = CharacterPreferenceScope.key
         tracksEdits = true
+        startServerSync()
     }
 
     /// Loads lists for the character currently in scope. A character this
@@ -258,6 +279,9 @@ final class ActionMenuStore: ObservableObject {
     func reload() {
         let key = CharacterPreferenceScope.key
         guard key != loadedFor else { return }
+        // The in-memory lists are still the character who just left. Send
+        // their pending snapshot before this scope's keys are loaded.
+        flushServerPushNow()
         tracksEdits = false
         reconciling = false
         rememberedIcons = [:]
@@ -266,6 +290,7 @@ final class ActionMenuStore: ObservableObject {
         pullCloud()
         loadedFor = key
         tracksEdits = true
+        pullServerPrefs()
     }
 
     /// Both keys absent: this character has never saved lists, so the factory
@@ -305,6 +330,12 @@ final class ActionMenuStore: ObservableObject {
         }
         if let settingsObserver {
             center.removeObserver(settingsObserver)
+        }
+        if let serverAttachObserver {
+            center.removeObserver(serverAttachObserver)
+        }
+        if let serverEndedObserver {
+            center.removeObserver(serverEndedObserver)
         }
     }
 
@@ -894,7 +925,11 @@ final class ActionMenuStore: ObservableObject {
         if reconcileAgain {
             reconcileAgain = false
             reconcile(readCloud(), cloudKnown: true)
+            return
         }
+        // A newer iCloud snapshot is this character's saved prefs. Push it
+        // when it is ahead of imserver. A tied or older cloud stamp does not.
+        scheduleServerPush()
     }
 
     /// Takes synced switches this character has never stored. When the cloud
@@ -1051,6 +1086,7 @@ final class ActionMenuStore: ObservableObject {
         storeSyncFlags()
         writeCloud(updatedAt: updatedAt, push: false)
         scheduleCloudPush()
+        scheduleServerPush()
     }
 
     /// A left-menu switch moved. Factory lists stay out because `seeded` is
@@ -1067,6 +1103,7 @@ final class ActionMenuStore: ObservableObject {
         UserDefaults.standard.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
         writeCloud(updatedAt: updatedAt, push: false)
         scheduleCloudPush()
+        scheduleServerPush()
     }
 
     private func scheduleCloudPush() {
@@ -1147,6 +1184,448 @@ final class ActionMenuStore: ObservableObject {
         guard let value = note.userInfo?[NSUbiquitousKeyValueStoreChangeReasonKey] else { return nil }
         if let number = value as? NSNumber { return number.intValue }
         return value as? Int
+    }
+
+    /// One debounced PUT. The body is the snapshot taken when the edit was
+    /// scheduled, so a character switch cannot send the next character's lists
+    /// to the previous session.
+    private struct PendingServerPush {
+        var link: CharacterPrefsSession.Link
+        var body: [String: Any]
+        var localMs: Int64
+    }
+
+    /// `/prefs` document. Absent list keys are not empty lists: an empty
+    /// server (`updatedAt` 0) must not wipe a saved local list, and a
+    /// settings-only body must not wipe hot buttons.
+    private struct ServerPayload {
+        var character: String
+        var updatedAt: Int64
+        var saved: Bool?
+        var shortcuts: [ActionShortcut]?
+        var buttons: [HotButton]?
+        var settings: [String: Bool]
+    }
+
+    private enum PrefsHTTP {
+        case payload(ServerPayload)
+        case unsupported
+        case failed
+    }
+
+    private func startServerSync() {
+        let center = NotificationCenter.default
+        serverAttachObserver = center.addObserver(
+            forName: .imPrefsSessionAttached,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.serverSessionAttached()
+        }
+        serverEndedObserver = center.addObserver(
+            forName: .imPrefsSessionEnded,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.serverSessionEnded()
+        }
+        serverSessionAttached()
+    }
+
+    /// The session published a bearer. Pull only when it is the character
+    /// whose lists are already loaded, so a quick switch cannot apply A
+    /// onto B. A scope that moved first reloads, and that reload pulls.
+    private func serverSessionAttached() {
+        guard let link = CharacterPrefsSession.link else { return }
+        guard link.characterKey == CharacterPreferenceScope.key, link.characterKey.isEmpty == false else { return }
+        if loadedFor != link.characterKey {
+            reload()
+            return
+        }
+        pullServerPrefs()
+    }
+
+    private func serverSessionEnded() {
+        pullGeneration += 1
+        pullWait?.cancel()
+        pullWait = nil
+        prefsUnavailable = false
+        flushServerPushNow()
+    }
+
+    /// `GET /v1/sessions/{id}/prefs` for the attached character. Back-to-back
+    /// attaches (resume, then the launch path) share one request.
+    private func pullServerPrefs() {
+        guard prefsLinkMatchesScope() != nil else { return }
+        guard loadedFor == CharacterPreferenceScope.key else { return }
+        prefsUnavailable = false
+        pullGeneration += 1
+        let generation = pullGeneration
+        guard let link = CharacterPrefsSession.link else { return }
+        pullWait?.cancel()
+        pullWait = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            guard Task.isCancelled == false else { return }
+            let result = await Self.requestPrefs(method: "GET", link: link, body: nil)
+            DispatchQueue.main.async { [weak self] in
+                self?.finishPull(generation: generation, link: link, result: result)
+            }
+        }
+    }
+
+    private func finishPull(generation: Int, link: CharacterPrefsSession.Link, result: PrefsHTTP) {
+        guard generation == pullGeneration else { return }
+        guard link.characterKey == CharacterPreferenceScope.key, loadedFor == link.characterKey else { return }
+        switch result {
+        case .unsupported:
+            prefsUnavailable = true
+        case .failed:
+            break
+        case .payload(let payload):
+            guard Self.characterMatches(payload.character, key: link.characterKey) else { return }
+            applyPulled(payload, key: link.characterKey)
+        }
+    }
+
+    /// Newer server state replaces local lists and stored switches, then
+    /// iCloud. A newer local save is pushed. Factory lists are never the
+    /// body of that push. A tie leaves both sides alone.
+    private func applyPulled(_ payload: ServerPayload, key: String) {
+        let localMs = Self.milliseconds(from: updatedAt)
+        if payload.updatedAt > localMs {
+            adoptServer(payload)
+            return
+        }
+        let saved = hasSavedPrefs
+        let ahead = saved && (localMs > payload.updatedAt || (localMs == 0 && payload.updatedAt == 0))
+        guard ahead else {
+            serverUpdatedAt[key] = payload.updatedAt
+            return
+        }
+        if localMs == 0 {
+            stampSavedPrefs()
+        }
+        // The local lists are still the fresh-install seed. The server's
+        // lists, when it has any, stay the saved ones. They are taken on
+        // locally so the push cannot replace them with the seed.
+        if seeded {
+            keepServerLists(payload)
+        }
+        serverUpdatedAt[key] = payload.updatedAt
+        scheduleServerPush()
+    }
+
+    /// Server document is newer. Lists and switches that arrived are applied.
+    /// Keys the server left out stay as they are. Nothing is PUT back.
+    private func adoptServer(_ payload: ServerPayload) {
+        let key = CharacterPreferenceScope.key
+        guard key.isEmpty == false, loadedFor == key else { return }
+        suppressServerPush += 1
+        defer {
+            suppressServerPush -= 1
+            releaseDeferredServerPush()
+        }
+        if let lists = Self.savedLists(in: payload) {
+            seeded = false
+            UserDefaults.standard.set(false, forKey: localKey(SyncKey.seeded))
+            if sameLists(buttons: lists.buttons, shortcuts: lists.shortcuts) == false {
+                replaceFromSync(buttons: lists.buttons, shortcuts: lists.shortcuts)
+            }
+        }
+        if CharacterMenuSwitch.apply(payload.settings) {
+            NotificationCenter.default.post(name: .imMenuSettingsApplied, object: nil)
+        }
+        updatedAt = Self.seconds(from: payload.updatedAt)
+        UserDefaults.standard.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
+        serverUpdatedAt[key] = payload.updatedAt
+        writeCloud(updatedAt: updatedAt)
+    }
+
+    /// Saved server lists replace the factory seed. The local stamp stays,
+    /// because the settings edit that made this device newer is the stamp
+    /// the following PUT carries.
+    private func keepServerLists(_ payload: ServerPayload) {
+        guard seeded, let lists = Self.savedLists(in: payload) else { return }
+        let stamp = updatedAt
+        suppressServerPush += 1
+        defer {
+            suppressServerPush -= 1
+            releaseDeferredServerPush()
+        }
+        seeded = false
+        UserDefaults.standard.set(false, forKey: localKey(SyncKey.seeded))
+        if sameLists(buttons: lists.buttons, shortcuts: lists.shortcuts) == false {
+            replaceFromSync(buttons: lists.buttons, shortcuts: lists.shortcuts)
+        }
+        updatedAt = stamp
+        UserDefaults.standard.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
+        writeCloud(updatedAt: updatedAt)
+    }
+
+    /// Both list keys present. One side alone is not a saved snapshot, so the
+    /// factory half of a fresh install cannot ride along with it.
+    private static func savedLists(
+        in payload: ServerPayload
+    ) -> (buttons: [HotButton], shortcuts: [ActionShortcut])? {
+        guard let shortcuts = payload.shortcuts, let buttons = payload.buttons else { return nil }
+        return (buttons, shortcuts)
+    }
+
+    private var hasSavedPrefs: Bool {
+        if seeded == false { return true }
+        return CharacterMenuSwitch.stored().isEmpty == false
+    }
+
+    /// Saved prefs that have never been stamped become eligible to upload.
+    /// The factory seed never reaches this.
+    private func stampSavedPrefs() {
+        guard hasSavedPrefs, updatedAt <= 0 else { return }
+        updatedAt = Date().timeIntervalSince1970
+        UserDefaults.standard.set(updatedAt, forKey: localKey(SyncKey.updatedAt))
+    }
+
+    private func releaseDeferredServerPush() {
+        guard suppressServerPush == 0, serverPushDeferred else { return }
+        serverPushDeferred = false
+        scheduleServerPush()
+    }
+
+    private func scheduleServerPush() {
+        guard prefsUnavailable == false else { return }
+        if suppressServerPush > 0 {
+            serverPushDeferred = true
+            return
+        }
+        guard let link = prefsLinkMatchesScope() else { return }
+        let localMs = Self.milliseconds(from: updatedAt)
+        guard localMs > (serverUpdatedAt[link.characterKey] ?? 0) else { return }
+        guard let body = pushBody(updatedAt: localMs) else { return }
+        let pending = PendingServerPush(link: link, body: body, localMs: localMs)
+        if let previous = pendingPush,
+           previous.link.characterKey != pending.link.characterKey
+            || previous.link.sessionId != pending.link.sessionId {
+            startServerSend(previous)
+        }
+        pendingPush = pending
+        pushWait?.cancel()
+        pushWait = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard Task.isCancelled == false else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.flushPendingServerPush()
+            }
+        }
+    }
+
+    private func flushServerPushNow() {
+        pushWait?.cancel()
+        pushWait = nil
+        flushPendingServerPush()
+    }
+
+    private func flushPendingServerPush() {
+        guard let pending = pendingPush else { return }
+        pendingPush = nil
+        startServerSend(pending)
+    }
+
+    private func startServerSend(_ pending: PendingServerPush) {
+        guard pending.localMs > (serverUpdatedAt[pending.link.characterKey] ?? 0) else { return }
+        guard prefsUnavailable == false else { return }
+        if serverSendInFlight {
+            if pendingPush == nil || pending.localMs >= (pendingPush?.localMs ?? 0) {
+                pendingPush = pending
+            }
+            return
+        }
+        serverSendInFlight = true
+        Task { [weak self] in
+            let result = await Self.requestPrefs(method: "PUT", link: pending.link, body: pending.body)
+            DispatchQueue.main.async { [weak self] in
+                self?.finishServerSend(pending: pending, result: result)
+            }
+        }
+    }
+
+    private func finishServerSend(pending: PendingServerPush, result: PrefsHTTP) {
+        serverSendInFlight = false
+        let key = pending.link.characterKey
+        switch result {
+        case .unsupported:
+            prefsUnavailable = true
+            pendingPush = nil
+        case .failed:
+            break
+        case .payload(let payload):
+            guard Self.characterMatches(payload.character, key: key) else { break }
+            if payload.saved == false {
+                serverUpdatedAt[key] = payload.updatedAt
+                if key == CharacterPreferenceScope.key, loadedFor == key, payload.updatedAt > Self.milliseconds(from: updatedAt) {
+                    adoptServer(payload)
+                }
+            } else {
+                let stamp = payload.updatedAt > 0 ? payload.updatedAt : pending.localMs
+                serverUpdatedAt[key] = stamp
+                if key == CharacterPreferenceScope.key,
+                   loadedFor == key,
+                   suppressServerPush == 0,
+                   Self.milliseconds(from: updatedAt) > stamp {
+                    scheduleServerPush()
+                }
+            }
+        }
+        if pendingPush != nil, prefsUnavailable == false {
+            flushPendingServerPush()
+        }
+    }
+
+    /// Explicit settings, plus lists only after the player (or iCloud, or
+    /// the server) has saved them. The fresh-install seed is left out so it
+    /// cannot become the server's copy when `updatedAt` is still 0.
+    private func pushBody(updatedAt localMs: Int64) -> [String: Any]? {
+        var settings: [String: Bool] = [:]
+        for (base, value) in CharacterMenuSwitch.stored() {
+            settings[CharacterMenuSwitch.wireKey(base)] = value
+        }
+        if seeded && settings.isEmpty { return nil }
+        var body: [String: Any] = [
+            "updatedAt": NSNumber(value: localMs),
+            "settings": settings,
+        ]
+        if seeded == false {
+            body["actionShortcuts"] = Self.shortcutPayload(shortcuts)
+            body["hotButtons"] = Self.hotButtonPayload(buttons)
+        }
+        return body
+    }
+
+    private func prefsLinkMatchesScope() -> CharacterPrefsSession.Link? {
+        guard let link = CharacterPrefsSession.link else { return nil }
+        guard link.characterKey.isEmpty == false, link.characterKey == CharacterPreferenceScope.key else { return nil }
+        return link
+    }
+
+    private static func hotButtonPayload(_ buttons: [HotButton]) -> [[String: String]] {
+        buttons.prefix(hotLimit).map { button in
+            [
+                "text": button.text,
+                "icon": HotButton.clampedIcon(button.icon),
+                "color": button.color.rawValue,
+            ]
+        }
+    }
+
+    private static func milliseconds(from seconds: TimeInterval) -> Int64 {
+        guard seconds > 0 else { return 0 }
+        let ms = (seconds * 1000.0).rounded()
+        guard ms < Double(Int64.max) else { return 0 }
+        return Int64(ms)
+    }
+
+    private static func seconds(from milliseconds: Int64) -> TimeInterval {
+        guard milliseconds > 0 else { return 0 }
+        return TimeInterval(milliseconds) / 1000.0
+    }
+
+    /// Empty means the server did not name a character. A name that does not
+    /// match the request is someone else's document.
+    private static func characterMatches(_ name: String, key: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if trimmed.isEmpty { return true }
+        return trimmed == key
+    }
+
+    private static func requestPrefs(
+        method: String,
+        link: CharacterPrefsSession.Link,
+        body: [String: Any]?
+    ) async -> PrefsHTTP {
+        guard let url = prefsURL(link) else { return .failed }
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("Bearer \(link.token)", forHTTPHeaderField: "Authorization")
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            guard let data = try? JSONSerialization.data(withJSONObject: body) else { return .failed }
+            request.httpBody = data
+        }
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return .failed }
+            if http.statusCode == 404 || http.statusCode == 405 { return .unsupported }
+            guard (200...299).contains(http.statusCode) else { return .failed }
+            guard let payload = parsePayload(data) else { return .failed }
+            return .payload(payload)
+        } catch {
+            return .failed
+        }
+    }
+
+    private static func prefsURL(_ link: CharacterPrefsSession.Link) -> URL? {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        let escaped = link.sessionId.addingPercentEncoding(withAllowedCharacters: allowed) ?? link.sessionId
+        let base = link.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return URL(string: base + "/v1/sessions/" + escaped + "/prefs")
+    }
+
+    private static func parsePayload(_ data: Data) -> ServerPayload? {
+        guard data.isEmpty == false,
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return nil
+        }
+        let shortcuts = list(object, "actionShortcuts").map { shortcuts(from: $0) }
+        let buttons = list(object, "hotButtons").map { serverButtons(from: $0) }
+        return ServerPayload(
+            character: object["character"] as? String ?? "",
+            updatedAt: jsonMillis(object["updatedAt"]),
+            saved: jsonBool(object["saved"]),
+            shortcuts: shortcuts,
+            buttons: buttons,
+            settings: settings(from: object["settings"])
+        )
+    }
+
+    /// A missing key stays nil. `NSNull` is missing, not an empty list.
+    private static func list(_ object: [String: Any], _ key: String) -> Any? {
+        guard object.keys.contains(key), let value = object[key], (value is NSNull) == false else { return nil }
+        return value
+    }
+
+    private static func serverButtons(from stored: Any?) -> [HotButton] {
+        guard let rows = stored as? [Any] else { return [] }
+        let buttons: [HotButton] = rows.compactMap { element in
+            guard let row = element as? [String: Any], let text = row["text"] as? String else { return nil }
+            let icon = row["icon"] as? String ?? ""
+            let color = row["color"] as? String
+            return HotButton(text: text, icon: icon, color: ShortcutColor.decode(color))
+        }
+        return migrateLegacyLoot(Array(buttons.prefix(hotLimit)))
+    }
+
+    private static func settings(from stored: Any?) -> [String: Bool] {
+        guard let raw = stored as? [String: Any] else { return [:] }
+        var values: [String: Bool] = [:]
+        for (wire, value) in raw {
+            guard let base = CharacterMenuSwitch.base(forWire: wire), let flag = jsonBool(value) else { continue }
+            values[base] = flag
+        }
+        return values
+    }
+
+    private static func jsonBool(_ value: Any?) -> Bool? {
+        guard let value, (value is NSNull) == false else { return nil }
+        if let flag = value as? Bool { return flag }
+        return nil
+    }
+
+    private static func jsonMillis(_ value: Any?) -> Int64 {
+        guard let value, (value is NSNull) == false else { return 0 }
+        guard let number = value as? NSNumber else { return 0 }
+        if CFGetTypeID(number) == CFBooleanGetTypeID() { return 0 }
+        let ms = number.doubleValue
+        guard ms.isFinite, ms > 0, ms < Double(Int64.max) else { return 0 }
+        return Int64(ms.rounded())
     }
 }
 
