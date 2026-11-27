@@ -108,6 +108,39 @@ extension Notification.Name {
     static let imMenuSettingsEdited = Notification.Name("im.menuSettingsEdited")
     /// iCloud applied switch values for the character in scope. Readers reload.
     static let imMenuSettingsApplied = Notification.Name("im.menuSettingsApplied")
+    /// The on-screen character has a live IM bearer. Action slots pull `/prefs`.
+    static let imPrefsSessionAttached = Notification.Name("im.prefsSessionAttached")
+    /// That bearer is gone. A response still in flight must not be applied.
+    static let imPrefsSessionEnded = Notification.Name("im.prefsSessionEnded")
+}
+
+/// Bearer for `GET`/`PUT /v1/sessions/{id}/prefs`. The session publishes it
+/// when a character is attached and clears it when that bearer is dropped.
+/// The menu store reads it; it does not own the token.
+enum CharacterPrefsSession {
+    struct Link: Equatable {
+        var character: String
+        var sessionId: String
+        var token: String
+        var baseURL: String
+
+        var characterKey: String {
+            character.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+    }
+
+    private(set) static var link: Link?
+
+    static func publish(character: String, sessionId: String, token: String, baseURL: String) {
+        link = Link(character: character, sessionId: sessionId, token: token, baseURL: baseURL)
+        NotificationCenter.default.post(name: .imPrefsSessionAttached, object: nil)
+    }
+
+    static func clear() {
+        guard link != nil else { return }
+        link = nil
+        NotificationCenter.default.post(name: .imPrefsSessionEnded, object: nil)
+    }
 }
 
 /// Left-menu switches that sync with Actions and Hot Buttons. A missing
@@ -134,6 +167,19 @@ enum CharacterMenuSwitch {
     /// `im.sync.matrixMode`, then `.<lowercased character>` like the list keys.
     static func syncBase(_ base: String) -> String {
         "im.sync.\(base.dropFirst(3))"
+    }
+
+    /// `/prefs` settings key. `im.hideKeyboardPortrait` is `hideKeyboardPortrait`.
+    static func wireKey(_ base: String) -> String {
+        guard base.hasPrefix("im.") else { return base }
+        return String(base.dropFirst(3))
+    }
+
+    /// Local UserDefaults base for a `/prefs` settings key. Unknown keys are ignored.
+    static func base(forWire wire: String) -> String? {
+        let base = "im." + wire
+        guard bases.contains(base) else { return nil }
+        return base
     }
 
     /// Switches this character has actually stored. Missing keys are omitted.
