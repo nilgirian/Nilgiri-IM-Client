@@ -1263,13 +1263,11 @@ final class ActionMenuStore: ObservableObject {
         let generation = pullGeneration
         guard let link = CharacterPrefsSession.link else { return }
         pullWait?.cancel()
-        pullWait = Task { [weak self] in
+        pullWait = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 80_000_000)
             guard Task.isCancelled == false else { return }
             let result = await Self.requestPrefs(method: "GET", link: link, body: nil)
-            DispatchQueue.main.async { [weak self] in
-                self?.finishPull(generation: generation, link: link, result: result)
-            }
+            self?.finishPull(generation: generation, link: link, result: result)
         }
     }
 
@@ -1408,12 +1406,10 @@ final class ActionMenuStore: ObservableObject {
         }
         pendingPush = pending
         pushWait?.cancel()
-        pushWait = Task { [weak self] in
+        pushWait = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 400_000_000)
             guard Task.isCancelled == false else { return }
-            DispatchQueue.main.async { [weak self] in
-                self?.flushPendingServerPush()
-            }
+            self?.flushPendingServerPush()
         }
     }
 
@@ -1439,11 +1435,9 @@ final class ActionMenuStore: ObservableObject {
             return
         }
         serverSendInFlight = true
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             let result = await Self.requestPrefs(method: "PUT", link: pending.link, body: pending.body)
-            DispatchQueue.main.async { [weak self] in
-                self?.finishServerSend(pending: pending, result: result)
-            }
+            self?.finishServerSend(pending: pending, result: result)
         }
     }
 
