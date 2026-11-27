@@ -3111,7 +3111,7 @@ struct TranscriptView: View {
                     }
                     .clipped()
                     Group {
-                        if session.atMenu {
+                        if session.atMenu || session.characterDeleteActive {
                             GameMenuPanel()
                         } else {
                             inputBar
@@ -3261,11 +3261,17 @@ struct TranscriptView: View {
                 }
             }
             .onChange(of: session.atMenu) { _, atMenu in
-                if atMenu {
+                if atMenu || session.characterDeleteActive {
                     releaseCommandKeyboard()
                     actionPanelShown = false
                 } else {
                     showCommandKeyboardIfPreferred()
+                }
+            }
+            .onChange(of: session.characterDeleteActive) { _, active in
+                if active {
+                    releaseCommandKeyboard()
+                    actionPanelShown = false
                 }
             }
             .onChange(of: playScreenCoverPresented) { _, presented in
@@ -3926,6 +3932,8 @@ struct TranscriptView: View {
 
 /// Welcome menu, in the input bar's place. Enter sends `1`. Quit sends `0`
 /// and unlinks. Change password is a dialog, not menu choice `2`.
+/// Delete character is a dialog that sends `3` and the two passwords.
+/// It is shown only when the menu text includes that choice.
 /// The frost is the same `Chrome.barBackground` as the bars and creation chrome.
 /// The log draws under it; the bottom content inset matches this panel's height
 /// so the last lines stay above the buttons.
@@ -3941,11 +3949,20 @@ private struct GameMenuPanel: View {
     @FocusState private var currentPasswordFocused: Bool
     @FocusState private var newPasswordFocused: Bool
     @FocusState private var confirmPasswordFocused: Bool
+    @State private var confirmingDelete = false
+    @State private var deletePassword = ""
+    @State private var deleteConfirm = ""
+    @State private var deleteError: String?
+    @State private var deleteBusy = false
+    @FocusState private var deletePasswordFocused: Bool
+    @FocusState private var deleteConfirmFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if changingPassword {
                 passwordDialog
+            } else if confirmingDelete {
+                deleteDialog
             } else {
                 choices
             }
@@ -3960,8 +3977,17 @@ private struct GameMenuPanel: View {
                 Color.clear.preference(key: BottomBarHeightKey.self, value: proxy.size.height)
             }
         }
+        .onChange(of: session.character) { old, new in
+            let same = (old ?? "").compare(new ?? "", options: .caseInsensitive) == .orderedSame
+            guard same == false, deleteBusy == false, passwordBusy == false else { return }
+            if confirmingDelete {
+                Task { await cancelDelete() }
+            } else {
+                closePasswordDialog()
+            }
+        }
         .toolbar {
-            if changingPassword {
+            if changingPassword || confirmingDelete {
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button("Done") {
@@ -4001,6 +4027,19 @@ private struct GameMenuPanel: View {
             .buttonStyle(.plain)
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityLabel("Quit")
+            if session.menuOffersCharacterDelete {
+                Button {
+                    deleteError = nil
+                    confirmingDelete = true
+                    session.beginCharacterDelete()
+                } label: {
+                    Text("Delete character")
+                        .foregroundStyle(Color.red)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Delete character")
+            }
         }
         .disabled(session.menuBusy)
     }
@@ -4091,10 +4130,73 @@ private struct GameMenuPanel: View {
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
+    /// Permanent delete. Both fields are the current password, masked.
+    /// The warning is the game's own sentence. Server replies stay in the log
+    /// unchanged; this dialog repeats the refusal or the cancel sentence.
+    private var deleteDialog: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Delete character")
+                .font(.headline)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(verbatim: "WARNING: Deleting your character is permanent and irreversible. All items, gold, and character data will be lost.")
+                .foregroundStyle(Color.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+            secureLine(
+                "Current password",
+                text: $deletePassword,
+                contentType: .password,
+                submitLabel: .next,
+                focus: $deletePasswordFocused
+            ) {
+                deleteConfirmFocused = true
+            }
+            secureLine(
+                "Re-enter current password",
+                text: $deleteConfirm,
+                contentType: .password,
+                submitLabel: .done,
+                focus: $deleteConfirmFocused
+            ) {
+                Task { await submitDelete() }
+            }
+            if let deleteError, deleteError.isEmpty == false {
+                Text(verbatim: deleteError)
+                    .foregroundStyle(Color.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 16) {
+                Button("Cancel") {
+                    Task { await cancelDelete() }
+                }
+                .buttonStyle(.plain)
+                .disabled(deleteBusy)
+                Button {
+                    Task { await submitDelete() }
+                } label: {
+                    HStack(spacing: 8) {
+                        Text("Delete")
+                            .foregroundStyle(Color.white)
+                        if deleteBusy {
+                            ProgressView()
+                        }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.red)
+                .disabled(deleteBusy || deletePassword.isEmpty || deleteConfirm.isEmpty)
+                .accessibilityLabel("Delete character")
+            }
+        }
+    }
+
     private func resignPasswordFocus() {
         currentPasswordFocused = false
         newPasswordFocused = false
         confirmPasswordFocused = false
+        deletePasswordFocused = false
+        deleteConfirmFocused = false
     }
 
     private func submitPassword() async {
@@ -4124,6 +4226,40 @@ private struct GameMenuPanel: View {
         newPassword = ""
         confirmPassword = ""
         passwordError = nil
+        resignPasswordFocus()
+    }
+
+    private func submitDelete() async {
+        guard deleteBusy == false else { return }
+        if deletePassword.isEmpty || deleteConfirm.isEmpty {
+            deleteError = "Enter your current password."
+            return
+        }
+        if deletePassword != deleteConfirm {
+            deleteError = "Passwords do not match."
+            return
+        }
+        deleteBusy = true
+        defer { deleteBusy = false }
+        let entered = deletePassword
+        if let message = await session.deleteCharacter(password: entered) {
+            deleteError = message
+            return
+        }
+        closeDeleteDialog()
+    }
+
+    private func cancelDelete() async {
+        guard deleteBusy == false else { return }
+        await session.cancelCharacterDelete()
+        closeDeleteDialog()
+    }
+
+    private func closeDeleteDialog() {
+        confirmingDelete = false
+        deletePassword = ""
+        deleteConfirm = ""
+        deleteError = nil
         resignPasswordFocus()
     }
 }
@@ -4436,6 +4572,13 @@ private struct CharacterPickerSheet: View {
     var body: some View {
         NavigationStack {
             List {
+                if session.status == "Your character has been permanently deleted. Good-bye!" {
+                    Section {
+                        Text(verbatim: session.status)
+                            .foregroundStyle(Color.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 characterRows
                 if session.canAddCharacter {
                     loginRow

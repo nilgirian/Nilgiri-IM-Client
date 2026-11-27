@@ -269,6 +269,12 @@ enum Ansi {
         return span.url
     }
 
+    /// Visible text of one MUD line. CSI color sequences are removed.
+    /// The stored line is not changed. Callers match on this and leave the transcript alone.
+    static func plain(_ raw: String) -> String {
+        strippingCSI(raw).replacingOccurrences(of: "\r", with: "")
+    }
+
     private static func strippingCSI(_ raw: String) -> String {
         var out = ""
         var index = raw.startIndex
